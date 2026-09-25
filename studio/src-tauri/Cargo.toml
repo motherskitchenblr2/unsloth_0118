@@ -59,7 +59,7 @@ objc2-foundation = { version = "0.3.2", default-features = false, features = ["s
 [target.'cfg(target_os = "linux")'.dependencies]
 gdk = "0.18"
 gdk-pixbuf = "0.18"
-glib = "0.18"
+glib = "0.20"
 gtk = "0.18"
 elevated-command = "1.1.2"
 webkit2gtk-sys = "2.0.2"
