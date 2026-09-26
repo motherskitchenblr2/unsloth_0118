@@ -11495,23 +11495,6 @@ def _gguf_runtime_bytes(
             llama_extra_args,
             default = managed_kv_unified,
         )
-        # Resolve the same capability-dependent count that load_model emits.
-        _cc_caps: dict = {}
-        try:
-            _cc_caps = LlamaCppBackend.probe_server_capabilities() or {}
-        except Exception as _cc_exc:
-            logger.debug("ctx-checkpoints capability probe failed: %s", _cc_exc)
-        # Older lightweight probes may not provide the new sizing helpers.
-        _per_checkpoint = getattr(probe, "_rollback_state_bytes", lambda _n: 0)(1)
-        _host_mib = getattr(probe, "_host_memory_capacity_mib", lambda: None)()
-        _resolved_checkpoints = effective_ctx_checkpoints_for_caps(
-            _cc_caps,
-            llama_extra_args,
-            ctx_checkpoints,
-            per_checkpoint_bytes = _per_checkpoint,
-            n_parallel = slots,
-            total_host_bytes = (_host_mib * 1024 * 1024) if _host_mib else None,
-        )
         # load_model appends --flash-attn on to every launch whose build has the flag,
         # so the default here is ON, not off. The false arm pads variable-width V
         # tensors to the model-wide maximum (_max_kv_value_width), which on an
@@ -11521,7 +11504,7 @@ def _gguf_runtime_bytes(
         _fa_supported = True
         try:
             _fa_caps = LlamaCppBackend.probe_server_capabilities()
-            # Same ``found`` test as the checkpoint probe above: the defaults dict
+            # Same ``found`` test as the checkpoint probe below: the defaults dict
             # reports nothing supported, so keying on the flag alone would size every
             # unprobed host as flash-attention-less.
             if _fa_caps.get("found") and not _fa_caps.get("supports_flash_attn", True):
@@ -11552,6 +11535,23 @@ def _gguf_runtime_bytes(
                 tensor_parallel = bool(tensor_parallel),
                 env = os.environ,
             )
+        _cc_caps: dict = {}
+        try:
+            _cc_caps = LlamaCppBackend.probe_server_capabilities() or {}
+        except Exception as _cc_exc:
+            logger.debug("ctx-checkpoints capability probe failed: %s", _cc_exc)
+        _per_checkpoint = getattr(probe, "_ctx_checkpoint_bytes", lambda *_a, **_k: 0)(
+            cache_type_for_budget, swa_full = swa_full, flash_attn = flash_attn
+        )
+        _host_mib = getattr(probe, "_host_memory_capacity_mib", lambda: None)()
+        _resolved_checkpoints = effective_ctx_checkpoints_for_caps(
+            _cc_caps,
+            llama_extra_args,
+            ctx_checkpoints,
+            per_checkpoint_bytes = _per_checkpoint,
+            n_parallel = slots,
+            total_host_bytes = (_host_mib * 1024 * 1024) if _host_mib else None,
+        )
         kv = probe._estimate_kv_cache_bytes(
             ctx,
             cache_type_for_budget,
@@ -39951,6 +39951,44 @@ async def _selected_gpu_ordinal(gpu_ids, *, allow_ranking: bool = True) -> Optio
     )
 
 
+def _refuse_disabled_nvfp4_request(request: Any) -> None:
+    """400 a load or plan naming NVFP4 while the NVFP4 switch (``UNSLOTH_NVFP4_DIFFUSION``) is off.
+
+    First thing in every image and video load / plan route, ahead of the precision gates and their
+    opt-in silent fallback, so the request is refused outright, never swapped for another scheme,
+    and nothing is resolved, planned or fetched for it."""
+    from core.inference.diffusion_nvfp4_flag import refuse_disabled_nvfp4
+    try:
+        refuse_disabled_nvfp4(
+            transformer_quant = getattr(request, "transformer_quant", None),
+            text_encoder_quant = getattr(request, "text_encoder_quant", None),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code = 400, detail = str(exc))
+
+
+async def _refuse_disabled_nvfp4_checkpoint(request: Any) -> None:
+    """400 a load or plan whose model is itself an NVFP4 checkpoint while the NVFP4 switch is off.
+
+    The scheme gates above never see such a pick: it names no precision, it IS one. Runs after the
+    account checks, since it reads the local path or cached snapshot the request names."""
+    from core.inference.diffusion_nvfp4_flag import (
+        nvfp4_diffusion_enabled,
+        refuse_disabled_nvfp4_checkpoint,
+    )
+
+    if nvfp4_diffusion_enabled():
+        return
+    try:
+        await asyncio.to_thread(
+            refuse_disabled_nvfp4_checkpoint,
+            getattr(request, "model_path", None),
+            getattr(request, "base_repo", None),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code = 400, detail = str(exc))
+
+
 @studio_router.post("/images/download-plan", response_model = DiffusionDownloadPlanResponse)
 async def diffusion_download_plan(
     request: DiffusionLoadRequest, current_subject: str = Depends(get_current_subject)
@@ -39960,6 +39998,7 @@ async def diffusion_download_plan(
 
     Validates the same way /images/load does, so an unloadable pick fails here rather than
     after a multi-GB download."""
+    _refuse_disabled_nvfp4_request(request)
     if account_access.managed_account():
         await asyncio.to_thread(account_access.require_media_references, request)
     if account_access.managed_account():
@@ -39971,6 +40010,7 @@ async def diffusion_download_plan(
         request = request.model_copy(
             update = {"hf_token": account_access.account_hf_token(request.hf_token)}
         )
+    await _refuse_disabled_nvfp4_checkpoint(request)
     from core.inference.diffusion import (
         get_diffusion_backend,
         resolve_local_single_file,
@@ -40043,6 +40083,8 @@ async def diffusion_download_plan(
                     speed_mode = getattr(request, "speed_mode", None),
                     # Judged on the card this pick would load on, as the loader does.
                     gpu_ordinal = gpu_ordinal,
+                    repo_id = request.model_path,
+                    base_repo = request.base_repo,
                 )
             else:
                 _assert_native_precision_unset(
@@ -40099,9 +40141,13 @@ def _assert_native_precision_unset(
 
     Raises RuntimeError, which the route maps to 409 alongside the diffusers refusals."""
     from core.inference.diffusion_auto_policy import precision_fallback_allowed
+    from core.inference.diffusion_nvfp4_flag import refuse_disabled_nvfp4
     from core.inference.diffusion_precision import normalize_te_quant
     from core.inference.diffusion_transformer_quant import TQ_AUTO, normalize_transformer_quant
 
+    refuse_disabled_nvfp4(
+        transformer_quant = transformer_quant, text_encoder_quant = text_encoder_quant
+    )
     if precision_fallback_allowed():
         return
     pinned = normalize_transformer_quant(transformer_quant)
@@ -40162,6 +40208,7 @@ async def load_diffusion_model_gated(
     Media auto-switch awaits this rather than the route so the idle unload can tell an
     API-loaded pipeline from one the user picked on the Images page.
     """
+    _refuse_disabled_nvfp4_request(request)
     if account_access.managed_account():
         await asyncio.to_thread(account_access.require_media_references, request)
     account_access.require_idle_other_accounts()
@@ -40174,6 +40221,7 @@ async def load_diffusion_model_gated(
         request = request.model_copy(
             update = {"hf_token": account_access.account_hf_token(request.hf_token)}
         )
+    await _refuse_disabled_nvfp4_checkpoint(request)
     # Tested at ENTRY because `begin_load` returns before the worker moves a byte, so the only
     # fact available is that a repo ALREADY cached is not one this load will fetch. The WRITE is
     # deferred to the launch below, since the validation in between 400s without moving a byte.
@@ -40284,6 +40332,8 @@ async def load_diffusion_model_gated(
                 cpu_offload = bool(getattr(request, "cpu_offload", False)),
                 speed_mode = getattr(request, "speed_mode", None),
                 gpu_ordinal = gpu_ordinal,
+                repo_id = request.model_path,
+                base_repo = request.base_repo,
             )
         elif fam is not None and pending_name == ENGINE_SD_CPP:
             # The native engine accepts both knobs for interface parity and ignores them. It was
@@ -40357,6 +40407,8 @@ async def load_diffusion_model_gated(
                     cpu_offload = bool(getattr(request, "cpu_offload", False)),
                     speed_mode = getattr(request, "speed_mode", None),
                     gpu_ordinal = gpu_ordinal,
+                    repo_id = request.model_path,
+                    base_repo = request.base_repo,
                 )
 
         def _start_engine_load():
