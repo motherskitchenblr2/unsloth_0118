@@ -60,9 +60,7 @@ case "$(uname -m)" in
     *) echo "unsloth-llama-update: unsupported arch $(uname -m)" >&2; exit 1;;
 esac
 
-# The FULL "release_tag" is what --check compares against resolve_latest_tag; the
-# marker's "tag" is the normalized base build, so preferring it reports "an update is
-# available" forever on any install the in-app updater wrote.
+# Compare the full "release_tag"; the marker's "tag" is the normalized base build.
 installed_tag() {
     "$PY" - "$INSTALL_DIR" <<'PY' 2>/dev/null || echo "unknown"
 import json, os, sys
@@ -108,6 +106,20 @@ fi
 # a sibling temp dir is on the same filesystem, so the swap is an atomic rename
 parent="$(dirname "$INSTALL_DIR")"
 
+# -L too: a dangling symlink still occupies the path
+present() { [ -e "$1" ] || [ -L "$1" ]; }
+
+# a SIGKILL between the two renames of the swap runs no trap and leaves only the backup
+if ! present "$INSTALL_DIR"; then
+    stranded="$(ls -1dt -- "$INSTALL_DIR".old.* 2>/dev/null | head -n 1 || true)"
+    if [ -n "$stranded" ]; then
+        echo "[llama-update] restoring the install an interrupted update left at $stranded"
+        mv -T "$stranded" "$INSTALL_DIR"
+    else
+        echo "[llama-update] no llama.cpp at $INSTALL_DIR; installing it"
+    fi
+fi
+
 # A named volume mounted AT the install dir cannot be renamed (EBUSY), so swap its
 # CONTENTS instead. UNSLOTH_LLAMA_UPDATE_IN_PLACE=1/0 overrides autodetection.
 IN_PLACE="${UNSLOTH_LLAMA_UPDATE_IN_PLACE:-}"
@@ -115,7 +127,7 @@ if [ -z "$IN_PLACE" ]; then
     IN_PLACE=0
     if command -v mountpoint >/dev/null 2>&1 && mountpoint -q "$INSTALL_DIR" 2>/dev/null; then
         IN_PLACE=1
-    elif [ "$(stat -c %d "$INSTALL_DIR" 2>/dev/null)" != "$(stat -c %d "$parent" 2>/dev/null)" ]; then
+    elif present "$INSTALL_DIR" && [ "$(stat -c %d "$INSTALL_DIR" 2>/dev/null)" != "$(stat -c %d "$parent" 2>/dev/null)" ]; then
         IN_PLACE=1   # filesystem boundary = a volume, on hosts without mountpoint(1)
     fi
 fi
@@ -138,10 +150,8 @@ cleanup() {
             # same-named entry in the install dir is a half-moved NEW one
             if [ -d "$backup" ]; then
                 _restore_fail=0
-                # The loop below only sees names the OLD tree had, so a file the
-                # new release introduced would survive into a mixed-version dir and
-                # ggml dlopens every libggml-*.so next to the binaries. Gated on
-                # "drained": before that, an entry here can be the only old copy.
+                # The loop below only sees the OLD tree's names and ggml dlopens every
+                # libggml-*.so, so remove new-only files too (only once drained).
                 if [ "$drained" = "1" ]; then
                     find "$INSTALL_DIR" -mindepth 1 -maxdepth 1 \
                          ! -path "$work" ! -path "$backup" \
@@ -161,7 +171,7 @@ cleanup() {
                     echo "[llama-update] CRITICAL: restore failed; previous install preserved at $backup" >&2
                 fi
             fi
-        elif [ ! -e "$INSTALL_DIR" ] && [ -e "$backup" ]; then
+        elif ! present "$INSTALL_DIR" && present "$backup"; then
             if ! mv "$backup" "$INSTALL_DIR" 2>/dev/null; then
                 echo "[llama-update] CRITICAL: restore failed; previous install preserved at $backup" >&2
             fi
@@ -199,12 +209,12 @@ if [ "$IN_PLACE" = "1" ]; then
         exit 1
     fi
 else
-    mv "$INSTALL_DIR" "$backup"
+    ! present "$INSTALL_DIR" || mv "$INSTALL_DIR" "$backup"
     if mv "$new" "$INSTALL_DIR"; then
         swap_done=1
     else
         echo "[llama-update] swap failed; restoring previous install" >&2
-        mv "$backup" "$INSTALL_DIR"
+        ! present "$backup" || mv "$backup" "$INSTALL_DIR"
         exit 1
     fi
 fi

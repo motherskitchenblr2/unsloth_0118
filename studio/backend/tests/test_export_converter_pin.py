@@ -1,13 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
-"""The GGUF converter pin is Unsloth's own routing, so it is scoped to one conversion.
-
-Setting UNSLOTH_LLAMA_CPP_SCRIPTS_DIR and leaving it there cost two controls that live
-in unsloth_zoo: the variable outranks UNSLOTH_LLAMA_CPP_CONVERTER_TAG, so the escape
-hatch the unsupported-architecture message names did nothing for a Studio export, and
-trust is read off the variable, so a converter Studio had just downloaded looked
-user-pinned and UNSLOTH_CONVERTER_SCAN_STRICT stopped failing exports."""
+"""Set UNSLOTH_LLAMA_CPP_SCRIPTS_DIR for one conversion only: it outranks the converter tag."""
 
 from __future__ import annotations
 
@@ -24,7 +18,6 @@ _TESTS_DIR = Path(__file__).resolve().parent
 if str(_TESTS_DIR) not in sys.path:
     sys.path.insert(0, str(_TESTS_DIR))
 
-# Reuse the absolute-paths stub harness: loads core/export/export.py without torch/unsloth.
 from test_export_absolute_paths import (  # noqa: E402
     _install_export_backend_stubs,
     _load_module,
@@ -41,8 +34,7 @@ def _export_mod(monkeypatch, *, mlx = False):
     mod = _load_module(
         "test_core_export_backend_converter_pin", "core/export/export.py", monkeypatch
     )
-    # The stub unsloth is MLX, so say which host each case is about: Studio pins on a
-    # GPU host, and leaves the pinning to unsloth_zoo's MLX save path on a Mac.
+    # the stub unsloth is MLX; Studio pins on GPU hosts and leaves it to unsloth_zoo on Mac
     monkeypatch.setattr(mod, "_IS_MLX", mlx)
     return mod
 
@@ -57,9 +49,7 @@ def _zoo(
     llama_cpp = sys.modules["unsloth_zoo.llama_cpp"]
     calls = {"internal": [], "incomplete": []}
 
-    # Not reentrant, exactly like the real one: it holds a plain threading.Lock for the
-    # whole conversion, so a second entry on the same thread hangs rather than raising.
-    # Raising here turns that hang into a test failure.
+    # the real lock is not reentrant and would hang; raising turns that into a failure
     held = threading.Lock()
 
     @contextlib.contextmanager
@@ -102,16 +92,13 @@ def test_pin_is_scoped_to_the_conversion(monkeypatch):
 
     with mod._llama_cpp_scripts_pin():
         assert os.environ[_SCRIPTS_DIR] == llama_cpp.LLAMA_CPP_DEFAULT_DIR
-    # The leak is the bug: every later export, and the MLX path's own internal pin,
-    # read a variable nobody set deliberately.
     assert _SCRIPTS_DIR not in os.environ
     assert calls["internal"] == [llama_cpp.LLAMA_CPP_DEFAULT_DIR]
 
 
 def test_pin_goes_through_the_internal_helper(monkeypatch):
-    """Not a raw os.environ write: unsloth_zoo grants the strict-scan exemption to a
-    pin the USER set, and marking this one internal is what keeps
-    UNSLOTH_CONVERTER_SCAN_STRICT=1 able to refuse a converter Studio downloaded."""
+    """Not a raw os.environ write: unsloth_zoo grants the strict-scan exemption to user-set pins, so
+    an internal mark keeps UNSLOTH_CONVERTER_SCAN_STRICT=1 refusing downloaded converters."""
     mod = _export_mod(monkeypatch)
     llama_cpp, calls = _zoo(monkeypatch)
 
@@ -143,8 +130,7 @@ def test_a_pin_the_user_set_is_untouched(monkeypatch):
 
 
 def test_an_incomplete_install_is_not_pinned(monkeypatch):
-    """An entrypoint with no conversion/ beside it cannot run, and pinning it is what
-    stops the staged resolver from fetching a co-versioned set that can."""
+    """Entrypoints without conversion/ can't run; pinning blocks a co-versioned set that can."""
     mod = _export_mod(monkeypatch)
     _llama_cpp, calls = _zoo(monkeypatch, incomplete = True)
 
@@ -154,8 +140,7 @@ def test_an_incomplete_install_is_not_pinned(monkeypatch):
 
 
 def test_older_zoo_still_gets_a_scoped_pin(monkeypatch):
-    """No internal-pin helper to call, so the variable is scoped by hand. The strict-scan
-    exemption cannot be avoided on those builds, but the leak can."""
+    """Older zoo: scope the env var by hand; the exemption can't be avoided, but the leak can."""
     mod = _export_mod(monkeypatch)
     llama_cpp, _calls = _zoo(monkeypatch, internal_pin = False)
 
@@ -175,8 +160,7 @@ def test_the_pin_unwinds_when_the_conversion_raises(monkeypatch):
 
 
 def test_mlx_leaves_the_pinning_to_unsloth_zoo(monkeypatch):
-    """The MLX save path installs llama.cpp and pins it itself, so there is nothing to
-    add here."""
+    """The MLX save path installs and pins llama.cpp itself, so this layer adds no pin."""
     mod = _export_mod(monkeypatch, mlx = True)
     _llama_cpp, calls = _zoo(monkeypatch)
 
@@ -186,23 +170,19 @@ def test_mlx_leaves_the_pinning_to_unsloth_zoo(monkeypatch):
 
 
 def test_mlx_export_does_not_nest_the_pin(monkeypatch):
-    """unsloth_zoo's pin holds a plain threading.Lock for the whole conversion, so
-    entering it here and again inside save_pretrained_gguf hangs a Mac GGUF export
-    for good. The stub raises where the real one would block."""
+    """The pin's threading.Lock is not reentrant, so nesting it deadlocks a Mac GGUF export."""
     mod = _export_mod(monkeypatch, mlx = True)
     llama_cpp, _calls = _zoo(monkeypatch)
 
     with mod._llama_cpp_scripts_pin():
-        # What unsloth_zoo/mlx/utils.py:save_pretrained_gguf does inside the call above.
+        # mirrors unsloth_zoo/mlx/utils.py:save_pretrained_gguf
         with llama_cpp.internal_scripts_dir_pin(llama_cpp.LLAMA_CPP_DEFAULT_DIR):
             pass
     assert _SCRIPTS_DIR not in os.environ
 
 
 def test_a_gguf_export_leaves_no_pin_behind(tmp_path, monkeypatch):
-    """End to end through export_gguf: the pin is in force while the model converts and
-    gone once the export returns. The export worker outlives the export, so a variable
-    left here is read by every later export in that process."""
+    """Pin is active only during conversion: the worker outlives the export and would leak it."""
     mod = _export_mod(monkeypatch)
     llama_cpp, calls = _zoo(monkeypatch)
     save_dir = tmp_path / "export"

@@ -1,12 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
-"""
-VLM (Vision-Language Model) processing utilities.
-
-Generates smart instructions for VLM datasets via content analysis and
-heuristics.
-"""
+"""VLM dataset utilities that generate instructions from content analysis and heuristics."""
 
 import re
 from itertools import islice
@@ -17,35 +12,33 @@ def generate_smart_vlm_instruction(
     text_column = "text",
     image_column = "image",
     dataset_name = None,
+    fallback_instruction = None,
 ):
-    """
-    Generate a smart, context-aware instruction for VLM datasets via heuristics.
-
-    Strategy:
-    1. Explicit question/instruction column → use that
-    2. Infer from text column name + sample content
-    3. Analyze dataset name for task hints
-    4. Generic fallback
-
-    Returns:
-        dict: {
-            "instruction": str or None,  # None means use column content
-            "instruction_type": "explicit" | "inferred" | "generic",
-            "uses_dynamic_instruction": bool,  # True if it varies per sample
-            "confidence": float,  # 0.0 to 1.0
-        }
-    """
-    column_names = set(next(iter(dataset)).keys())
+    """selects a VLM instruction from explicit columns, heuristics, an LLM, or the default. fallback_instruction, when set, replaces everything after the explicit question-column scan."""
     sample = next(iter(dataset))
+    column_names = set(sample.keys())
 
-    # Columns that hold per-sample instructions
-    question_columns = ["question", "query", "prompt", "instruction", "user_prompt"]
+    question_columns = [
+        "question",
+        "query",
+        "prompt",
+        "instruction",
+        "user_prompt",
+        "problem",
+        "input",
+        "inputs",
+    ]
+    columns = [col for col in sample if col not in (text_column, image_column)]
 
-    for col in question_columns:
-        if col in column_names:
-            # Use it only if it has non-empty content
-            sample_content = sample[col]
-            if sample_content and str(sample_content).strip():
+    for name in question_columns:
+        matches = ([name] if name in columns else []) + [
+            col for col in columns if col != name and col.lower() == name
+        ]
+        for col in matches:
+            has_text = any(
+                isinstance(row.get(col), str) and row[col].strip() for row in islice(dataset, 100)
+            )
+            if has_text:
                 return {
                     "instruction": None,
                     "instruction_column": col,
@@ -54,9 +47,31 @@ def generate_smart_vlm_instruction(
                     "confidence": 1.0,
                 }
 
+    # Per-row questions win; only a split without them takes the caller's prompt (the training one, for eval).
+    if fallback_instruction is not None:
+        return {
+            "instruction": fallback_instruction,
+            "instruction_column": None,
+            "instruction_type": "inherited",
+            "uses_dynamic_instruction": False,
+            "confidence": 1.0,
+        }
+
     text_col_lower = text_column.lower()
 
-    text_sample = str(sample.get(text_column, ""))[:500]
+    # Hints read the rows the question scan reads, not row 0: a seeded row bound reorders train before formatting.
+    text_rows = dataset
+    fmt = getattr(dataset, "format", None)
+    # A set_transform / with_transform callback may read the columns a projection drops: keep whole rows then.
+    if hasattr(dataset, "select_columns") and not (
+        isinstance(fmt, dict) and fmt.get("type") == "custom"
+    ):
+        try:
+            # Only the text column: full rows decode 100 images, about a second per split on Radiology_mini.
+            text_rows = dataset.select_columns([text_column])
+        except Exception:
+            text_rows = dataset
+    text_samples = [str(row.get(text_column, ""))[:500] for row in islice(text_rows, 100)]
 
     # Task-specific keywords and their instructions
     task_patterns = {
@@ -122,6 +137,7 @@ def generate_smart_vlm_instruction(
     # Score each task by column/dataset name and content matches
     best_match = None
     best_score = 0.0
+    best_hits = 0
 
     for task_name, task_info in task_patterns.items():
         score = 0.0
@@ -134,13 +150,16 @@ def generate_smart_vlm_instruction(
         ):
             score += 0.3
 
-        for pattern in task_info["content_hints"]:
-            if re.search(pattern, text_sample, re.IGNORECASE):
-                score += 0.4
-                break
+        hits = sum(
+            any(re.search(pattern, text, re.IGNORECASE) for pattern in task_info["content_hints"])
+            for text in text_samples
+        )
+        if hits:
+            score += 0.4
 
-        if score > best_score:
-            best_score = score
+        # A tie goes to the task whose hints match more rows (LaTeX rows can also hold a long word).
+        if (score, hits) > (best_score, best_hits):
+            best_score, best_hits = score, hits
             best_match = task_info
 
     if best_match and best_score > 0.5:

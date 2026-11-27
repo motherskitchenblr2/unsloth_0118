@@ -15,22 +15,48 @@ import threading
 import time
 from types import SimpleNamespace
 
-from . import mxc_adapter, mxc_policy, mxc_runtime
+from . import mxc_adapter, mxc_drive_alias, mxc_policy, mxc_read_grants, mxc_runtime
 
 _lock = threading.Lock()
-_cache: dict[tuple, tuple[float, bool, str]] = {}
+# No TTL, as sandbox_probe: the key and invalidate_cache() decide; a timer only re-ran the container.
+_cache: dict[tuple, tuple[bool, str]] = {}
 _inflight: dict[tuple, threading.Event] = {}
-POSITIVE_TTL = 300.0
-NEGATIVE_TTL = 30.0
+MSYS_NAMESPACE_REASON = (
+    "Git Bash (MSYS2) cannot start in the MXC container, which denies the global named-object "
+    "directory it creates (microsoft/mxc#1061)."
+)
+NO_BUILTIN_CONTAINER_REASON = (
+    "This Windows has no built-in container (BaseContainer), and the fallback sandbox is off."
+)
 
 
-_host_prep_cache: dict[str, tuple[float, str | None]] = {}
+_host_prep_cache: dict[str, str | None] = {}
+# Bumped by invalidate_cache(): a check started before it must not publish.
+_generation = 0
 
 
 def invalidate_cache() -> None:
+    global _generation
     with _lock:
         _cache.clear()
         _host_prep_cache.clear()
+        _generation += 1
+    mxc_runtime.forget_verified_runtime()
+    # Only when already loaded: the MXC child paths import this module without the tool stack.
+    os_sandbox = sys.modules.get(f"{__package__}.os_sandbox")
+    if os_sandbox is not None:
+        os_sandbox.forget_tool_isolation()
+
+
+def host_prep_command() -> list[str]:
+    """The elevated host preparation, as argv; Settings > Sandbox runs exactly this."""
+    return [
+        sys.executable,
+        str(Path(__file__).resolve().parents[3] / "install_mxc_prebuilt.py"),
+        "--prepare-host",
+        "--install-dir",
+        str(mxc_runtime._installed_package_root()),
+    ]
 
 
 def host_prep_remediation() -> str | None:
@@ -40,21 +66,13 @@ def host_prep_remediation() -> str | None:
     except Exception:  # noqa: BLE001 - no runtime, nothing to prepare
         return None
     with _lock:
-        cached = _host_prep_cache.get(identity)
-        if cached is not None and time.monotonic() < cached[0]:
-            return cached[1]
+        if identity in _host_prep_cache:
+            return _host_prep_cache[identity]
+        generation = _generation
     steps = mxc_runtime.probe_host_prep_steps(env = mxc_adapter._control_environment())
     advice = None
     if steps:
-        command = subprocess.list2cmdline(
-            [
-                sys.executable,
-                str(Path(__file__).resolve().parents[3] / "install_mxc_prebuilt.py"),
-                "--prepare-host",
-                "--install-dir",
-                str(mxc_runtime._installed_package_root()),
-            ]
-        )
+        command = subprocess.list2cmdline(host_prep_command())
         reboot = (
             " (prepare-null-device is undone by every reboot)"
             if ("prepare-null-device" in steps)
@@ -62,21 +80,31 @@ def host_prep_remediation() -> str | None:
         )
         advice = (
             f"MXC reports missing host preparation: {', '.join(steps)}{reboot}. "
-            f"Run {command} and approve the administrator prompt."
+            f"Run {command} and approve the administrator prompt, or use Settings > Sandbox > "
+            "Prepare this PC."
         )
     with _lock:
-        _host_prep_cache[identity] = (time.monotonic() + NEGATIVE_TTL, advice)
+        # None = wxc-exec could not tell: asked again next time rather than kept as "nothing missing".
+        if generation == _generation and steps is not None:
+            _host_prep_cache[identity] = advice
     return advice
+
+
+def _is_cmd(selected_executable: str) -> bool:
+    return Path(selected_executable).name.casefold() in mxc_policy._CMD_NAMES
 
 
 def _terminal_probe(selected_executable: str, workdir: Path, canary: Path, outside_write: Path):
     name = Path(selected_executable).name.casefold()
     read_capture = workdir / "outside-read.txt"
-    if name in {"cmd", "cmd.exe"}:
+    if _is_cmd(selected_executable):
+        # Quoted redirect is the quoting positive control, else denied read/write pass vacuously
         command = (
             "echo ok>inside.txt"
+            ' & echo ok>"inside quoted.txt"'
             f' & type "{canary}" >"{read_capture}" 2>nul'
             f' & (echo bad>"{outside_write}") 2>nul'
+            " & cd"
             " & echo UNSLOTH_MXC_TERMINAL_PROBE_OK"
         )
         return (selected_executable, "/d", "/s", "/c", command)
@@ -113,13 +141,44 @@ def _terminal_probe(selected_executable: str, workdir: Path, canary: Path, outsi
     raise ValueError(f"the selected Windows Terminal shell is not qualified for MXC: {name}")
 
 
+def _is_msys_namespace_failure(selected_executable: str, execution_kind: str, output) -> bool:
+    """msys-2.0.dll dies in DLL init when AppContainer denies its absolute \\BaseNamedObjects path."""
+    name = Path(selected_executable).name.casefold()
+    if execution_kind != "terminal" or name not in {"bash", "bash.exe"}:
+        return False
+    text = output or ""
+    return (
+        "NtCreateDirectoryObject" in text
+        and "\\BaseNamedObjects\\" in text
+        and "0xc0000022" in text.casefold()
+    )
+
+
+def _executable_signature(selected_executable: str) -> tuple:
+    """An in-place update (a Git for Windows upgrade) keeps the path, so a verdict also keys on the files."""
+    paths = [selected_executable]
+    if Path(selected_executable).name.casefold() in {"bash", "bash.exe"}:
+        bin_dir = Path(selected_executable).parent
+        paths += [bin_dir / "msys-2.0.dll", bin_dir.parent / "usr" / "bin" / "msys-2.0.dll"]
+    signature = []
+    for path in paths:
+        try:
+            stat = os.stat(path)
+        except OSError:
+            signature.append(None)
+        else:
+            signature.append((stat.st_mtime_ns, stat.st_size))
+    return tuple(signature)
+
+
 def _probe(
     selected_executable: str,
     execution_kind: str,
     cancel_event = None,
+    egress_rules: bool = False,
 ) -> tuple[bool, str]:
     if sys.platform != "win32":
-        return False, "MXC is enabled only for native Windows Studio"
+        return False, "MXC is enabled only for native Windows Unsloth"
     if sys.getwindowsversion().build < 26100:
         return False, "Windows 11 build 26100 or newer is required for the MXC Preview"
     try:
@@ -185,10 +244,29 @@ def _probe(
             timeout_seconds = timeout,
             workdir = str(workdir),
             env = env,
+            egress_proxy = egress_rules,
+            egress_rules_probe = egress_rules,
         )
 
+        # Production runs a cmd Terminal from a drive alias of its workdir, so the probe must too.
+        lease = None
+        if execution_kind == "terminal" and _is_cmd(selected_executable):
+            try:
+                lease = mxc_drive_alias.acquire(
+                    mxc_policy._safe_canonical_path(str(workdir), directory = True)
+                )
+            except Exception:
+                lease = None
+        grant_lease = None
         try:
-            request = mxc_policy.build_launch_request(probe_plan)
+            # The probe reads Python through the same grants, so a revocation waits for it too.
+            grant_lease, tried = mxc_read_grants.hold_before_build()
+            request = (
+                mxc_policy.build_launch_request(probe_plan, cwd_alias = lease.root)
+                if lease
+                else mxc_policy.build_launch_request(probe_plan)
+            )
+            grant_lease = mxc_read_grants.hold_for_request(request, grant_lease, tried = tried)
             proc = mxc_adapter.spawn(
                 request,
                 cancel_event = cancel_event,
@@ -225,11 +303,21 @@ def _probe(
                 if proc.poll() is None:
                     mxc_adapter.abort(proc)
                 mxc_adapter.release_runtime(proc)
+            if lease is not None:
+                lease.release()
+            if grant_lease is not None:
+                grant_lease.release()
         if (
             proc.returncode != 0
             or result.get("exitCode") != 0
             or result.get("cleanup") != "complete"
         ):
+            if result.get("cleanup") == "complete" and _is_msys_namespace_failure(
+                selected_executable, execution_kind, output
+            ):
+                return False, MSYS_NAMESPACE_REASON
+            if "BaseContainer is unavailable" in (output or ""):
+                return False, NO_BUILTIN_CONTAINER_REASON
             return False, "the live MXC probe did not complete cleanly"
         if execution_kind == "terminal":
             captured = workdir / "outside-read.txt"
@@ -241,6 +329,8 @@ def _probe(
                 or outside_write.exists()
                 or "outside-secret" in outside_read
                 or not (workdir / "inside.txt").is_file()
+                or (_is_cmd(selected_executable) and not (workdir / "inside quoted.txt").is_file())
+                or (lease is not None and lease.root.casefold() not in output.casefold().split())
             ):
                 return False, "the live MXC Terminal positive/negative controls failed"
             return True, "the selected Terminal passed the live MXC positive and negative controls"
@@ -276,6 +366,7 @@ def probe(
     execution_kind: str = "python",
     force: bool = False,
     cancel_event = None,
+    egress_rules: bool = False,
 ) -> tuple[bool, str]:
     try:
         identity = mxc_runtime.installation_identity()
@@ -286,28 +377,35 @@ def probe(
         mxc_runtime.PROFILE_ID,
         execution_kind,
         os.path.abspath(selected_executable),
+        _executable_signature(selected_executable),
         mxc_policy.dacl_fallback_enabled(),
+        egress_rules,
     )
     while True:
         with _lock:
             cached = _cache.get(key)
-            if cached is not None and not force and time.monotonic() < cached[0]:
-                return cached[1], cached[2]
+            if cached is not None and not force:
+                return cached
             flight = _inflight.get(key)
             if flight is None:
                 flight = threading.Event()
                 _inflight[key] = flight
+                generation = _generation
                 break
         while not flight.wait(0.05):
             if cancel_event is not None and cancel_event.is_set():
                 return False, "MXC capability probe was cancelled"
 
     try:
-        result = _probe(selected_executable, execution_kind, cancel_event)
+        result = _probe(
+            selected_executable,
+            execution_kind,
+            cancel_event,
+            **({"egress_rules": True} if egress_rules else {}),
+        )
         with _lock:
-            if cancel_event is None or not cancel_event.is_set():
-                ttl = POSITIVE_TTL if result[0] else NEGATIVE_TTL
-                _cache[key] = (time.monotonic() + ttl, *result)
+            if generation == _generation and (cancel_event is None or not cancel_event.is_set()):
+                _cache[key] = result
         return result
     finally:
         with _lock:

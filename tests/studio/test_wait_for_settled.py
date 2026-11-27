@@ -1,13 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
-"""`wait_for_settled` replaces "sleep N ms, then measure" in the Playwright smokes.
-
-The fixed sleep is wrong in both directions: on a fast box it waits long after the
-transition ended, and on a loaded runner it measures a box mid-flight. The helper has to
-return once the element is still, keep waiting while it moves, and time out on an
-element that never stops. Run against a real headless Chromium; skipped where there is
-no Playwright or no browser build.
-"""
+"""Fixed sleeps are wrong both ways, so wait_for_settled is tested against real headless Chromium."""
 
 from __future__ import annotations
 
@@ -19,9 +12,16 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from _playwright_robust import chromium_launch_args, wait_for_settled  # noqa: E402
+from _playwright_robust import (  # noqa: E402
+    chromium_launch_args,
+    usable_sync_api,
+    wait_for_settled,
+)
 
-sync_api = pytest.importorskip("playwright.sync_api")
+# Not importorskip: in the CPU job another module's stub answers to playwright.sync_api.
+sync_api = usable_sync_api()
+if sync_api is None:
+    pytest.skip("playwright is not installed here", allow_module_level = True)
 
 
 @pytest.fixture(scope = "module")
@@ -62,7 +62,6 @@ def test_an_element_that_never_stops_times_out(page):
 
 
 def test_a_node_replaced_mid_wait_is_looked_up_again(page):
-    # A re-render that swaps the node must not strand the wait on the detached one.
     page.set_content('<div id="wrap"><div id="box" style="width:100px;height:40px">x</div></div>')
     page.evaluate(
         """() => setTimeout(() => {

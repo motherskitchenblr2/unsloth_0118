@@ -17,6 +17,8 @@ from .format_conversion import (
     convert_to_vlm_format,
     convert_llava_to_vlm_format,
     convert_sharegpt_with_images_to_vlm_format,
+    convert_video_to_vlm_format,
+    own_message_videos,
 )
 
 from .chat_templates import (
@@ -51,30 +53,26 @@ from .dataset_utils import (
 )
 
 __all__ = [
-    # Detection
     "detect_dataset_format",
     "detect_custom_format_heuristic",
     "detect_multimodal_dataset",
     "detect_vlm_dataset_structure",
-    # Conversion
     "standardize_chat_format",
     "convert_chatml_to_alpaca",
     "convert_alpaca_to_chatml",
     "convert_to_vlm_format",
     "convert_llava_to_vlm_format",
     "convert_sharegpt_with_images_to_vlm_format",
-    # Templates
+    "convert_video_to_vlm_format",
+    "own_message_videos",
     "apply_chat_template_to_dataset",
     "get_dataset_info_summary",
     "get_tokenizer_chat_template",
     "DEFAULT_ALPACA_TEMPLATE",
-    # VLM
     "generate_smart_vlm_instruction",
-    # Collators
     "DataCollatorSpeechSeq2SeqWithPadding",
     "DeepSeekOCRDataCollator",
     "VLMDataCollator",
-    # Mappings
     "TEMPLATE_TO_MODEL_MAPPER",
     "MODEL_TO_TEMPLATE_MAPPER",
     "TEMPLATE_TO_RESPONSES_MAPPER",

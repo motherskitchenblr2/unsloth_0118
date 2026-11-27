@@ -51,12 +51,19 @@ def test_a_video_family_without_a_usable_hosted_seed_spends_no_smoke_probe(monke
         tq, "_smoke_probe", lambda s, d, unproven_ok = False: calls.append(s) or unproven_ok
     )
     monkeypatch.setattr(tq, "dense_transformer_supported", lambda t: True)
-    monkeypatch.setattr(tq, "_capability", lambda: (10, 0))
+    monkeypatch.setattr(tq, "_capability", lambda ordinal = None: (10, 0))
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    from core.inference.video_families import video_family_prequant_schemes
+
     target = types.SimpleNamespace(device = "cuda", dtype = torch.bfloat16, ordinal = 0)
-    for fam in _FAMILIES:
-        if getattr(fam, "modular_workflow", None):
-            continue
+    # Families with a hosted fp8 / int8 seed (Wan2.2) legitimately probe; the rest must not.
+    unseeded = [
+        fam
+        for fam in _FAMILIES
+        if not getattr(fam, "modular_workflow", None) and not video_family_prequant_schemes(fam)
+    ]
+    assert unseeded
+    for fam in unseeded:
         assert (
             vid._video_auto_denoiser_scheme(
                 fam, target = target, requested = requested, base_repo = fam.base_repo
@@ -110,7 +117,7 @@ def _blackwell(monkeypatch, *, supported = ("int8", "fp8", "nvfp4", "mxfp8")):
     import torch
 
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
-    monkeypatch.setattr(tq, "_capability", lambda: (10, 0))
+    monkeypatch.setattr(tq, "_capability", lambda ordinal = None: (10, 0))
     monkeypatch.setattr(tq, "dense_transformer_supported", lambda target: True)
     monkeypatch.setattr(tq, "_is_consumer_gpu", lambda device = None: False)
     monkeypatch.setattr(tq, "_child_probe_table", lambda device: None)
@@ -343,9 +350,13 @@ _WAN_SIBLINGS = {
         _sib("text_encoder/model-00001-of-00001.safetensors", 11_000_000_000),
         _sib("vae/diffusion_pytorch_model.safetensors", 500_000_000),
     ],
+}
+# The base's unsloth mirror holds the same files at the same paths, and is the repo a default load fetches from.
+_WAN_SIBLINGS["unsloth/Wan2.2-T2V-A14B-FP8"] = _WAN_SIBLINGS[_WAN_T2V]
+_WAN_SIBLINGS |= {
     "unsloth/Wan2.2-T2V-A14B-NVFP4": [
-        _sib("Wan2.2-T2V-A14B-NVFP4.pt", 8_000_000_000),
-        _sib("Wan2.2-T2V-A14B-transformer_2-NVFP4.pt", 8_100_000_000),
+        _sib("Wan2.2-T2V-A14B-NVFP4.safetensors", 8_000_000_000),
+        _sib("Wan2.2-T2V-A14B-transformer_2-NVFP4.safetensors", 8_100_000_000),
     ],
 }
 
@@ -405,7 +416,7 @@ def test_the_image_hub_entry_never_asks_about_an_nvfp4_repo(monkeypatch):
         "huggingface_hub.HfApi", lambda *a, **k: types.SimpleNamespace(model_info = asked.append)
     )
     source = types.SimpleNamespace(
-        kind = "repo", location = "unsloth/Z-Image-Turbo-NVFP4", filename = "x-NVFP4.pt"
+        kind = "repo", location = "unsloth/Z-Image-Turbo-NVFP4", filename = "x-NVFP4.safetensors"
     )
     assert DiffusionBackend._prequant_source_hub_entry(source, None, scheme = "nvfp4") is None
     assert DiffusionBackend._prequant_source_hub_entry(source, None) is None
@@ -458,7 +469,10 @@ def test_enabled_the_video_plan_stages_the_hosted_nvfp4_denoisers(monkeypatch):
     _enable(monkeypatch)
     plan, staged, api = _wan_plan(monkeypatch)
     assert "unsloth/Wan2.2-T2V-A14B-NVFP4" in api.asked
-    assert {"Wan2.2-T2V-A14B-NVFP4.pt", "Wan2.2-T2V-A14B-transformer_2-NVFP4.pt"} <= staged
+    assert {
+        "Wan2.2-T2V-A14B-NVFP4.safetensors",
+        "Wan2.2-T2V-A14B-transformer_2-NVFP4.safetensors",
+    } <= staged
     assert "transformer/diffusion_pytorch_model.safetensors" not in staged
 
 
@@ -498,9 +512,7 @@ def test_the_nvfp4_auto_rows_are_dropped_before_any_gate_or_flashinfer_probe(mon
 def test_enabled_the_flashinfer_auto_row_leads_again(monkeypatch):
     _enable(monkeypatch)
     calls = _record_nvfp4_probes(monkeypatch)
-    monkeypatch.setattr(
-        tq, "_is_consumer_gpu", lambda device = None: False
-    )  # not the runner's own card
+    monkeypatch.setattr(tq, "_is_consumer_gpu", lambda device = None: False)
     order = tq._auto_scheme_order("wan2.2-t2v-a14b", "cuda", (10, 0), "Wan-AI/Wan2.2-T2V-A14B")
     assert order[0] == tq.TQ_NVFP4
     assert "backend" in calls
