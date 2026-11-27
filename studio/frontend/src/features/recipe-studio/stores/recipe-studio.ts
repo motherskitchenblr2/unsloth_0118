@@ -12,23 +12,25 @@ import {
   applyNodeChanges,
 } from "@xyflow/react";
 import { create } from "zustand";
-import type {
-  RecipeNode,
-  RecipeProcessorConfig,
-  LayoutDirection,
-  LlmType,
-  NodeConfig,
-  SeedSourceType,
-  SamplerType,
-} from "../types";
 import {
-  getBlockDefinition,
   type BlockKind,
   type BlockType,
   type SeedBlockType,
+  type ValidatorBlockType,
+  getBlockDefinition,
 } from "../blocks/registry";
-import { deriveDisplayGraph } from "../utils/graph/derive-display-graph";
+import type {
+  LayoutDirection,
+  LlmType,
+  NodeConfig,
+  RecipeNode,
+  RecipeProcessorConfig,
+  SamplerType,
+  SeedSourceType,
+} from "../types";
+import { swapSeedSourceType } from "../utils/config-factories";
 import { applyRecipeConnection, isValidRecipeConnection } from "../utils/graph";
+import { deriveDisplayGraph } from "../utils/graph/derive-display-graph";
 import {
   HANDLE_IDS,
   normalizeRecipeHandleId,
@@ -42,8 +44,8 @@ import {
 } from "./helpers/model-infra-layout";
 import { applyEdgeRemovals, applyNodeRemovals } from "./helpers/removals";
 import {
-  applyRenameToConfigs,
   applyLayoutDirectionToNodes,
+  applyRenameToConfigs,
   buildNodeUpdate,
   syncEdgesForConfigPatch,
   syncSubcategoryConfigsForCategoryUpdate,
@@ -55,6 +57,7 @@ type SheetView =
   | "sampler"
   | "seed"
   | "llm"
+  | "model"
   | "validator"
   | "expression"
   | "note"
@@ -76,6 +79,9 @@ type RecipeStudioState = {
   nextId: number;
   nextY: number;
   fitViewTick: number;
+  // Deletion is deferred until a save stops referencing the uid, so a reload cannot orphan files.
+  pendingUploadCleanups: string[];
+  queueUploadCleanup: (uid: string) => void;
   setSheetOpen: (open: boolean) => void;
   setSheetView: (view: SheetView) => void;
   setProcessors: (processors: RecipeProcessorConfig[]) => void;
@@ -97,13 +103,17 @@ type RecipeStudioState = {
     position?: XYPosition,
     openDialog?: boolean,
   ) => void;
-  addLlmNode: (type: LlmType, position?: XYPosition, openDialog?: boolean) => void;
+  addLlmNode: (
+    type: LlmType,
+    position?: XYPosition,
+    openDialog?: boolean,
+  ) => void;
   addModelProviderNode: (position?: XYPosition, openDialog?: boolean) => void;
   addModelConfigNode: (position?: XYPosition, openDialog?: boolean) => void;
   addToolProfileNode: (position?: XYPosition, openDialog?: boolean) => void;
   addExpressionNode: (position?: XYPosition, openDialog?: boolean) => void;
   addValidatorNode: (
-    type: "validator_python" | "validator_sql" | "validator_oxc",
+    type: ValidatorBlockType,
     position?: XYPosition,
     openDialog?: boolean,
   ) => void;
@@ -133,6 +143,7 @@ const INITIAL_STATE = {
   nextId: 3,
   nextY: 280,
   fitViewTick: 0,
+  pendingUploadCleanups: [],
 } satisfies Pick<
   RecipeStudioState,
   | "nodes"
@@ -150,6 +161,7 @@ const INITIAL_STATE = {
   | "nextId"
   | "nextY"
   | "fitViewTick"
+  | "pendingUploadCleanups"
 >;
 
 function buildAddedNodeState(
@@ -250,7 +262,10 @@ function connectSemantic(
   };
 }
 
-function isModelSemanticEdge(edge: Edge, configs: Record<string, NodeConfig>): boolean {
+function isModelSemanticEdge(
+  edge: Edge,
+  configs: Record<string, NodeConfig>,
+): boolean {
   const source = configs[edge.source];
   const target = configs[edge.target];
   return Boolean(
@@ -262,6 +277,18 @@ function isModelSemanticEdge(edge: Edge, configs: Record<string, NodeConfig>): b
   );
 }
 
+// Only uid directories qualify; legacy node-id directories can be shared by other recipes.
+function seedUploadCleanupUid(config: NodeConfig | undefined): string | null {
+  if (!config || config.kind !== "seed") {
+    return null;
+  }
+  const uid = config.unstructured_upload_uid?.trim();
+  if (!uid || !config.unstructured_file_ids?.length) {
+    return null;
+  }
+  return uid;
+}
+
 export const useRecipeStudioStore = create<RecipeStudioState>((set, get) => ({
   ...INITIAL_STATE,
   setSheetOpen: (open) => set({ sheetOpen: open }),
@@ -271,6 +298,12 @@ export const useRecipeStudioStore = create<RecipeStudioState>((set, get) => ({
   setDialogOpen: (open) => set({ dialogOpen: open }),
   setExecutionLocked: (locked) => set({ executionLocked: locked }),
   resetRecipe: () => set(INITIAL_STATE),
+  queueUploadCleanup: (uid) =>
+    set((state) =>
+      state.pendingUploadCleanups.includes(uid)
+        ? state
+        : { pendingUploadCleanups: [...state.pendingUploadCleanups, uid] },
+    ),
   selectConfig: (id) => set({ activeConfigId: id, dialogOpen: false }),
   openConfig: (id) => set({ activeConfigId: id, dialogOpen: true }),
   setLayoutDirection: (direction) =>
@@ -315,12 +348,16 @@ export const useRecipeStudioStore = create<RecipeStudioState>((set, get) => ({
         auxNodePositions: {},
         llmAuxVisibility: state.llmAuxVisibility,
       });
-      const { nodes } = getLayoutedElements(displayGraph.nodes, displayGraph.edges, {
-        direction: state.layoutDirection,
-        nodesep: isTopBottom ? 120 : 80,
-        ranksep: isTopBottom ? 140 : 80,
-        configs: state.configs,
-      });
+      const { nodes } = getLayoutedElements(
+        displayGraph.nodes,
+        displayGraph.edges,
+        {
+          direction: state.layoutDirection,
+          nodesep: isTopBottom ? 120 : 80,
+          ranksep: isTopBottom ? 140 : 80,
+          configs: state.configs,
+        },
+      );
       const layoutedPositions = new Map(
         nodes.map((node) => [node.id, node.position] as const),
       );
@@ -372,7 +409,16 @@ export const useRecipeStudioStore = create<RecipeStudioState>((set, get) => ({
       }
       return buildAddedNodeState(state, "sampler", type, position, openDialog);
     }),
-  addSeedNode: (type, position, openDialog = true) =>
+  addSeedNode: (type, position, openDialog = true) => {
+    const current = get();
+    if (!current.executionLocked) {
+      const uid = seedUploadCleanupUid(
+        Object.values(current.configs).find((config) => config.kind === "seed"),
+      );
+      if (uid) {
+        current.queueUploadCleanup(uid);
+      }
+    }
     set((state) => {
       if (state.executionLocked) {
         return state;
@@ -381,48 +427,28 @@ export const useRecipeStudioStore = create<RecipeStudioState>((set, get) => ({
         (config) => config.kind === "seed",
       );
       if (!existing) {
-        return buildAddedNodeState(
-          state,
-          "seed",
-          type,
-          position,
-          openDialog,
-        );
+        return buildAddedNodeState(state, "seed", type, position, openDialog);
       }
       let nextSourceType: SeedSourceType = "hf";
       if (type === "seed_local") {
         nextSourceType = "local";
       } else if (type === "seed_unstructured") {
         nextSourceType = "unstructured";
+      } else if (type === "seed_github") {
+        nextSourceType = "github_repo";
       }
 
-      const nextConfig = {
-        ...existing,
-        seed_source_type: nextSourceType,
-        hf_repo_id: "",
-        hf_subset: "",
-        hf_split: "",
-        hf_path: "",
-        hf_token: "",
-        hf_endpoint: "https://huggingface.co",
-        local_file_name: "",
-        unstructured_file_ids: [],
-        unstructured_file_names: [],
-        unstructured_file_sizes: [],
-        resolved_paths: [],
-        seed_columns: [],
-        seed_drop_columns: [],
-        seed_preview_rows: [],
-        unstructured_chunk_size: "1200",
-        unstructured_chunk_overlap: "200",
-      };
+      const nextConfig = swapSeedSourceType(existing, nextSourceType);
       return {
         configs: {
           ...state.configs,
           [existing.id]: nextConfig,
         },
         nodes: updateNodeData(
-          state.nodes.map((node) => ({ ...node, selected: node.id === existing.id })),
+          state.nodes.map((node) => ({
+            ...node,
+            selected: node.id === existing.id,
+          })),
           existing.id,
           nextConfig,
           state.layoutDirection,
@@ -430,13 +456,20 @@ export const useRecipeStudioStore = create<RecipeStudioState>((set, get) => ({
         activeConfigId: existing.id,
         dialogOpen: openDialog,
       };
-    }),
+    });
+  },
   addLlmNode: (type, position, openDialog = true) =>
     set((state) => {
       if (state.executionLocked) {
         return state;
       }
-      const added = buildAddedNodeState(state, "llm", type, position, openDialog);
+      const added = buildAddedNodeState(
+        state,
+        "llm",
+        type,
+        position,
+        openDialog,
+      );
       const context = getAddedNodeContext(added);
       if (!context) {
         return added;
@@ -487,9 +520,7 @@ export const useRecipeStudioStore = create<RecipeStudioState>((set, get) => ({
       let { nodes, configs } = context;
       let edges = state.edges;
       const unboundModelConfigs = Object.values(configs).filter(
-        (config) =>
-          config.kind === "model_config" &&
-          !config.provider.trim(),
+        (config) => config.kind === "model_config" && !config.provider.trim(),
       );
       if (!position && unboundModelConfigs.length > 0) {
         nodes = placeNodeNear(
@@ -597,7 +628,7 @@ export const useRecipeStudioStore = create<RecipeStudioState>((set, get) => ({
       let { nodes, configs } = context;
       let edges = state.edges;
       const unboundLlms = Object.values(configs).filter(
-        (config) => config.kind === "llm" && !(config.tool_alias?.trim()),
+        (config) => config.kind === "llm" && !config.tool_alias?.trim(),
       );
       if (!position && unboundLlms.length > 0) {
         nodes = placeNodeNear(
@@ -679,6 +710,8 @@ export const useRecipeStudioStore = create<RecipeStudioState>((set, get) => ({
       dialogOpen: false,
       sheetView: "root",
       fitViewTick: state.fitViewTick + 1,
+      // These belong to the previous recipe; draining after this save could delete files it uses.
+      pendingUploadCleanups: [],
     })),
   setAuxNodePosition: (id, position) =>
     set((state) => {
@@ -736,10 +769,7 @@ export const useRecipeStudioStore = create<RecipeStudioState>((set, get) => ({
         configs = applyRenameToConfigs(configs, oldName, newName);
       }
 
-      // When a provider toggles between local and external, keep already
-      // linked model_config nodes in sync. applyRenameToConfigs above has
-      // already propagated any name change, so providerName here is the
-      // post-rename value.
+      // Keep linked model_config nodes in sync when a provider toggles local/external.
       if (current.kind === "model_provider" && next.kind === "model_provider") {
         const prevIsLocal = current.is_local === true;
         const nextIsLocal = next.is_local === true;
@@ -749,17 +779,15 @@ export const useRecipeStudioStore = create<RecipeStudioState>((set, get) => ({
             if (cfg.kind !== "model_config" || cfg.provider !== providerName) {
               continue;
             }
-            if (nextIsLocal && !cfg.model.trim()) {
-              // external -> local: auto fill the placeholder model id so the
-              // config does not fail "model is required" validation.
-              configs = { ...configs, [cfgId]: { ...cfg, model: "local" } };
-              continue;
-            }
-            if (!nextIsLocal && cfg.model === "local") {
-              // local -> external: clear the placeholder so the user picks a
-              // real model id for the new external endpoint.
-              configs = { ...configs, [cfgId]: { ...cfg, model: "" } };
-            }
+            configs = {
+              ...configs,
+              [cfgId]: {
+                ...cfg,
+                model: "",
+                // biome-ignore lint/style/useNamingConvention: api schema
+                gguf_variant: undefined,
+              },
+            };
           }
         }
       }
@@ -769,6 +797,17 @@ export const useRecipeStudioStore = create<RecipeStudioState>((set, get) => ({
     set(applyUpdate);
   },
   onNodesChange: (changes) => {
+    const current = get();
+    if (!current.executionLocked) {
+      for (const change of changes) {
+        if (change.type === "remove") {
+          const uid = seedUploadCleanupUid(current.configs[change.id]);
+          if (uid) {
+            current.queueUploadCleanup(uid);
+          }
+        }
+      }
+    }
     const applyNodesChange = (state: RecipeStudioState) => {
       if (state.executionLocked) {
         return state;

@@ -1,12 +1,7 @@
-# Model defaults for unsloth/gemma-3-4b-pt
-# Based on Gemma3_(4B)-Vision.ipynb
 # Also applies to: unsloth/gemma-3-4b-pt-unsloth-bnb-4bit, google/gemma-3-4b-pt, unsloth/gemma-3-4b-pt-bnb-4bit
-# added inference parameters from unsloth guides
 
 training:
-  trust_remote_code: false
   max_seq_length: 2048
-  # num_epochs: 2
   num_epochs: 0
   learning_rate: 2e-4
   batch_size: 1
@@ -18,7 +13,7 @@ training:
   random_seed: 3407
   packing: false
   train_on_completions: true
-  gradient_checkpointing: true
+  gradient_checkpointing: "unsloth"
   optim: "adamw_torch_fused"
   lr_scheduler_type: "cosine"
 
@@ -30,6 +25,7 @@ lora:
     - "all-linear"
   use_rslora: false
   use_loftq: false
+  use_dora: false
   finetune_vision_layers: true
   finetune_language_layers: true
   finetune_attention_modules: true
@@ -43,7 +39,6 @@ logging:
   log_frequency: 10
 
 inference:
-  trust_remote_code: false
   temperature: 1.0
   top_k: 64
   top_p: 0.95

@@ -2,18 +2,32 @@
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
 """
-Inference submodule - Inference backend for model loading and generation
+Inference submodule - backend for model loading and generation.
 
 The default get_inference_backend() returns an InferenceOrchestrator that
-delegates to a subprocess. The original InferenceBackend runs inside
-the subprocess and can be imported directly from .inference when needed.
+delegates to a subprocess. The original InferenceBackend runs inside the
+subprocess and can be imported directly from .inference when needed.
+
+Public names are resolved lazily (PEP 562): importing this package -- or a
+dependency-light leaf like ``core.inference.chat_eos`` -- must NOT eagerly pull
+the orchestrator / llama_cpp import chain (httpx, subprocess plumbing, the ML
+backend and its Unsloth dependencies). Those load only when a public name is
+actually accessed, so standalone helpers stay unit-testable without the full
+inference stack.
 """
 
-from .orchestrator import InferenceOrchestrator, get_inference_backend
-from .llama_cpp import LlamaCppBackend
+import os
+from typing import TYPE_CHECKING
 
-# Expose InferenceOrchestrator as InferenceBackend for backward compat
-InferenceBackend = InferenceOrchestrator
+# Same ROCm AOTriton opt-in as main.py, for entries that skip main.py; read at first SDPA dispatch, setdefault keeps explicit 0; else gfx1151 runs MATH
+os.environ.setdefault("TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL", "1")
+
+# Same flash-attn switch as main.py, for entries that skip it.
+try:
+    from utils.rocm_flash_attn import default_triton_amd_env as _default_triton_amd_env
+    _default_triton_amd_env()
+except Exception:  # noqa: BLE001
+    pass
 
 __all__ = [
     "InferenceBackend",
@@ -21,3 +35,32 @@ __all__ = [
     "get_inference_backend",
     "LlamaCppBackend",
 ]
+
+_LAZY_ATTRS = {
+    "InferenceOrchestrator": ("orchestrator", "InferenceOrchestrator"),
+    "InferenceBackend": ("orchestrator", "InferenceOrchestrator"),
+    "get_inference_backend": ("orchestrator", "get_inference_backend"),
+    "LlamaCppBackend": ("llama_cpp", "LlamaCppBackend"),
+}
+
+
+def __getattr__(name):
+    try:
+        submodule, attr = _LAZY_ATTRS[name]
+    except KeyError:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}") from None
+    from importlib import import_module
+
+    value = getattr(import_module(f"{__name__}.{submodule}"), attr)
+    globals()[name] = value
+    return value
+
+
+def __dir__():
+    return sorted(set(globals()) | set(__all__))
+
+
+if TYPE_CHECKING:
+    from .llama_cpp import LlamaCppBackend
+    from .orchestrator import InferenceOrchestrator, get_inference_backend
+    InferenceBackend = InferenceOrchestrator

@@ -1,40 +1,99 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
+import { ChevronLeftStandardIcon } from "@/lib/chevron-icons";
+import { HugeiconsIcon } from "@hugeicons/react";
+import { useAppShellReadySignal } from "@/components/app-readiness";
+import { usePlatformStore } from "@/config/env";
+import { Button } from "@/components/ui/button";
+import { Spinner } from "@/components/ui/spinner";
+import { Tabs, TabsContent } from "@/components/ui/tabs";
+import { useHfTokenStore } from "@/features/hub";
+import { GuidedTour, useGuidedTourController } from "@/features/tour";
 import {
-  shouldShowTrainingView,
   useDatasetPreviewDialogStore,
   useTrainingConfigStore,
   useTrainingRuntimeLifecycle,
   useTrainingRuntimeStore,
 } from "@/features/training";
-import { GuidedTour, useGuidedTourController } from "@/features/tour";
-import { studioTourSteps, studioTrainingTourSteps } from "./tour";
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { Button } from "@/components/ui/button";
-import { ArrowLeft01Icon } from "@hugeicons/core-free-icons";
-import { HugeiconsIcon } from "@hugeicons/react";
-import { type ReactElement, useCallback, useEffect, useMemo, useState } from "react";
-import { useSidebar } from "@/components/ui/sidebar";
-import { DatasetPreviewDialog } from "./sections/dataset-preview-dialog";
-import { DatasetSection } from "./sections/dataset-section";
-import { ModelSection } from "./sections/model-section";
-import { ParamsSection } from "./sections/params-section";
-import { TrainingSection } from "./sections/training-section";
-import { LiveTrainingView } from "./live-training-view";
+import { useT } from "@/i18n";
+import { MediaPageLink } from "@/components/media-page-link";
+// eslint-disable-next-line no-restricted-imports -- the Images barrel would pull ImagesPage out of its lazy chunk.
+import { useImageWorkflowStore } from "@/features/images/stores/image-workflow-store";
+import {
+  ImageIcon,
+  LibrariesIcon,
+} from "@hugeicons/core-free-icons";
+import { useNavigate } from "@tanstack/react-router";
+import {
+  type ReactElement,
+  useEffect,
+  useRef,
+} from "react";
+import { useShallow } from "zustand/react/shallow";
 import { HistoricalTrainingView } from "./historical-training-view";
 import { HistoryCardGrid } from "./history-card-grid";
+import { useTrainingCacheReconciliation } from "./hooks/use-training-cache-reconciliation";
+import { LiveTrainingView } from "./live-training-view";
+import { DatasetPreviewDialog } from "./sections/dataset-preview-dialog";
+import { TrainSubNav } from "./studio-navigation";
+import { TrainingApiButton } from "./training-api-button";
+import {
+  studioHistoryTourSteps,
+  studioTourSteps,
+  studioTrainingTourSteps,
+} from "./tour";
+import {
+  type TrainSubTab,
+  getStudioSubtitle,
+  useStudioNavigation,
+} from "./use-studio-navigation";
+import { RunPreviewCard } from "./wizard/run-preview-card";
+import { StartTrainingCta } from "./wizard/start-training-cta";
+import { useParamMode } from "./wizard/training-param-mode";
+import { TrainingWizard } from "./wizard/training-wizard";
 
 export function StudioPage(): ReactElement {
+  const signalReady = useAppShellReadySignal();
+  const t = useT();
+  const setImagesPageMode = useImageWorkflowStore((s) => s.setPageMode);
+  const [paramMode, setParamMode] = useParamMode();
   useTrainingRuntimeLifecycle();
-  const showTrainingView = useTrainingRuntimeStore(shouldShowTrainingView);
-  const isTrainingRunning = useTrainingRuntimeStore((state) => state.isTrainingRunning);
-  const currentJobId = useTrainingRuntimeStore((state) => state.jobId);
+  useTrainingCacheReconciliation();
   const runtimeMessage = useTrainingRuntimeStore((state) => state.message);
-  const isHydratingRuntime = useTrainingRuntimeStore((state) => state.isHydrating);
-  const hasHydratedRuntime = useTrainingRuntimeStore((state) => state.hasHydrated);
+  const isHydratingRuntime = useTrainingRuntimeStore(
+    (state) => state.isHydrating,
+  );
+  const hasHydratedRuntime = useTrainingRuntimeStore(
+    (state) => state.hasHydrated,
+  );
 
-  const config = useTrainingConfigStore();
+  const config = useTrainingConfigStore(
+    useShallow((s) => ({
+      datasetSource: s.datasetSource,
+      dataset: s.dataset,
+      uploadedFile: s.uploadedFile,
+      datasetKnownCached: s.datasetKnownCached,
+      datasetLocalPath: s.datasetLocalPath,
+      datasetStreaming: s.datasetStreaming,
+      datasetSubset: s.datasetSubset,
+      datasetSplit: s.datasetSplit,
+      isVisionModel: s.isVisionModel,
+      isDatasetImage: s.isDatasetImage,
+    })),
+  );
+  const capabilitiesUnknown = usePlatformStore((s) => s.capabilitiesUnknown());
+  const trainUnavailable = usePlatformStore((s) => s.isTrainUnavailable());
+  const trainsOnCpu = usePlatformStore(
+    (s) => s.isCpuTrainingHost() && !s.capabilitiesUnknown(),
+  );
+  const navigate = useNavigate();
+  // The guard let this load on a guess; leave once the host is confirmed unable to train.
+  useEffect(() => {
+    if (capabilitiesUnknown || !trainUnavailable) return;
+    void navigate({ to: "/chat", replace: true });
+  }, [capabilitiesUnknown, trainUnavailable, navigate]);
+  const hfToken = useHfTokenStore((s) => s.token);
   const selectedModel = useTrainingConfigStore((s) => s.selectedModel);
   const ensureModelDefaultsLoaded = useTrainingConfigStore(
     (s) => s.ensureModelDefaultsLoaded,
@@ -47,38 +106,26 @@ export function StudioPage(): ReactElement {
   const dialogInitial = useDatasetPreviewDialogStore((s) => s.initialData);
   const closeDialog = useDatasetPreviewDialogStore((s) => s.close);
 
-  const [requestedTab, setRequestedTab] = useState("configure");
-  const selectedHistoryRunId = useTrainingRuntimeStore((s) => s.selectedHistoryRunId);
-  const setSelectedHistoryRunId = useTrainingRuntimeStore((s) => s.setSelectedHistoryRunId);
-
-  useEffect(() => {
-    return () => setSelectedHistoryRunId(null);
-  }, [setSelectedHistoryRunId]);
-
-  // Derive activeTab: auto-switch to "current-run" only while training is
-  // genuinely running.  Once training ends, honour whatever tab the user clicks.
-  // If requestedTab is "current-run" but there's nothing to show, fall back to "configure".
-  const activeTab =
-    isTrainingRunning && requestedTab !== "history"
-      ? "current-run"
-      : requestedTab === "current-run" && !showTrainingView
-        ? "configure"
-        : requestedTab;
-
-  const { setPinned } = useSidebar();
-  const pinSidebar = useCallback(() => setPinned(true), [setPinned]);
+  const {
+    activeTab,
+    clearHistorySelection,
+    handleHistoryRunSelected,
+    handleResumeStarted,
+    handleTabChange,
+    trainingRunActive,
+    selectedHistoryRunId,
+    showTrainingView,
+  } = useStudioNavigation();
 
   const tourEnabled = hasHydratedRuntime && !isHydratingRuntime;
   const isConfigTour = activeTab === "configure";
-  const baseTourSteps = activeTab === "current-run" ? studioTrainingTourSteps : studioTourSteps;
-  // Inject onEnter for navbar-targeting steps so the sidebar expands during the tour.
-  const tourSteps = useMemo(
-    () =>
-      baseTourSteps.map((step) =>
-        step.target === "navbar" ? { ...step, onEnter: pinSidebar } : step,
-      ),
-    [baseTourSteps, pinSidebar],
-  );
+  // Each tab unmounts the others, so steps must match the anchors on screen.
+  const tourSteps =
+    activeTab === "current-run"
+      ? studioTrainingTourSteps
+      : activeTab === "history"
+        ? studioHistoryTourSteps
+        : studioTourSteps;
   const tour = useGuidedTourController({
     id: "studio",
     steps: tourSteps,
@@ -86,135 +133,193 @@ export function StudioPage(): ReactElement {
   });
 
   const setTourOpen = tour.setOpen;
+  const previousTourTabRef = useRef(activeTab);
   useEffect(() => {
+    if (previousTourTabRef.current === activeTab) {
+      return;
+    }
+    previousTourTabRef.current = activeTab;
     setTourOpen(false);
   }, [activeTab, setTourOpen]);
 
-  // When training auto-switches us to "current-run", persist that in
-  // requestedTab so the user stays on results after training ends.
   useEffect(() => {
-    if (isTrainingRunning && requestedTab !== "history" && requestedTab !== "current-run") {
-      setRequestedTab("current-run");
-      setSelectedHistoryRunId(null);
+    if (selectedModel) {
+      ensureModelDefaultsLoaded();
     }
-  }, [isTrainingRunning, requestedTab]);
-
-  // Selecting a run from the sidebar only sets selectedHistoryRunId; auto-switch
-  // to the History tab so the main panel reflects the selection.
-  useEffect(() => {
-    if (selectedHistoryRunId && requestedTab !== "history") {
-      setRequestedTab("history");
-    }
-  }, [selectedHistoryRunId, requestedTab]);
-
-  useEffect(() => {
-    ensureModelDefaultsLoaded();
     ensureDatasetChecked();
   }, [selectedModel, ensureModelDefaultsLoaded, ensureDatasetChecked]);
 
-  function handleTabChange(value: string) {
-    setRequestedTab(value);
-    if (value !== "history") {
-      setSelectedHistoryRunId(null);
-    }
-  }
+  const subtitle = getStudioSubtitle({
+    activeTab,
+    runtimeMessage,
+    selectedHistoryRunId,
+    t,
+  });
 
-  const subtitle = (() => {
-    if (activeTab === "current-run") return runtimeMessage || "Training in progress";
-    if (activeTab === "history")
-      return selectedHistoryRunId ? "Viewing past run" : "View past training runs";
-    return "Configure and start training";
-  })();
+  // The root guard lets /studio through while the hardware verdict is out, so wait here.
+  // AppSidebar re-reads /api/health into this store, so no second poll is needed.
+  const showTrainingHydrating =
+    capabilitiesUnknown || (!hasHydratedRuntime && isHydratingRuntime);
+  const reloadReadySent = useRef(false);
+  useEffect(() => {
+    if (
+      capabilitiesUnknown ||
+      !hasHydratedRuntime ||
+      isHydratingRuntime ||
+      reloadReadySent.current
+    ) {
+      return;
+    }
+    reloadReadySent.current = true;
+    signalReady();
+  }, [capabilitiesUnknown, hasHydratedRuntime, isHydratingRuntime, signalReady]);
+  // Hardware detection is a cold `import torch` that can take minutes, so it gets its own wording.
+  const hydratingMessage = capabilitiesUnknown
+    ? t("studio.checkingSupport")
+    : t("studio.loadingRuntime");
+  const showHistoryBack = activeTab === "history" && !!selectedHistoryRunId;
 
   return (
-    <div className="relative min-h-screen bg-background">
-      <main className="relative z-10 mx-auto max-w-7xl px-4 py-4 sm:px-6">
-        <GuidedTour {...tour.tourProps} celebrate={isConfigTour} />
-
-        <DatasetPreviewDialog
-          open={dialogOpen}
-          onOpenChange={(open) => {
-            if (!open) closeDialog();
-          }}
-          datasetSource={config.datasetSource}
-          datasetName={
-            config.datasetSource === "huggingface" ? config.dataset : config.uploadedFile
-          }
-          hfToken={config.hfToken.trim() || null}
-          datasetSubset={config.datasetSubset}
-          datasetSplit={config.datasetSplit}
-          mode={dialogMode}
-          initialData={dialogInitial}
-          isVlm={config.isVisionModel && config.isDatasetImage === true}
-        />
-
-        <div className="mb-6 flex flex-col gap-0.5 sm:mb-8">
-          <h1 className="text-2xl font-semibold tracking-tight">
-            Fine-tuning Studio
-          </h1>
-          <p className="text-sm text-muted-foreground">{subtitle}</p>
-        </div>
-
-        {!hasHydratedRuntime && isHydratingRuntime ? (
-          <div className="rounded-xl border bg-card p-8 text-sm text-muted-foreground">
-            Loading training runtime...
-          </div>
-        ) : (
-          <Tabs value={activeTab} onValueChange={handleTabChange}>
-            <div className="flex items-center gap-3">
-              {selectedHistoryRunId && activeTab === "history" && (
-                <Button
-                  variant="ghost"
-                  size="icon-sm"
-                  className="rounded-full text-muted-foreground"
-                  onClick={() => setSelectedHistoryRunId(null)}
-                  aria-label="Back to history"
-                >
-                  <HugeiconsIcon icon={ArrowLeft01Icon} className="size-4" />
-                </Button>
-              )}
-              <TabsList variant="line">
-                <TabsTrigger value="configure" disabled={isTrainingRunning}>
-                  Configure
-                </TabsTrigger>
-                <TabsTrigger value="current-run" disabled={!showTrainingView}>
-                  Current Run
-                </TabsTrigger>
-                <TabsTrigger value="history">History</TabsTrigger>
-              </TabsList>
+    <div data-wallpaper-page-canvas="" className="flex h-full min-h-0 flex-col bg-background">
+      <Tabs
+        value={activeTab}
+        onValueChange={(value) => handleTabChange(value as TrainSubTab)}
+        className="contents"
+      >
+        <div className="mx-auto flex w-full max-w-[calc(1180px*var(--ui-space-scale,1))] 3xl:max-w-[calc(1440px*var(--ui-space-scale,1))] 4xl:max-w-[calc(1760px*var(--ui-space-scale,1))] flex-col gap-7 px-5 pb-20 pt-8 max-sm:px-4 sm:px-9">
+          <header className="font-heading flex flex-col gap-5">
+            <div className="flex flex-col gap-0.5">
+              <h1 className="text-ui-30 font-semibold leading-[1.04] tracking-[-0.028em] text-foreground sm:text-ui-34">
+                {t("studio.routeTitle")}
+              </h1>
+              <p className="text-sm text-muted-foreground">{subtitle}</p>
             </div>
-
-            <TabsContent value="configure">
-              <div className="flex min-w-0 flex-col gap-4 md:gap-6">
-                <ModelSection />
-                <div className="grid min-w-0 grid-cols-1 items-start gap-4 md:grid-cols-2 md:gap-6 xl:grid-cols-3 xl:gap-6">
-                  <DatasetSection />
-                  <ParamsSection />
-                  <TrainingSection />
+            {!showTrainingHydrating && (
+              <div className="flex min-w-0 flex-wrap items-center gap-3 border-b border-border/60">
+                {showHistoryBack && (
+                  <Button
+                    variant="ghost"
+                    size="icon-sm"
+                    className="-ml-1 rounded-full text-muted-foreground"
+                    onClick={clearHistorySelection}
+                    aria-label={t("studio.backToHistory")}
+                  >
+                    <HugeiconsIcon icon={ChevronLeftStandardIcon} className="size-4" />
+                  </Button>
+                )}
+                <TrainSubNav
+                  value={activeTab}
+                  trainingRunActive={trainingRunActive}
+                  showTrainingView={showTrainingView}
+                />
+                <div className="ml-auto flex items-center gap-2">
+                  <TrainingApiButton />
+                  <MediaPageLink
+                    to="/images"
+                    label={t("studio.imageTraining")}
+                    tooltip={t("studio.goToImageTraining")}
+                    icon={ImageIcon}
+                    onNavigate={() => setImagesPageMode("train")}
+                    labelClassName="max-sm:hidden"
+                    arrowClassName="max-sm:hidden"
+                  />
+                  <MediaPageLink
+                    to="/library"
+                    libraryTab="models"
+                    label={t("shell.navigation.library")}
+                    tooltip={t("studio.goToLibrary")}
+                    icon={LibrariesIcon}
+                    labelClassName="max-sm:hidden"
+                    arrowClassName="max-sm:hidden"
+                  />
                 </div>
               </div>
-            </TabsContent>
+            )}
+          </header>
 
-            <TabsContent value="current-run">
-              <LiveTrainingView />
-            </TabsContent>
+          <div className="flex w-full flex-col gap-6">
+            <GuidedTour {...tour.tourProps} celebrate={isConfigTour} />
 
-            <TabsContent value="history">
-              {selectedHistoryRunId ? (
-                <HistoricalTrainingView runId={selectedHistoryRunId} />
-              ) : (
-                <HistoryCardGrid onSelectRun={(runId) => {
-                  if (runId === currentJobId && isTrainingRunning) {
-                    handleTabChange("current-run");
-                  } else {
-                    setSelectedHistoryRunId(runId);
-                  }
-                }} />
-              )}
-            </TabsContent>
-          </Tabs>
-        )}
-      </main>
+            {showTrainingHydrating ? (
+              <div className="flex items-center gap-3 rounded-2xl border border-border/60 p-8 text-sm text-muted-foreground">
+                <Spinner className="size-4 shrink-0" />
+                {hydratingMessage}
+              </div>
+            ) : (
+              <>
+                <TabsContent value="configure" className="mt-0">
+                  {trainsOnCpu && (
+                    <p className="mb-6 rounded-2xl border border-border/60 px-4 py-3 text-sm text-muted-foreground">
+                      {t("studio.cpuTrainingNotice")}
+                    </p>
+                  )}
+                  <div className="@container/train-configure">
+                    {/* 64rem only fit windows 1376px and wider; 56rem still clears @md/train-section */}
+                    <div className="grid grid-cols-1 gap-8 @4xl/train-configure:grid-cols-[minmax(0,1fr)_320px] @5xl/train-configure:gap-10">
+                      <div className="min-w-0">
+                        <TrainingWizard
+                          paramMode={paramMode}
+                          onParamModeChange={setParamMode}
+                        />
+                      </div>
+                      <div className="@4xl/train-configure:sticky @4xl/train-configure:top-6 @4xl/train-configure:self-start">
+                        <RunPreviewCard
+                          paramMode={paramMode}
+                          startCta={<StartTrainingCta />}
+                        />
+                      </div>
+                    </div>
+                  </div>
+                </TabsContent>
+                <TabsContent value="current-run" className="mt-0">
+                  <LiveTrainingView />
+                </TabsContent>
+                <TabsContent
+                  value="history"
+                  className="mt-0"
+                  data-tour="studio-history"
+                >
+                  {selectedHistoryRunId ? (
+                    <HistoricalTrainingView
+                      runId={selectedHistoryRunId}
+                      onResumeStarted={handleResumeStarted}
+                    />
+                  ) : (
+                    <HistoryCardGrid
+                      onSelectRun={handleHistoryRunSelected}
+                      onResumeStarted={handleResumeStarted}
+                    />
+                  )}
+                </TabsContent>
+              </>
+            )}
+          </div>
+
+          <DatasetPreviewDialog
+            open={dialogOpen}
+            onOpenChange={(open) => {
+              if (!open) {
+                closeDialog();
+              }
+            }}
+            datasetSource={config.datasetSource}
+            datasetName={
+              config.datasetSource === "huggingface"
+                ? config.dataset
+                : config.uploadedFile
+            }
+            hfToken={hfToken.trim() || null}
+            datasetKnownCached={config.datasetKnownCached}
+            datasetLocalPath={config.datasetLocalPath}
+            datasetStreaming={config.datasetStreaming}
+            datasetSubset={config.datasetSubset}
+            datasetSplit={config.datasetSplit}
+            mode={dialogMode}
+            initialData={dialogInitial}
+            isVlm={config.isVisionModel && config.isDatasetImage === true}
+          />
+        </div>
+      </Tabs>
     </div>
   );
 }

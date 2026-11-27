@@ -5,6 +5,25 @@ import shutil
 import importlib
 
 
+def _missing_dependency(message):
+    """Under pytest, skip rather than exit, since exiting at import time aborts the whole session."""
+    if "pytest" in sys.modules:
+        import pytest
+        pytest.skip(message, allow_module_level = True)
+
+
+TRUTHY = ("1", "true", "yes", "on")
+
+
+def require_opt_in(env_var, reason):
+    """Call before heavy imports, or pytest collection executes the whole script (training, Hub pushes)."""
+    if os.environ.get(env_var, "").strip().lower() in TRUTHY:
+        return
+    if "pytest" in sys.modules:
+        import pytest
+        pytest.skip(f"{reason} Set {env_var}=1 to run.", allow_module_level = True)
+
+
 def detect_package_manager():
     """Detect the available package manager"""
     package_managers = {
@@ -33,23 +52,15 @@ def check_package_installed(package_name, package_manager = None):
 
     try:
         if package_manager == "apt":
-            # Check with dpkg
-            result = subprocess.run(
-                ["dpkg", "-l", package_name], capture_output = True, text = True
-            )
+            result = subprocess.run(["dpkg", "-l", package_name], capture_output = True, text = True)
             return result.returncode == 0
 
         elif package_manager in ["yum", "dnf"]:
-            # Check with rpm
-            result = subprocess.run(
-                ["rpm", "-q", package_name], capture_output = True, text = True
-            )
+            result = subprocess.run(["rpm", "-q", package_name], capture_output = True, text = True)
             return result.returncode == 0
 
         elif package_manager == "pacman":
-            result = subprocess.run(
-                ["pacman", "-Q", package_name], capture_output = True, text = True
-            )
+            result = subprocess.run(["pacman", "-Q", package_name], capture_output = True, text = True)
             return result.returncode == 0
 
         elif package_manager == "zypper":
@@ -64,15 +75,13 @@ def check_package_installed(package_name, package_manager = None):
 
 
 def require_package(package_name, executable_name = None):
-    """Require a package to be installed, exit if not found"""
+    """Require a package to be installed; skip the module under pytest if not."""
 
-    # First check if executable is in PATH (most reliable)
     if executable_name:
         if shutil.which(executable_name):
             print(f"✓ {executable_name} is available")
             return
 
-    # Then check with package manager
     pm = detect_package_manager()
     is_installed = check_package_installed(package_name, pm)
 
@@ -80,7 +89,8 @@ def require_package(package_name, executable_name = None):
         print(f"✓ Package {package_name} is installed")
         return
 
-    # Package not found - show installation instructions
+    _missing_dependency(f"requires the system package '{package_name}'")
+
     print(f"❌ Error: {package_name} is not installed")
     print(f"\nPlease install {package_name} using your system package manager:")
 
@@ -105,18 +115,20 @@ def require_package(package_name, executable_name = None):
     sys.exit(1)
 
 
-# Usage
-# require_package("ffmpeg", "ffmpeg")
-
-
-def require_python_package(package_name, import_name = None, pip_name = None):
-    """Require a Python package to be installed, exit if not found"""
+def require_python_package(
+    package_name,
+    import_name = None,
+    pip_name = None,
+):
+    """Require a Python package to be installed; skip the module under pytest if not."""
     if import_name is None:
         import_name = package_name
     if pip_name is None:
         pip_name = package_name
 
     if importlib.util.find_spec(import_name) is None:
+        _missing_dependency(f"requires the '{package_name}' package (pip install {pip_name})")
+
         print(f"❌ Error: Python package '{package_name}' is not installed")
         print(f"\nPlease install {package_name} using pip:")
         print(f"  pip install {pip_name}")

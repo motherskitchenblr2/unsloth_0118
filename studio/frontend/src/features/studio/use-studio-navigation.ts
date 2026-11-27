@@ -1,0 +1,195 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
+
+import {
+  isTrainingRunActive,
+  shouldShowTrainingView,
+  useTrainingRuntimeStore,
+} from "@/features/training";
+import type { useT } from "@/i18n";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { useShallow } from "zustand/react/shallow";
+
+export type TrainSubTab = "configure" | "current-run" | "history";
+
+let mountedStudioPages = 0;
+
+function studioTabFor(
+  selectedHistoryRunId: string | null,
+  jobId: string | null,
+  trainingRunActive: boolean,
+): TrainSubTab {
+  if (selectedHistoryRunId) {
+    return trainingRunActive && selectedHistoryRunId === jobId
+      ? "current-run"
+      : "history";
+  }
+  return trainingRunActive ? "current-run" : "configure";
+}
+
+function activeStudioTab(
+  requestedTab: TrainSubTab,
+  trainingRunActive: boolean,
+  showTrainingView: boolean,
+): TrainSubTab {
+  if (trainingRunActive && requestedTab !== "history") {
+    return "current-run";
+  }
+  if (requestedTab === "current-run" && !showTrainingView) {
+    return "configure";
+  }
+  return requestedTab;
+}
+
+function runtimeRequestedTab({
+  jobId,
+  previousTrainingRunActive,
+  previousJobId,
+  previousSelectedHistoryRunId,
+  requestedTab,
+  selectedHistoryRunId,
+  trainingRunActive,
+}: {
+  jobId: string | null;
+  previousTrainingRunActive: boolean;
+  previousJobId: string | null;
+  previousSelectedHistoryRunId: string | null;
+  requestedTab: TrainSubTab;
+  selectedHistoryRunId: string | null;
+  trainingRunActive: boolean;
+}): TrainSubTab | null {
+  // A selected run's visible tab comes from studioTabFor; History is where clearing it lands.
+  if (
+    selectedHistoryRunId &&
+    selectedHistoryRunId !== previousSelectedHistoryRunId &&
+    requestedTab !== "history"
+  ) {
+    return "history";
+  }
+  if (
+    ((jobId !== null && jobId !== previousJobId && trainingRunActive) ||
+      (trainingRunActive && !previousTrainingRunActive)) &&
+    requestedTab !== "history" &&
+    requestedTab !== "current-run"
+  ) {
+    return "current-run";
+  }
+  return null;
+}
+
+export function getStudioSubtitle({
+  activeTab,
+  runtimeMessage,
+  selectedHistoryRunId,
+  t,
+}: {
+  activeTab: TrainSubTab;
+  runtimeMessage: string;
+  selectedHistoryRunId: string | null;
+  t: ReturnType<typeof useT>;
+}): string {
+  if (activeTab === "current-run") {
+    return runtimeMessage || t("studio.subtitles.trainingInProgress");
+  }
+  if (activeTab === "history") {
+    return selectedHistoryRunId
+      ? t("studio.subtitles.viewingPastRun")
+      : t("studio.subtitles.viewPastRuns");
+  }
+  return t("studio.subtitles.configure");
+}
+
+export function useStudioNavigation() {
+  const showTrainingView = useTrainingRuntimeStore(shouldShowTrainingView);
+  const {
+    currentJobId,
+    trainingRunActive,
+    selectedHistoryRunId,
+    setCurrentRunViewActive,
+    setSelectedHistoryRunId,
+  } = useTrainingRuntimeStore(
+    useShallow((state) => ({
+      currentJobId: state.jobId,
+      trainingRunActive: isTrainingRunActive(state),
+      selectedHistoryRunId: state.selectedHistoryRunId,
+      setCurrentRunViewActive: state.setCurrentRunViewActive,
+      setSelectedHistoryRunId: state.setSelectedHistoryRunId,
+    })),
+  );
+  const [requestedTab, setRequestedTabState] = useState<TrainSubTab>(() =>
+    selectedHistoryRunId
+      ? "history"
+      : studioTabFor(null, currentJobId, trainingRunActive),
+  );
+  const requestedTabRef = useRef(requestedTab);
+  const setRequestedTab = useCallback((next: TrainSubTab) => {
+    requestedTabRef.current = next;
+    setRequestedTabState(next);
+  }, []);
+  const activeTab = selectedHistoryRunId
+    ? studioTabFor(selectedHistoryRunId, currentJobId, trainingRunActive)
+    : activeStudioTab(requestedTab, trainingRunActive, showTrainingView);
+
+  useEffect(() => {
+    setCurrentRunViewActive(activeTab === "current-run");
+    return () => setCurrentRunViewActive(false);
+  }, [activeTab, setCurrentRunViewActive]);
+
+  // A route change briefly mounts a second Train page in the fading-out wrapper; only the last one to unmount clears.
+  useEffect(() => {
+    mountedStudioPages += 1;
+    return () => {
+      mountedStudioPages -= 1;
+      if (mountedStudioPages === 0) setSelectedHistoryRunId(null);
+    };
+  }, [setSelectedHistoryRunId]);
+
+  useEffect(() => {
+    return useTrainingRuntimeStore.subscribe((state, previousState) => {
+      if (state.configureRequest !== previousState.configureRequest) {
+        setRequestedTab("configure");
+        return;
+      }
+      const nextTab = runtimeRequestedTab({
+        jobId: state.jobId,
+        previousJobId: previousState.jobId,
+        previousTrainingRunActive: isTrainingRunActive(previousState),
+        previousSelectedHistoryRunId: previousState.selectedHistoryRunId,
+        requestedTab: requestedTabRef.current,
+        selectedHistoryRunId: state.selectedHistoryRunId,
+        trainingRunActive: isTrainingRunActive(state),
+      });
+      if (!nextTab) {
+        return;
+      }
+      setRequestedTab(nextTab);
+    });
+  }, [setRequestedTab]);
+
+  const handleTabChange = useCallback(
+    (value: TrainSubTab) => {
+      setRequestedTab(value);
+      setSelectedHistoryRunId(null);
+    },
+    [setRequestedTab, setSelectedHistoryRunId],
+  );
+
+  const clearHistorySelection = useCallback(() => {
+    handleTabChange("history");
+  }, [handleTabChange]);
+
+  const handleResumeStarted = useCallback(() => {
+    handleTabChange("current-run");
+  }, [handleTabChange]);
+
+  return {
+    activeTab,
+    clearHistorySelection,
+    handleHistoryRunSelected: setSelectedHistoryRunId,
+    handleResumeStarted,
+    handleTabChange,
+    trainingRunActive,
+    selectedHistoryRunId,
+    showTrainingView,
+  };
+}

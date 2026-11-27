@@ -1,10 +1,6 @@
-# Model defaults for unsloth/mistral-7b-v0.3-bnb-4bit
-# Based on Mistral_v0.3_(7B)-Alpaca.ipynb
 # Also applies to: "unsloth/mistral-7b-v0.3", "mistralai/Mistral-7B-v0.3",
 training:
-  trust_remote_code: false
   max_seq_length: 2048
-  # num_epochs: 4
   num_epochs: 0
   learning_rate: 2e-4
   batch_size: 2
@@ -34,6 +30,7 @@ lora:
     - "down_proj"
   use_rslora: false
   use_loftq: false
+  use_dora: false
 
 logging:
   enable_wandb: false
@@ -41,6 +38,3 @@ logging:
   enable_tensorboard: false
   tensorboard_dir: "runs"
   log_frequency: 10
-
-inference:
-  trust_remote_code: false

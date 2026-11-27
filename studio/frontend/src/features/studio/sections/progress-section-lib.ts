@@ -3,19 +3,6 @@
 
 import type { TrainingPhase } from "@/features/training";
 
-export const phaseLabel: Record<TrainingPhase, string> = {
-  idle: "Idle",
-  downloading_model: "Downloading model",
-  downloading_dataset: "Downloading dataset",
-  loading_model: "Loading model",
-  loading_dataset: "Loading dataset",
-  configuring: "Configuring",
-  training: "Training",
-  completed: "Completed",
-  error: "Error",
-  stopped: "Stopped",
-};
-
 export const phaseColors: Record<TrainingPhase, string> = {
   idle: "bg-muted text-muted-foreground",
   downloading_model:
@@ -28,6 +15,10 @@ export const phaseColors: Record<TrainingPhase, string> = {
     "bg-amber-100 text-amber-700 dark:bg-amber-900 dark:text-amber-300",
   configuring: "bg-blue-100 text-blue-700 dark:bg-blue-900 dark:text-blue-300",
   training:
+    "bg-emerald-100 text-emerald-700 dark:bg-emerald-900 dark:text-emerald-300",
+  finalizing:
+    "bg-amber-100 text-amber-700 dark:bg-amber-900 dark:text-amber-300",
+  training_drafter:
     "bg-emerald-100 text-emerald-700 dark:bg-emerald-900 dark:text-emerald-300",
   completed:
     "bg-emerald-100 text-emerald-700 dark:bg-emerald-900 dark:text-emerald-300",
@@ -46,6 +37,32 @@ export function formatDuration(seconds: number | null | undefined): string {
   if (h > 0) return `${h}h ${m}m ${s}s`;
   if (m > 0) return `${m}m ${s}s`;
   return `${s}s`;
+}
+
+export function sessionStepsPerSecond(
+  currentStep: number,
+  sessionStartStep: number,
+  elapsedSeconds: number | null,
+): number | null {
+  const sessionSteps = currentStep - sessionStartStep;
+  if (elapsedSeconds == null || elapsedSeconds <= 0 || sessionSteps < 0) {
+    return null;
+  }
+  return sessionSteps / elapsedSeconds;
+}
+
+export function sessionEtaSeconds(
+  currentStep: number,
+  sessionStartStep: number,
+  totalSteps: number,
+  elapsedSeconds: number | null,
+): number | null {
+  const sessionSteps = currentStep - sessionStartStep;
+  const remaining = totalSteps - currentStep;
+  if (elapsedSeconds == null || sessionSteps <= 0 || remaining < 0) {
+    return null;
+  }
+  return Math.round((elapsedSeconds * remaining) / sessionSteps);
 }
 
 export function formatNumber(value: number | null | undefined, digits: number): string {

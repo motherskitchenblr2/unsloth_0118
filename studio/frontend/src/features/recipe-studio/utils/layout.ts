@@ -17,10 +17,6 @@ type LayoutOptions = {
   configs?: Record<string, NodeConfig>;
 };
 
-/**
- * Pipeline rank order used to enforce a logical flow even for disconnected nodes.
- * Lower rank = earlier in the pipeline.
- */
 function getPipelineRank(config: NodeConfig | undefined): number {
   if (!config) {
     return 2;
@@ -63,19 +59,12 @@ function getEdgeWeight(edgeType: string | undefined): number {
   return 3;
 }
 
-/**
- * Build phantom edges between disconnected data-pipeline nodes so dagre
- * respects the pipeline rank order even when blocks aren't wired together.
- *
- * Groups nodes by rank, then inserts invisible edges from the last node of
- * rank N to the first node of rank N+1 when no real edge already connects them.
- */
+/** Invisible edges between rank N and N+1 so dagre keeps pipeline order for unwired blocks. */
 function buildPhantomEdges(
   nodes: Node[],
   edges: Edge[],
   configs: Record<string, NodeConfig>,
 ): Edge[] {
-  // Group nodes by rank
   const byRank = new Map<number, string[]>();
   for (const node of nodes) {
     const rank = getPipelineRank(configs[node.id]);
@@ -94,7 +83,6 @@ function buildPhantomEdges(
       continue;
     }
 
-    // Check if any real edge already connects these rank groups
     const hasRealEdge = edges.some(
       (e) => currentIds.includes(e.source) && nextIds.includes(e.target),
     );
@@ -102,7 +90,6 @@ function buildPhantomEdges(
       continue;
     }
 
-    // Insert one phantom edge from last node in current rank to first in next
     phantoms.push({
       id: `phantom-${ranks[i]}-${ranks[i + 1]}`,
       source: currentIds[currentIds.length - 1],
@@ -129,7 +116,6 @@ export function getLayoutedElements<TNode extends Node>(
     configs,
   } = options;
 
-  // When configs are provided, filter out infra and aux nodes from dagre
   const hasConfigs = configs && Object.keys(configs).length > 0;
   const dataNodes = hasConfigs
     ? nodes.filter((n) => !(isInfraNode(n.id, configs) || isAuxNode(n.id)))
@@ -146,7 +132,6 @@ export function getLayoutedElements<TNode extends Node>(
       )
     : edges;
 
-  // Build phantom edges to enforce pipeline rank ordering for disconnected nodes
   const phantomEdges = hasConfigs
     ? buildPhantomEdges(dataNodes, dataEdges, configs)
     : [];
@@ -175,7 +160,6 @@ export function getLayoutedElements<TNode extends Node>(
 
   dagre.layout(graph);
 
-  // Build position map from dagre results (data nodes only)
   const layoutedPositions = new Map<string, { x: number; y: number }>();
   for (const node of dataNodes) {
     const pos = graph.node(node.id);
@@ -187,7 +171,6 @@ export function getLayoutedElements<TNode extends Node>(
     });
   }
 
-  // Apply positions: data nodes get dagre positions, infra/aux keep original
   const layoutedNodes = nodes.map((node) => {
     const position = layoutedPositions.get(node.id);
     if (!position) {

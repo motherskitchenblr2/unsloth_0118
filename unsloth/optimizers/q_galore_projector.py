@@ -1,17 +1,13 @@
 # Copyright 2023-present Daniel Han-Chen & the Unsloth team. All rights reserved.
-#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
-#
 #     http://www.apache.org/licenses/LICENSE-2.0
-#
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-#
 # Adapted from Q-GaLore (https://github.com/VITA-Group/Q-GaLore)
 # Original paper: "Q-GaLore: Quantized GaLore with INT4 Projection and
 # Layer-Adaptive Low-Rank Gradients" (arXiv:2407.08296)
@@ -27,22 +23,16 @@ class GaLoreProjector:
     """Low-rank gradient projector with optional INT4/INT8 quantized projection
     matrices and layer-adaptive subspace update scheduling.
 
-    The projector computes an SVD of the gradient to obtain an orthogonal basis
-    for the top-``rank`` subspace.  Gradients are projected into this subspace
-    for the optimizer step, then projected back to full rank for the weight
-    update.
+    SVD of the gradient gives an orthogonal basis for the top-``rank`` subspace.
+    Gradients are projected in for the optimizer step, then back to full rank for
+    the weight update. Two Q-GaLore innovations:
 
-    Two key Q-GaLore innovations are implemented:
-
-    1. **Quantized projection matrices** — when ``quant=True``, the orthogonal
-       matrix is stored in INT4/INT8, reducing the memory cost of keeping the
-       projector state.
-
-    2. **Layer-adaptive update scheduling** — a rolling queue of cosine
-       similarities between consecutive orthogonal vectors is maintained.  When
-       the average exceeds ``cos_threshold``, ``update_proj_gap`` is multiplied
-       by ``gamma_proj``, effectively reducing the frequency of expensive SVD
-       recomputations for layers whose subspace has stabilized.
+    1. Quantized projection matrices: with ``quant=True`` the orthogonal matrix
+       is stored in INT4/INT8 to cut projector-state memory.
+    2. Layer-adaptive update scheduling: when the rolling-average cosine
+       similarity of consecutive orthogonal vectors exceeds ``cos_threshold``,
+       ``update_proj_gap`` is multiplied by ``gamma_proj`` to recompute SVD less
+       often for stabilized layers.
 
     Args:
         rank: Target rank for the low-rank projection.
@@ -96,12 +86,10 @@ class GaLoreProjector:
         self.scale = scale
         self.proj_type = proj_type
 
-        # Quantization settings for the projection matrix
         self.quant = quant
         self.quant_group_size = group_size
         self.quant_n_bit = n_bit
 
-        # Adaptive update scheduling state
         self.cos_threshold = cos_threshold
         self.gamma_proj = gamma_proj
         self.queue_size = queue_size
@@ -110,15 +98,37 @@ class GaLoreProjector:
         self.svd_count = 0
         self._ortho_float_cache = None
 
-        # Projection matrix state
         self.ortho_matrix = None
         self.ortho_matrix_scales = None
         self.ortho_matrix_zeros = None
         self.ortho_matrix_shape = None
 
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
+    def state_dict(self) -> dict:
+        """Plain dict of tensors and primitives, loadable with ``torch.load(weights_only = True)``."""
+        state = {
+            name: getattr(self, name) for name in self.__slots__ if name != "_ortho_float_cache"
+        }
+        state["queue"] = list(self.queue)
+        if self.ortho_matrix_shape is not None:
+            state["ortho_matrix_shape"] = tuple(self.ortho_matrix_shape)
+        return state
+
+    @classmethod
+    def from_state_dict(
+        cls,
+        state: dict,
+        device = None,
+    ) -> "GaLoreProjector":
+        # Checkpoints load on CPU; tensors go back to the parameter's device with their dtype kept.
+        projector = cls.__new__(cls)
+        for name in cls.__slots__:
+            value = state.get(name)
+            if device is not None and isinstance(value, torch.Tensor):
+                value = value.to(device)
+            setattr(projector, name, value)
+        projector.queue = deque(state.get("queue") or (), maxlen = projector.queue_size)
+        projector._ortho_float_cache = None
+        return projector
 
     def project(self, full_rank_grad: torch.Tensor, step: int) -> torch.Tensor:
         """Project a full-rank gradient into the low-rank subspace.
@@ -137,7 +147,7 @@ class GaLoreProjector:
         assert self.proj_type == "std", "Only proj_type='std' is supported."
 
         if full_rank_grad.shape[0] >= full_rank_grad.shape[1]:
-            # "tall" matrix → right projection  (grad @ Q^T)
+            # "tall" takes the right projection (grad @ Q^T), "wide" the left (Q^T @ grad).
             if self.ortho_matrix is None or step % self.update_proj_gap == 0:
                 float_ortho = self._compute_orthogonal(
                     full_rank_grad,
@@ -150,7 +160,6 @@ class GaLoreProjector:
             self._ortho_float_cache = self._load_ortho()
             low_rank_grad = torch.matmul(full_rank_grad, self._ortho_float_cache.t())
         else:
-            # "wide" matrix → left projection  (Q^T @ grad)
             if self.ortho_matrix is None or step % self.update_proj_gap == 0:
                 float_ortho = self._compute_orthogonal(
                     full_rank_grad,
@@ -166,14 +175,7 @@ class GaLoreProjector:
         return low_rank_grad
 
     def project_back(self, low_rank_grad: torch.Tensor) -> torch.Tensor:
-        """Project a low-rank update back to full rank.
-
-        Args:
-            low_rank_grad: The low-rank gradient/update tensor.
-
-        Returns:
-            The full-rank update scaled by ``self.scale``.
-        """
+        """Project a low-rank update back to full rank, scaled by `self.scale`."""
         float_ortho = self._ortho_float_cache
         self._ortho_float_cache = None
         if float_ortho is None:
@@ -186,26 +188,9 @@ class GaLoreProjector:
 
         return full_rank_grad * self.scale
 
-    # ------------------------------------------------------------------
-    # SVD
-    # ------------------------------------------------------------------
-
     @staticmethod
-    def _compute_orthogonal(
-        weights: torch.Tensor,
-        rank: int,
-        side: str,
-    ) -> torch.Tensor:
-        """Compute the top-``rank`` orthogonal matrix via truncated SVD.
-
-        Args:
-            weights: 2-D tensor (typically the gradient).
-            rank: Number of singular vectors to keep.
-            side: ``'left'`` returns U[:, :rank], ``'right'`` returns Vh[:rank, :].
-
-        Returns:
-            Orthogonal matrix of shape ``(rank, N)`` (right) or ``(M, rank)`` (left).
-        """
+    def _compute_orthogonal(weights: torch.Tensor, rank: int, side: str) -> torch.Tensor:
+        """Truncated-SVD orthogonal factor: U[:, :rank] for side 'left', Vh[:rank, :] for 'right'."""
         original_dtype = weights.dtype
         original_device = weights.device
 
@@ -219,8 +204,7 @@ class GaLoreProjector:
             U, s, Vh = torch.linalg.svd(matrix, full_matrices = False)
             result = Vh[:rank, :] if side == "right" else U[:, :rank]
         else:
-            # Oversampling p=10 per Halko et al. 2009 (arXiv:0909.4061)
-            # recommendation of p=5..10 for large low-rank matrices.
+            # Oversampling p=10, per Halko et al. 2009 (arXiv:0909.4061).
             q = min(rank + 10, min(m, n))
             U, s, V = torch.svd_lowrank(matrix, q = q, niter = 2)
             result = V[:, :rank].t() if side == "right" else U[:, :rank]
@@ -229,15 +213,7 @@ class GaLoreProjector:
             result = result.to(device = original_device, dtype = original_dtype)
         return result
 
-    # ------------------------------------------------------------------
-    # Adaptive scheduling
-    # ------------------------------------------------------------------
-
-    def _update_adaptive_schedule(
-        self,
-        float_ortho: torch.Tensor,
-        side: str,
-    ) -> None:
+    def _update_adaptive_schedule(self, float_ortho: torch.Tensor, side: str) -> None:
         """Track subspace stability and increase ``update_proj_gap`` if stable."""
         self.svd_count += 1
 
@@ -247,7 +223,8 @@ class GaLoreProjector:
             current_vector = float_ortho[:, :1].flatten()
 
         if self.past_ortho_vector is not None:
-            cos_sim = torch.dot(self.past_ortho_vector, current_vector).item()
+            # Singular vectors are sign-ambiguous: a negated basis is the same subspace.
+            cos_sim = abs(torch.dot(self.past_ortho_vector, current_vector).item())
 
             self.queue.append(cos_sim)
 
@@ -259,12 +236,7 @@ class GaLoreProjector:
 
         self.past_ortho_vector = current_vector.clone()
 
-    # ------------------------------------------------------------------
-    # Quantized projection matrix storage
-    # ------------------------------------------------------------------
-
     def _store_ortho(self, float_ortho: torch.Tensor) -> None:
-        """Store the orthogonal matrix, optionally quantized."""
         if self.quant:
             q, scales, zeros, shape = _quantize(
                 float_ortho,
@@ -279,7 +251,6 @@ class GaLoreProjector:
             self.ortho_matrix = float_ortho
 
     def _load_ortho(self) -> torch.Tensor:
-        """Load the orthogonal matrix, dequantizing if necessary."""
         if self.quant:
             return _dequantize(
                 self.ortho_matrix,
@@ -288,11 +259,6 @@ class GaLoreProjector:
                 self.ortho_matrix_shape,
             )
         return self.ortho_matrix
-
-
-# ======================================================================
-# Quantization utilities (shared with the optimizer)
-# ======================================================================
 
 
 @torch.no_grad()
@@ -314,8 +280,8 @@ def _quantize(
         w = w.reshape(-1, q_group_size)
     assert w.dim() == 2
 
-    max_val = w.amax(dim = 1, keepdim = True)
-    min_val = w.amin(dim = 1, keepdim = True)
+    max_val = w.amax(dim = 1, keepdim = True).clamp(min = 0)
+    min_val = w.amin(dim = 1, keepdim = True).clamp(max = 0)
     max_int = 2**n_bit - 1
     min_int = 0
     scales = (max_val - min_val).clamp(min = 1e-5) / max_int
@@ -329,13 +295,10 @@ def _quantize(
 
 @torch.no_grad()
 def _dequantize(
-    w: torch.Tensor,
-    scales: torch.Tensor,
-    zeros: torch.Tensor,
-    original_shape: tuple,
+    w: torch.Tensor, scales: torch.Tensor, zeros: torch.Tensor, original_shape: tuple
 ) -> torch.Tensor:
     """Dequantize from uint8 back to float."""
-    # Infer group size: scales has shape (n_groups, 1), so n_groups = scales.shape[0]
+    # Infer the group size: scales has shape (n_groups, 1), so n_groups = scales.shape[0].
     total = w.numel()
     n_groups = scales.shape[0] if scales.dim() > 1 else scales.numel()
     group_size = total // n_groups if n_groups > 0 else total
@@ -366,8 +329,8 @@ def _quantize_stochastic(
         w = w.reshape(-1, q_group_size)
     assert w.dim() == 2
 
-    max_val = w.amax(dim = 1, keepdim = True)
-    min_val = w.amin(dim = 1, keepdim = True)
+    max_val = w.amax(dim = 1, keepdim = True).clamp(min = 0)
+    min_val = w.amin(dim = 1, keepdim = True).clamp(max = 0)
     max_int = 2**n_bit - 1
     min_int = 0
     scales = (max_val - min_val).clamp(min = 1e-5) / max_int

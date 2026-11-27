@@ -17,12 +17,15 @@ type TerminalProps = {
   className?: string
   sequence?: boolean
   startOnView?: boolean
+  /** Skip typing animations, e.g. on remount for a run whose intro already played. */
+  instant?: boolean
 }
 
 type InternalLineProps = {
   __isActive?: boolean
   __onDone?: () => void
   __sequence?: boolean
+  __instant?: boolean
 }
 
 function useStartOnView(enabled: boolean): {
@@ -65,15 +68,18 @@ export function Terminal({
   className,
   sequence = true,
   startOnView = true,
+  instant = false,
 }: TerminalProps): ReactElement {
   const { ref, started } = useStartOnView(startOnView)
   const childElements = Children.toArray(children).filter(isValidElement)
   const [activeIndex, setActiveIndex] = useState(0)
-  const visibleIndex = sequence
-    ? started
-      ? activeIndex
-      : -1
-    : Number.MAX_SAFE_INTEGER
+  const visibleIndex = instant
+    ? Number.MAX_SAFE_INTEGER
+    : sequence
+      ? started
+        ? activeIndex
+        : -1
+      : Number.MAX_SAFE_INTEGER
 
   function handleLineDone(index: number): void {
     if (!sequence) {
@@ -99,7 +105,8 @@ export function Terminal({
       {childElements.map((child, index) =>
         cloneElement(child, {
           __sequence: sequence,
-          __isActive: !sequence || visibleIndex >= index,
+          __isActive: instant || !sequence || visibleIndex >= index,
+          __instant: instant,
           __onDone: () => handleLineDone(index),
           key: child.key ?? index,
         } as InternalLineProps)
@@ -122,11 +129,12 @@ export function AnimatedSpan({
   startOnView = false,
   __isActive,
   __sequence,
+  __instant,
   __onDone,
 }: AnimatedSpanProps): ReactElement {
   const { ref, started } = useStartOnView(startOnView)
-  const [visible, setVisible] = useState(false)
-  const doneRef = useRef(false)
+  const [visible, setVisible] = useState(Boolean(__instant))
+  const doneRef = useRef(Boolean(__instant))
   const onDoneRef = useRef(__onDone)
   const shouldStart = __sequence ? __isActive : started
 
@@ -180,11 +188,12 @@ export function TypingAnimation({
   startOnView = true,
   __isActive,
   __sequence,
+  __instant,
   __onDone,
 }: TypingAnimationProps): ReactElement {
   const { ref, started } = useStartOnView(startOnView)
-  const [typed, setTyped] = useState("")
-  const doneRef = useRef(false)
+  const [typed, setTyped] = useState(__instant ? children : "")
+  const doneRef = useRef(Boolean(__instant))
   const onDoneRef = useRef(__onDone)
   const shouldStart = __sequence ? __isActive : started
 

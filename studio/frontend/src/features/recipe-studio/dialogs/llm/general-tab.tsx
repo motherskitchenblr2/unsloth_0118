@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
+import { ChevronRightStandardIcon } from "@/lib/chevron-icons";
+import { HugeiconsIcon } from "@hugeicons/react";
 import {
   Collapsible,
   CollapsibleContent,
@@ -23,8 +25,6 @@ import {
 } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
 import { Textarea } from "@/components/ui/textarea";
-import { ArrowRight01Icon } from "@hugeicons/core-free-icons";
-import { HugeiconsIcon } from "@hugeicons/react";
 import { type ReactElement, type RefObject, useMemo, useRef } from "react";
 import { useRecipeStudioStore } from "../../stores/recipe-studio";
 import type { LlmConfig } from "../../types";
@@ -179,7 +179,7 @@ export function LlmGeneralTab({
         onChange={(value) => onUpdate({ name: value })}
       />
       {needsSetupHelp ? (
-        <div className="rounded-2xl border border-border/60 bg-muted/10 px-4 py-3 text-xs text-muted-foreground">
+        <div className="rounded-lg border border-border/60 bg-muted/10 px-4 py-3 text-xs text-muted-foreground">
           <p className="text-sm font-semibold text-foreground">
             Set up the model once, then come back here
           </p>
@@ -187,7 +187,7 @@ export function LlmGeneralTab({
             {!hasModelProviders && (
               <p className="flex items-start gap-2">
                 <HugeiconsIcon
-                  icon={ArrowRight01Icon}
+                  icon={ChevronRightStandardIcon}
                   className="mt-0.5 size-3.5 shrink-0 text-primary"
                 />
                 <span>Add a Provider connection step in AI generation → Setup.</span>
@@ -196,7 +196,7 @@ export function LlmGeneralTab({
             {!hasModelConfigs && (
               <p className="flex items-start gap-2">
                 <HugeiconsIcon
-                  icon={ArrowRight01Icon}
+                  icon={ChevronRightStandardIcon}
                   className="mt-0.5 size-3.5 shrink-0 text-primary"
                 />
                 <span>Add a Model preset step, connect it, then choose it below.</span>
@@ -205,7 +205,7 @@ export function LlmGeneralTab({
           </div>
         </div>
       ) : needsModelChoice ? (
-        <div className="rounded-2xl border border-border/60 bg-muted/10 px-4 py-3 text-xs text-muted-foreground">
+        <div className="rounded-lg border border-border/60 bg-muted/10 px-4 py-3 text-xs text-muted-foreground">
           <p className="text-sm font-semibold text-foreground">
             Start by choosing a model preset
           </p>
@@ -335,7 +335,7 @@ export function LlmGeneralTab({
         />
         <Textarea
           id={promptId}
-          className="corner-squircle nodrag max-h-[450px] overflow-auto"
+          className="corner-squircle nodrag max-h-[calc(450px*var(--ui-space-scale,1))] overflow-auto"
           aria-invalid={invalidPromptRefs.length > 0}
           value={config.prompt}
           onChange={(event) => onUpdate({ prompt: event.target.value })}
@@ -449,7 +449,7 @@ export function LlmGeneralTab({
             />
             <Textarea
               id={systemPromptId}
-              className="corner-squircle nodrag max-h-[450px] overflow-auto"
+              className="corner-squircle nodrag max-h-[calc(450px*var(--ui-space-scale,1))] overflow-auto"
               aria-invalid={invalidSystemRefs.length > 0}
               value={config.system_prompt}
               onChange={(event) =>

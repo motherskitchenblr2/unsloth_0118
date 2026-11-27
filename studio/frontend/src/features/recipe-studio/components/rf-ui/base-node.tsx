@@ -12,10 +12,9 @@ export function BaseNode({
   return (
     <div
       className={cn(
-        "bg-card text-card-foreground relative rounded-md border transition-[border-color,box-shadow] duration-150",
-        "hover:border-primary/40 hover:ring-1 hover:ring-primary/20 hover:shadow-sm",
-        "[.react-flow\\_\\_node.selected_&]:border-primary/45",
-        "[.react-flow\\_\\_node.selected_&]:ring-1 [.react-flow\\_\\_node.selected_&]:ring-primary/25",
+        "bg-card text-card-foreground relative rounded-xl border transition-[border-color,box-shadow] duration-150",
+        "hover:border-ring hover:shadow-sm",
+        "[.react-flow\\_\\_node.selected_&]:border-ring-strong",
         "[.react-flow\\_\\_node.selected_&]:shadow-md",
         className,
       )}

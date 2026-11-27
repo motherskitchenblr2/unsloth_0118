@@ -3,8 +3,11 @@
 
 from __future__ import annotations
 
+from core.training.account_jobs import account_hf_token
 import json
 from pathlib import Path
+import tempfile
+import unicodedata
 
 from utils.paths import recipe_datasets_root, resolve_dataset_path
 
@@ -17,13 +20,57 @@ _UNSLOTH_STUDIO_FOOTER = (
 )
 
 
+# Data Designer's `batch_{n:05d}.parquet`; `[0-9]`, not `*`, which fnmatch lets cross `/` into other splits.
+_BATCH_FILE_PATTERN = "batch_" + "[0-9]" * 5 + ".parquet"
+
+
 class RecipeDatasetPublishError(ValueError):
     """Raised when a recipe dataset cannot be published to Hugging Face."""
 
 
+# The main dataset's top-level Hub paths, plus the folders the Hub refuses.
+_HUB_TOP_LEVEL_NAMES = frozenset(
+    {
+        "data",
+        "images",
+        "readme.md",
+        "metadata.json",
+        "builder_config.json",
+        ".gitattributes",
+        ".git",
+        ".cache",
+    }
+)
+
+
+def processor_folder_name_error(names) -> str | None:
+    # Windows drops trailing dots and spaces; macOS and Windows ignore case.
+    seen: dict[str, str] = {}
+    for name in names:
+        key = unicodedata.normalize("NFC", name).rstrip(" .").casefold()
+        if key in _HUB_TOP_LEVEL_NAMES:
+            return (
+                f"Processor name {name!r} is taken by the main dataset's files on "
+                "Hugging Face. Rename the processor."
+            )
+        if key in seen:
+            return (
+                f"Processor names {seen[key]!r} and {name!r} would share one folder. "
+                "Rename one of them."
+            )
+        seen[key] = name
+    return None
+
+
 def _resolve_recipe_artifact_path(artifact_path: str) -> Path:
     root = recipe_datasets_root().expanduser().resolve()
-    candidate = resolve_dataset_path(artifact_path).expanduser()
+    try:
+        candidate = resolve_dataset_path(artifact_path).expanduser()
+    except ValueError as exc:
+        # Outside every dataset root, so it never reaches the check below: a 500, not a refusal.
+        raise RecipeDatasetPublishError(
+            "This execution artifact is outside the Recipe Studio dataset storage."
+        ) from exc
     resolved = candidate.resolve(strict = False)
 
     try:
@@ -36,11 +83,47 @@ def _resolve_recipe_artifact_path(artifact_path: str) -> Path:
     if not resolved.exists():
         raise RecipeDatasetPublishError("Execution artifacts are no longer available.")
     if not resolved.is_dir():
-        raise RecipeDatasetPublishError(
-            "Execution artifact path is not a dataset folder."
-        )
+        raise RecipeDatasetPublishError("Execution artifact path is not a dataset folder.")
 
     return resolved
+
+
+def _drop_seed_token(builder_config: dict) -> None:
+    # The hf and github_repo seed sources save their token in plain text.
+    seed_config = builder_config.get("data_designer", {}).get("seed_config") or {}
+    seed_config.get("source", {}).pop("token", None)
+
+
+def _ensure_hub_repo_private(hf_api, repo_id: str) -> None:
+    # create_repo ignores `private` when the repo already exists.
+    try:
+        hf_api.update_repo_settings(repo_id = repo_id, private = True, repo_type = "dataset")
+        return
+    except Exception as exc:
+        try:
+            info = hf_api.repo_info(repo_id = repo_id, repo_type = "dataset")
+            if bool(getattr(info, "private", False)):
+                return
+        except Exception:
+            pass
+        raise RecipeDatasetPublishError(
+            f"Could not make {repo_id} private, so nothing was uploaded. The token likely "
+            "lacks permission to change this repo's settings."
+        ) from exc
+
+
+def _replace_batch_files(
+    hf_api, *, repo_id: str, folder: Path, path_in_repo: str, commit_message: str
+) -> None:
+    # A smaller rerun would otherwise leave old batches that the card's glob still loads.
+    hf_api.upload_folder(
+        repo_id = repo_id,
+        folder_path = str(folder),
+        path_in_repo = path_in_repo,
+        repo_type = "dataset",
+        commit_message = commit_message,
+        delete_patterns = [_BATCH_FILE_PATTERN],
+    )
 
 
 def publish_recipe_dataset(
@@ -50,7 +133,9 @@ def publish_recipe_dataset(
     description: str,
     hf_token: str | None = None,
     private: bool = False,
+    link_endpoint: str | None = None,
 ) -> str:
+    hf_token = account_hf_token(hf_token)
     dataset_path = _resolve_recipe_artifact_path(artifact_path)
 
     try:
@@ -76,7 +161,18 @@ def publish_recipe_dataset(
         client = HuggingFaceHubClient(token = hf_token)
         client._validate_repo_id(repo_id = repo_id)
         client._validate_dataset_path(base_dataset_path = dataset_path)
+        processors_folder = dataset_path / PROCESSORS_OUTPUTS_FOLDER_NAME
+        processor_dirs = (
+            sorted(d for d in processors_folder.iterdir() if d.is_dir())
+            if processors_folder.is_dir()
+            else []
+        )
+        name_error = processor_folder_name_error(d.name for d in processor_dirs)
+        if name_error:
+            raise RecipeDatasetPublishError(name_error)
         client._create_or_get_repo(repo_id = repo_id, private = private)
+        if private:
+            _ensure_hub_repo_private(client._api, repo_id)
 
         metadata_path = dataset_path / METADATA_FILENAME
         builder_config_path = dataset_path / SDG_CONFIG_FILENAME
@@ -88,6 +184,7 @@ def publish_recipe_dataset(
         if builder_config_path.exists():
             with builder_config_path.open(encoding = "utf-8") as fh:
                 builder_config = json.load(fh)
+            _drop_seed_token(builder_config)
 
         card = DataDesignerDatasetCard.from_metadata(
             metadata = metadata,
@@ -97,28 +194,50 @@ def publish_recipe_dataset(
             tags = None,
         )
         card.text = card.text.replace(_DATA_DESIGNER_FOOTER, _UNSLOTH_STUDIO_FOOTER)
-        # Data Designer currently drops the explicit token when pushing the
-        # dataset card. Push it ourselves so auth stays request-local.
+        # Data Designer drops the explicit token, so push the card ourselves to keep auth request-local.
         card.push_to_hub(repo_id, token = hf_token, repo_type = "dataset")
 
-        client._upload_main_dataset_files(
-            repo_id = repo_id,
-            parquet_folder = dataset_path / FINAL_DATASET_FOLDER_NAME,
-        )
+        try:
+            _replace_batch_files(
+                client._api,
+                repo_id = repo_id,
+                folder = dataset_path / FINAL_DATASET_FOLDER_NAME,
+                path_in_repo = "data",
+                commit_message = "Upload main dataset files",
+            )
+        except Exception as exc:
+            raise HuggingFaceHubClientUploadError(f"Failed to upload parquet files: {exc}") from exc
         client._upload_images_folder(
             repo_id = repo_id,
             images_folder = dataset_path / "images",
         )
-        client._upload_processor_files(
-            repo_id = repo_id,
-            processors_folder = dataset_path / PROCESSORS_OUTPUTS_FOLDER_NAME,
-        )
-        client._upload_config_files(
-            repo_id = repo_id,
-            metadata_path = metadata_path,
-            builder_config_path = builder_config_path,
-        )
+        for processor_dir in processor_dirs:
+            try:
+                _replace_batch_files(
+                    client._api,
+                    repo_id = repo_id,
+                    folder = processor_dir,
+                    path_in_repo = processor_dir.name,
+                    commit_message = f"Upload {processor_dir.name} processor outputs",
+                )
+            except Exception as exc:
+                raise HuggingFaceHubClientUploadError(
+                    f"Failed to upload processor outputs for '{processor_dir.name}': {exc}"
+                ) from exc
+        with tempfile.TemporaryDirectory() as scrubbed_dir:
+            scrubbed_config_path = Path(scrubbed_dir) / SDG_CONFIG_FILENAME
+            if builder_config is not None:
+                with scrubbed_config_path.open("w", encoding = "utf-8") as fh:
+                    json.dump(builder_config, fh, indent = 2, ensure_ascii = False)
+            client._upload_config_files(
+                repo_id = repo_id,
+                metadata_path = metadata_path,
+                builder_config_path = scrubbed_config_path,
+            )
 
-        return f"https://huggingface.co/datasets/{repo_id}"
+        from utils.hf_endpoint import get_hf_endpoint
+
+        # Browser-facing URL: a loopback mirror is not the same host.
+        return f"{link_endpoint or get_hf_endpoint()}/datasets/{repo_id}"
     except HuggingFaceHubClientUploadError as exc:
         raise RecipeDatasetPublishError(str(exc)) from exc

@@ -27,20 +27,20 @@ export const RECIPE_STUDIO_USER_NODE_TONE =
 
 export const RECIPE_STUDIO_REFERENCE_BADGE_TONES = {
   user:
-    "corner-squircle border-amber-500/25 bg-amber-500/10 font-mono text-[11px] text-amber-700 dark:text-amber-300",
+    "corner-squircle border-amber-500/25 bg-amber-500/10 font-mono text-ui-11 text-amber-700 dark:text-amber-300",
   seed:
-    "corner-squircle border-blue-500/25 bg-blue-500/10 font-mono text-[11px] text-blue-700 dark:text-blue-300",
-  default: "corner-squircle font-mono text-[11px]",
+    "corner-squircle border-blue-500/25 bg-blue-500/10 font-mono text-ui-11 text-blue-700 dark:text-blue-300",
+  default: "corner-squircle font-mono text-ui-11",
 } as const;
 
 export const RECIPE_STUDIO_WARNING_BADGE_TONE =
-  "border-amber-500/40 bg-amber-500/10 text-amber-700 hover:bg-amber-500/20 dark:text-amber-300";
+  "bg-amber-500/10 text-amber-700 hover:bg-amber-500/20 dark:text-amber-300";
 
 export const RECIPE_STUDIO_WARNING_ICON_TONE =
   "text-amber-600 dark:text-amber-400";
 
 export const RECIPE_STUDIO_ONBOARDING_SURFACE_TONE =
-  "border-primary/20 bg-primary/[0.045]";
+  "border-wash-20 bg-wash-5";
 
 export const RECIPE_STUDIO_ONBOARDING_ICON_TONE =
   "bg-primary/10 text-primary";

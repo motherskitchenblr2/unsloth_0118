@@ -1,15 +1,10 @@
-# Model defaults for OuteAI/Llama-OuteTTS-1.0-1B
-# Based on Oute_TTS_(1B).ipynb
 # Also applies to: OuteAI/Llama-OuteTTS-1.0-1B
-# added inference parameters from unsloth notebook
 
 audio_type: dac
 
 training:
-  trust_remote_code: false
   eval_steps: 0
   max_seq_length: 2048
-  # num_epochs: 4
   num_epochs: 0
   learning_rate: 2e-4
   batch_size: 2
@@ -34,6 +29,7 @@ lora:
     - "v_proj"
   use_rslora: false
   use_loftq: false
+  use_dora: false
 
 logging:
   enable_wandb: false
@@ -43,7 +39,6 @@ logging:
   log_frequency: 10
 
 inference:
-  trust_remote_code: false
   temperature: 0.4
   top_k: 40
   top_p: 0.9

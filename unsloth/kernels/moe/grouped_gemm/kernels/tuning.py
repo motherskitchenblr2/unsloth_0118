@@ -1,9 +1,7 @@
 # SPDX-License-Identifier: GNU Affero General Public License v3.0
 # Copyright 2023-present the Unsloth team. All rights reserved.
 
-"""
-Manual tuning utils
-"""
+"""Manual tuning utils."""
 
 from collections import OrderedDict
 from dataclasses import asdict, dataclass, fields
@@ -33,21 +31,20 @@ class DeviceProperties:
     WARP_SIZE: int
 
 
-_DEVICE_PROPERTIES: Optional[DeviceProperties] = None
+# Per device: config pruning runs on the launching card, which differs on a mixed host.
+_DEVICE_PROPERTIES: dict = {}
 
 
 def get_device_properties():
-    global _DEVICE_PROPERTIES
-    if _DEVICE_PROPERTIES is None:
-        properties = triton.runtime.driver.active.utils.get_device_properties(
-            torch.cuda.current_device()
-        )
+    device = torch.cuda.current_device()
+    if device not in _DEVICE_PROPERTIES:
+        properties = triton.runtime.driver.active.utils.get_device_properties(device)
         NUM_SM = properties["multiprocessor_count"]
         NUM_REGS = properties["max_num_regs"]
         SIZE_SMEM = properties["max_shared_mem"]
         WARP_SIZE = properties["warpSize"]
-        _DEVICE_PROPERTIES = DeviceProperties(NUM_SM, NUM_REGS, SIZE_SMEM, WARP_SIZE)
-    return _DEVICE_PROPERTIES
+        _DEVICE_PROPERTIES[device] = DeviceProperties(NUM_SM, NUM_REGS, SIZE_SMEM, WARP_SIZE)
+    return _DEVICE_PROPERTIES[device]
 
 
 @dataclass
@@ -63,7 +60,11 @@ class KernelConfig:
     fuse_mul_post: bool = False
     use_tma_store: bool = False
 
-    def to_string(self, include_tuning_params: bool = False, include_tma: bool = False):
+    def to_string(
+        self,
+        include_tuning_params: bool = False,
+        include_tma: bool = False,
+    ):
         s = []
         if self.permute_x:
             s.append("permute_x")
@@ -116,7 +117,9 @@ class KernelResult:
 
     @staticmethod
     def to_dataframe(
-        results: list["KernelResult"], sort_by: str = "speedup", ascending: bool = False
+        results: list["KernelResult"],
+        sort_by: str = "speedup",
+        ascending: bool = False,
     ):
         df = pd.DataFrame([result.to_dict() for result in results])
         df = df.sort_values(by = sort_by, ascending = ascending)
@@ -202,12 +205,8 @@ def get_kernel_configs(
         )
 
     kernel_configs_fwd = prune_kernel_configs_fwd(kernel_configs_fwd)
-    kernel_configs_backward_dW = prune_kernel_configs_backward_dW(
-        kernel_configs_backward_dW
-    )
-    kernel_configs_backward_dX = prune_kernel_configs_backward_dX(
-        kernel_configs_backward_dX
-    )
+    kernel_configs_backward_dW = prune_kernel_configs_backward_dW(kernel_configs_backward_dW)
+    kernel_configs_backward_dX = prune_kernel_configs_backward_dX(kernel_configs_backward_dX)
     return kernel_configs_fwd, kernel_configs_backward_dW, kernel_configs_backward_dX
 
 
@@ -256,7 +255,6 @@ class TritonTuningContext:
         self.success = True
 
     def __enter__(self):
-        # Setup code can be added here if needed
         return self
 
     def __exit__(self, exc_type, exc_value, traceback):

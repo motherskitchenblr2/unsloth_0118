@@ -1,14 +1,17 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
+import { useTimeFormat } from "@/lib/time-format";
 import { useCallback, useEffect, useMemo, useState } from "react";
+import { copyToClipboard } from "@/lib/copy-to-clipboard";
 import { toastError, toastSuccess } from "@/shared/toast";
 import { normalizeNonEmptyName } from "@/utils";
+import { removeUnstructuredBlock } from "../api";
 import {
   buildSignature,
-  copyTextToClipboard,
   formatSavedLabel,
 } from "../executions/execution-helpers";
+import { useRecipeStudioStore } from "../stores/recipe-studio";
 import { importRecipePayload, type RecipeSnapshot } from "../utils/import";
 import type { RecipePayloadResult } from "../utils/payload/types";
 
@@ -72,7 +75,10 @@ function stripApiKeys(value: unknown): unknown {
     !Array.isArray(output.env)
   ) {
     output.env = Object.fromEntries(
-      Object.keys(output.env as Record<string, unknown>).map((envKey) => [envKey, ""]),
+      Object.keys(output.env as Record<string, unknown>).map((envKey) => [
+        envKey,
+        "",
+      ]),
     );
   }
   return output;
@@ -82,10 +88,7 @@ function inferHfRepoIdFromPath(pathValue: unknown): string {
   if (typeof pathValue !== "string") {
     return "";
   }
-  const parts = pathValue
-    .trim()
-    .split("/")
-    .filter(Boolean);
+  const parts = pathValue.trim().split("/").filter(Boolean);
   if (parts.length >= 3 && parts[0] === "datasets") {
     return `${parts[1]}/${parts[2]}`;
   }
@@ -126,8 +129,7 @@ function sanitizeSeedForShare(payload: unknown): unknown {
     typeof ui?.seed_source_type === "string" ? ui.seed_source_type : null;
   const sourceType =
     typeof source?.seed_type === "string" ? source.seed_type : null;
-  const shouldResetHfState =
-    sourceType === "hf" || uiSourceType === "hf";
+  const shouldResetHfState = sourceType === "hf" || uiSourceType === "hf";
   const shouldResetLocalState =
     sourceType === "local" ||
     sourceType === "unstructured" ||
@@ -143,7 +145,9 @@ function sanitizeSeedForShare(payload: unknown): unknown {
       ui.seed_columns = [];
       ui.seed_drop_columns = [];
       ui.seed_preview_rows = [];
+      delete ui.seed_total_rows;
       ui.local_file_name = "";
+      ui.unstructured_upload_uid = "";
       ui.unstructured_file_ids = [];
       ui.unstructured_file_names = [];
       ui.unstructured_file_sizes = [];
@@ -164,7 +168,9 @@ function sanitizeSeedForShare(payload: unknown): unknown {
       ui.seed_columns = [];
       ui.seed_drop_columns = [];
       ui.seed_preview_rows = [];
+      delete ui.seed_total_rows;
       ui.local_file_name = "";
+      ui.unstructured_upload_uid = "";
       ui.unstructured_file_ids = [];
       ui.unstructured_file_names = [];
       ui.unstructured_file_sizes = [];
@@ -172,6 +178,42 @@ function sanitizeSeedForShare(payload: unknown): unknown {
   }
 
   return root;
+}
+
+// Delete queued upload dirs only once a save no longer references them, so a reload before
+// autosave never leaves the saved recipe pointing at deleted files.
+function drainQueuedUploadCleanups(
+  savedPayload: RecipePayloadResult["payload"],
+): void {
+  const pending = useRecipeStudioStore.getState().pendingUploadCleanups;
+  if (pending.length === 0) {
+    return;
+  }
+  const ui =
+    savedPayload && typeof savedPayload === "object"
+      ? (savedPayload as { ui?: Record<string, unknown> }).ui
+      : undefined;
+  const savedUid =
+    ui && typeof ui.unstructured_upload_uid === "string"
+      ? ui.unstructured_upload_uid
+      : "";
+  const ready = pending.filter((uid) => uid !== savedUid);
+  if (ready.length === 0) {
+    return;
+  }
+  for (const uid of ready) {
+    void removeUnstructuredBlock(uid)
+      .then(() => {
+        useRecipeStudioStore.setState((state) => ({
+          pendingUploadCleanups: state.pendingUploadCleanups.filter(
+            (pendingUid) => pendingUid !== uid,
+          ),
+        }));
+      })
+      .catch((error) => {
+        console.warn("Failed to clean up uploaded documents:", error);
+      });
+  }
 }
 
 export function useRecipePersistence({
@@ -189,6 +231,8 @@ export function useRecipePersistence({
   const [workflowName, setWorkflowName] = useState("Unnamed");
   const [lastSavedAt, setLastSavedAt] = useState<number | null>(null);
   const [savedSignature, setSavedSignature] = useState("");
+  // Do not retry the exact content that just failed (e.g. a 409 from another window).
+  const [failedSignature, setFailedSignature] = useState<string | null>(null);
   const [saveLoading, setSaveLoading] = useState(false);
   const [copied, setCopied] = useState(false);
   const [importOpen, setImportOpen] = useState(false);
@@ -202,9 +246,12 @@ export function useRecipePersistence({
     () => buildSignature(normalizedWorkflowName, currentPayload),
     [currentPayload, normalizedWorkflowName],
   );
-  const isDirty = savedSignature.length > 0 && currentSignature !== savedSignature;
-  const saveTone: SaveTone = !isDirty && Boolean(lastSavedAt) ? "success" : "error";
+  const isDirty =
+    savedSignature.length > 0 && currentSignature !== savedSignature;
+  const saveTone: SaveTone =
+    !isDirty && Boolean(lastSavedAt) ? "success" : "error";
   const savedAtLabel = formatSavedLabel(lastSavedAt);
+  useTimeFormat();
 
   useEffect(() => {
     setInitialRecipeReady(false);
@@ -214,7 +261,9 @@ export function useRecipePersistence({
     setLastSavedAt(initialSavedAt);
     setCopied(false);
 
-    const parsed = importRecipePayload(JSON.stringify(initialPayload));
+    const parsed = importRecipePayload(JSON.stringify(initialPayload), {
+      preserveUnstructuredUploads: true,
+    });
     if (parsed.snapshot) {
       loadRecipe(parsed.snapshot);
     } else {
@@ -251,30 +300,47 @@ export function useRecipePersistence({
         payload: currentPayload,
       });
       setLastSavedAt(result.updatedAt);
+      setFailedSignature(null);
       setSavedSignature(buildSignature(nextName, currentPayload));
+      drainQueuedUploadCleanups(currentPayload);
     } catch (error) {
       console.error("Save recipe failed:", error);
-      toastError("Save failed", "Could not save recipe.");
+      setFailedSignature(buildSignature(nextName, currentPayload));
+      toastError(
+        "Save failed",
+        error instanceof Error ? error.message : "Could not save recipe.",
+      );
     } finally {
       setSaveLoading(false);
     }
   }, [currentPayload, onPersistRecipe, recipeId, saveLoading, workflowName]);
 
   useEffect(() => {
-    if (!isDirty || saveLoading) {
+    if (!isDirty || saveLoading || failedSignature === currentSignature) {
       return;
     }
     const timeoutId = window.setTimeout(() => {
       void persistRecipe();
     }, 800);
     return () => window.clearTimeout(timeoutId);
-  }, [isDirty, persistRecipe, saveLoading]);
+  }, [currentSignature, failedSignature, isDirty, persistRecipe, saveLoading]);
+
+  // Drain even when not dirty: a net-zero edit inside the debounce would otherwise leak the upload
+  // dir. Drain skips uids the saved recipe still references.
+  useEffect(() => {
+    if (!initialRecipeReady || isDirty || saveLoading) {
+      return;
+    }
+    drainQueuedUploadCleanups(currentPayload);
+  }, [currentPayload, initialRecipeReady, isDirty, saveLoading]);
 
   const copyRecipe = useCallback(async (): Promise<void> => {
     setCopied(false);
     try {
-      const safePayload = sanitizeSeedForShare(stripApiKeys(payloadResult.payload));
-      const ok = await copyTextToClipboard(JSON.stringify(safePayload, null, 2));
+      const safePayload = sanitizeSeedForShare(
+        stripApiKeys(payloadResult.payload),
+      );
+      const ok = await copyToClipboard(JSON.stringify(safePayload, null, 2));
       if (!ok) {
         throw new Error("Clipboard not available.");
       }

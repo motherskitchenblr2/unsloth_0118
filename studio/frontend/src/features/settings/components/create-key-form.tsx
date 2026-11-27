@@ -1,11 +1,21 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
+import { SegmentedPill } from "@/components/segmented-control";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
+import { useT } from "@/i18n";
 import { cn } from "@/lib/utils";
-import { useState } from "react";
-import { createApiKey } from "../api/api-keys";
+import { PlusSignIcon } from "@hugeicons/core-free-icons";
+import { HugeiconsIcon } from "@hugeicons/react";
+import { useId, useState } from "react";
+import { type ApiKey, createApiKey } from "../api/api-keys";
+import { apiKeyActionMessage } from "./api-key-action-message";
 
 const EXPIRY_PRESETS = [
   { label: "Never", value: null as number | null },
@@ -14,69 +24,119 @@ const EXPIRY_PRESETS = [
   { label: "90d", value: 90 },
 ];
 
+export function nextDefaultTokenNumber(
+  names: readonly string[],
+  pattern: RegExp,
+): number {
+  let highest = 0;
+  for (const existing of names) {
+    const match = pattern.exec(existing.trim());
+    if (match) highest = Math.max(highest, Number(match[1]));
+  }
+  return highest + 1;
+}
+
 export function CreateKeyForm({
   onCreated,
   onError,
+  existingNames,
 }: {
-  onCreated: (rawKey: string) => void;
-  onError: (message: string) => void;
+  onCreated: (rawKey: string, apiKey: ApiKey) => void;
+  /** null clears an earlier failure */
+  onError: (message: string | null) => void;
+  existingNames: readonly string[];
 }) {
+  const t = useT();
+  const pillId = useId();
   const [name, setName] = useState("");
   const [expiry, setExpiry] = useState<number | null>(null);
   const [loading, setLoading] = useState(false);
+  const [prefix, suffix] = t("settings.apiKeys.defaultTokenName").split("{n}");
+  const escape = (text = "") => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const defaultName = t("settings.apiKeys.defaultTokenName", {
+    n: String(
+      nextDefaultTokenNumber(
+        existingNames,
+        new RegExp(`^${escape(prefix)}(\\d+)${escape(suffix)}$`),
+      ),
+    ),
+  });
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!name.trim() || loading) return;
+    if (loading) return;
     setLoading(true);
+    onError(null);
     try {
-      const result = await createApiKey(name.trim(), expiry);
-      onCreated(result.key);
+      const result = await createApiKey(name.trim() || defaultName, expiry);
+      onCreated(result.key, result.api_key);
       setName("");
-    } catch (err) {
-      onError(err instanceof Error ? err.message : "Couldn't create key.");
+    } catch (cause) {
+      onError(apiKeyActionMessage(t("settings.apiKeys.createError"), cause));
     } finally {
       setLoading(false);
     }
   };
 
   return (
-    <form
-      onSubmit={handleSubmit}
-      className="flex flex-col gap-2 rounded-lg border border-border bg-muted/20 p-3"
-    >
+    <form onSubmit={handleSubmit} className="flex flex-col gap-2">
       <div className="flex flex-wrap items-center gap-2">
         <Input
           value={name}
           onChange={(e) => setName(e.target.value)}
-          placeholder="Key name (e.g. production)"
-          className="h-8 min-w-[180px] flex-1 text-sm"
-          aria-label="New key name"
+          placeholder={t("settings.apiKeys.tokenNamePlaceholder")}
+          className="h-control min-w-[calc(200px*var(--ui-space-scale,1))] flex-1 text-sm"
+          aria-label={t("settings.apiKeys.newAccessTokenName")}
         />
-        <div className="inline-flex items-center rounded-md border border-border bg-background p-0.5">
+        <div className="hub-tab-toggle inline-flex h-control items-center rounded-full">
           {EXPIRY_PRESETS.map((p) => {
             const active = expiry === p.value;
             return (
-              <button
-                key={p.label}
-                type="button"
-                onClick={() => setExpiry(p.value)}
-                aria-pressed={active}
-                className={cn(
-                  "rounded px-2 py-1 text-[11px] font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
-                  active
-                    ? "bg-accent text-foreground"
-                    : "text-muted-foreground hover:text-foreground",
-                )}
-              >
-                {p.label}
-              </button>
+              <Tooltip key={p.label}>
+                <TooltipTrigger asChild={true}>
+                  <button
+                    type="button"
+                    onClick={() => setExpiry(p.value)}
+                    aria-pressed={active}
+                    className={cn(
+                      "relative inline-flex h-control items-center rounded-full px-3.5 text-ui-12 font-medium transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring",
+                      active
+                        ? "text-foreground"
+                        : "text-muted-foreground hover:text-foreground",
+                    )}
+                  >
+                    {active && <SegmentedPill group={`${pillId}-expiry`} />}
+                    {p.value === null ? t("settings.apiKeys.never") : p.label}
+                  </button>
+                </TooltipTrigger>
+                <TooltipContent side="bottom" sideOffset={6}>
+                  {p.value === null
+                    ? t("settings.apiKeys.neverExpiresHint")
+                    : t("settings.apiKeys.expiresInDaysHint", {
+                        n: String(p.value),
+                      })}
+                </TooltipContent>
+              </Tooltip>
             );
           })}
         </div>
-        <Button type="submit" size="sm" disabled={loading || !name.trim()}>
-          {loading ? "Creating…" : "Create key"}
-        </Button>
+        <Tooltip>
+          <TooltipTrigger asChild={true}>
+            <Button type="submit" variant="dark" size="sm" disabled={loading}>
+              {!loading && (
+                <HugeiconsIcon icon={PlusSignIcon} data-icon="inline-start" />
+              )}
+              {loading
+                ? t("settings.apiKeys.creating")
+                : t("settings.apiKeys.createToken")}
+            </Button>
+          </TooltipTrigger>
+          <TooltipContent side="bottom" sideOffset={6}>
+            {t("settings.apiKeys.createTokenHint", {
+              name: name.trim() || defaultName,
+            })}
+          </TooltipContent>
+        </Tooltip>
       </div>
     </form>
   );

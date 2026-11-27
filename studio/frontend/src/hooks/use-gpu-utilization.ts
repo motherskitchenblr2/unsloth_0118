@@ -7,6 +7,9 @@ import { useEffect, useRef, useState } from "react";
 export interface GpuUtilization {
     available: boolean;
     backend: string | null;
+    devices?: GpuUtilization[];
+    index?: number;
+    visible_ordinal?: number;
     gpu_utilization_pct: number | null;
     temperature_c: number | null;
     vram_used_gb: number | null;
@@ -30,12 +33,7 @@ const DEFAULT: GpuUtilization = {
     power_utilization_pct: null,
 };
 
-/**
- * Poll `GET /api/train/hardware` for live GPU utilization stats.
- *
- * Only polls while `enabled` is true (i.e. training is running).
- * Polling interval defaults to 10 000 ms.
- */
+/** Polls only while `enabled` (training running). */
 export function useGpuUtilization(
     enabled: boolean,
     intervalMs = 10_000,
@@ -45,7 +43,6 @@ export function useGpuUtilization(
 
     useEffect(() => {
         if (!enabled) {
-            // Reset when training stops so the cards show "--" again
             setData(DEFAULT);
             return;
         }
@@ -59,17 +56,28 @@ export function useGpuUtilization(
                 const json = (await res.json()) as GpuUtilization;
                 if (!cancelled) setData(json);
             } catch {
-                // Silently ignore — next poll will retry
+                // Retry on the next poll.
             }
         }
 
-        // Fetch immediately, then set up interval
-        void poll();
-        timerRef.current = setInterval(() => void poll(), intervalMs);
+        let lastPollAt = 0;
+        const pollNow = () => {
+            lastPollAt = Date.now();
+            void poll();
+        };
+        pollNow();
+        timerRef.current = setInterval(() => {
+            if (!document.hidden) pollNow();
+        }, intervalMs);
+        const onVisibilityChange = () => {
+            if (!document.hidden && Date.now() - lastPollAt >= intervalMs) pollNow();
+        };
+        document.addEventListener("visibilitychange", onVisibilityChange);
 
         return () => {
             cancelled = true;
             if (timerRef.current) clearInterval(timerRef.current);
+            document.removeEventListener("visibilitychange", onVisibilityChange);
         };
     }, [enabled, intervalMs]);
 

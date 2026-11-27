@@ -12,7 +12,6 @@ import {
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import {
   Alert02Icon,
-  AlertDiamondIcon,
   CookBookIcon,
   FloppyDiskIcon,
 } from "@hugeicons/core-free-icons";
@@ -34,6 +33,7 @@ type RecipeStudioHeaderProps = {
   savedAtLabel: string;
   workflowName: string;
   warnings?: GraphWarning[];
+  supportsEasyMode?: boolean;
   onWorkflowNameChange: (value: string) => void;
   onViewChange: (view: RecipeStudioView) => void;
   onSaveRecipe: () => void;
@@ -51,6 +51,7 @@ export function RecipeStudioHeader({
   savedAtLabel,
   workflowName,
   warnings = [],
+  supportsEasyMode = false,
   onWorkflowNameChange,
   onViewChange,
   onSaveRecipe,
@@ -58,7 +59,7 @@ export function RecipeStudioHeader({
   const [editingWorkflowName, setEditingWorkflowName] = useState(false);
 
   function handleViewValueChange(value: string): void {
-    if (value === "editor" || value === "executions") {
+    if (value === "easy" || value === "editor" || value === "executions") {
       onViewChange(value);
     }
   }
@@ -83,10 +84,10 @@ export function RecipeStudioHeader({
   }
 
   return (
-    <div className="grid grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)] items-center gap-4 border-b px-4 py-3">
+    <div className="grid grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)] items-center gap-4 border-b px-4 py-3 max-sm:grid-cols-[minmax(0,1fr)_auto] max-sm:gap-x-2 max-sm:gap-y-2.5 max-sm:px-3">
       <div className="flex min-w-0 items-center gap-3">
         <div
-          className="flex size-8 shrink-0 items-center justify-center rounded-lg corner-squircle border border-border/70 bg-muted/20"
+          className="flex size-8 shrink-0 items-center justify-center rounded-md corner-squircle border border-border/70 bg-muted/20"
           aria-hidden={true}
         >
           <HugeiconsIcon
@@ -116,21 +117,26 @@ export function RecipeStudioHeader({
               {workflowName}
             </button>
           )}
-          <Badge variant="secondary" className="h-6 shrink-0 text-[10px]">
+          <Badge variant="secondary" className="h-6 shrink-0 text-ui-10">
             {STATUS_MESSAGE_CLASS[saveTone]}
           </Badge>
           <span
-            className="hidden max-w-[12rem] truncate text-xs text-muted-foreground sm:inline"
+            className="hidden max-w-[calc(12rem*var(--ui-space-scale,1))] truncate text-xs text-muted-foreground sm:inline"
             title={savedAtLabel}
           >
             {savedAtLabel}
           </span>
         </div>
       </div>
-      <div className="justify-self-center">
+      <div data-tour="recipe-views" className="justify-self-center max-sm:order-last max-sm:col-span-2">
         <Tabs value={activeView} onValueChange={handleViewValueChange}>
           <TabsList>
-            <TabsTrigger value="editor">Editor</TabsTrigger>
+            {supportsEasyMode && (
+              <TabsTrigger value="easy">Easy</TabsTrigger>
+            )}
+            <TabsTrigger value="editor">
+              {supportsEasyMode ? "Advanced" : "Editor"}
+            </TabsTrigger>
             <TabsTrigger value="executions">Runs</TabsTrigger>
           </TabsList>
         </Tabs>
@@ -141,7 +147,7 @@ export function RecipeStudioHeader({
             <PopoverTrigger asChild={true}>
               <button
                 type="button"
-                className={`inline-flex h-6 shrink-0 items-center gap-1 rounded-md border px-2 text-[10px] font-medium ${RECIPE_STUDIO_WARNING_BADGE_TONE}`}
+                className={`inline-flex h-6 shrink-0 items-center gap-1 rounded-full px-2 text-ui-10 font-medium ${RECIPE_STUDIO_WARNING_BADGE_TONE}`}
               >
                 <HugeiconsIcon icon={Alert02Icon} className="size-3" />
                 {warnings.length}
@@ -161,7 +167,7 @@ export function RecipeStudioHeader({
                   >
                     <HugeiconsIcon
                       icon={
-                        w.severity === "error" ? AlertDiamondIcon : Alert02Icon
+                        w.severity === "error" ? Alert02Icon : Alert02Icon
                       }
                       className={`mt-0.5 size-3 shrink-0 ${w.severity === "error" ? "text-destructive" : RECIPE_STUDIO_WARNING_ICON_TONE}`}
                     />
@@ -183,6 +189,7 @@ export function RecipeStudioHeader({
           type="button"
           size="sm"
           variant="outline"
+          data-tour="recipe-save"
           onClick={onSaveRecipe}
           disabled={saveLoading}
         >

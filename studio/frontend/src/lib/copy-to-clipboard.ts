@@ -1,13 +1,33 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
-/**
- * Copy text to clipboard in a way that works on Mac/Safari.
- * Uses a synchronous textarea + execCommand fallback so the copy runs in the
- * same user gesture as the click (required by Safari's clipboard security).
- */
+import { isTauri } from "@/lib/api-base";
+
+// Native IPC, so it works outside a user gesture (e.g. after an await).
+async function copyWithTauriClipboard(text: string): Promise<boolean> {
+  try {
+    const { writeText } = await import("@tauri-apps/plugin-clipboard-manager");
+    await writeText(text);
+    return true;
+  } catch (error) {
+    console.warn("Tauri clipboard-manager writeText failed", error);
+    return false;
+  }
+}
+
+/** Synchronous so it runs inside the click gesture, as Safari requires. */
 function copyWithExecCommand(text: string): boolean {
   if (typeof document === "undefined" || !document.body) return false;
+
+  // A modal focus trap empties the selection; the copy event writes the text anyway.
+  let written = false;
+  const onCopy = (event: ClipboardEvent) => {
+    if (!event.clipboardData) return;
+    event.clipboardData.setData("text/plain", text);
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    written = true;
+  };
 
   const textarea = document.createElement("textarea");
   textarea.value = text;
@@ -22,60 +42,86 @@ function copyWithExecCommand(text: string): boolean {
   textarea.focus({ preventScroll: true });
   textarea.select();
 
+  document.addEventListener("copy", onCopy, true);
   try {
-    const ok = document.execCommand("copy");
-    document.body.removeChild(textarea);
-    return ok;
+    return document.execCommand("copy") && written;
   } catch {
-    document.body.removeChild(textarea);
     return false;
+  } finally {
+    document.removeEventListener("copy", onCopy, true);
+    document.body.removeChild(textarea);
   }
 }
 
-export function copyToClipboard(text: string): boolean {
+export async function copyToClipboard(text: string): Promise<boolean> {
   if (typeof text !== "string" || text.length === 0) {
     return false;
   }
 
-  if (typeof document !== "undefined" && document.queryCommandSupported?.("copy") !== false) {
-    if (copyWithExecCommand(text)) return true;
-  }
-
-  // Async fallback for environments where execCommand is entirely unsupported
-  // but the Clipboard API is available (rare; kept for original contract parity).
-  if (typeof navigator?.clipboard?.writeText === "function") {
-    navigator.clipboard.writeText(text).then(
-      () => {},
-      () => {},
-    );
+  // Exactly one writer per call: a pre-armed second write could lose a race and leave a stale
+  // clipboard. Gated synchronously so browsers still write inside the gesture.
+  if (isTauri && (await copyWithTauriClipboard(text))) {
     return true;
   }
 
-  return false;
-}
-
-export async function copyToClipboardAsync(text: string): Promise<boolean> {
-  if (typeof text !== "string" || text.length === 0) {
-    return false;
-  }
-
-  // Prefer the async Clipboard API: avoids focus disruption in Radix
-  // focus-trapped dialogs where execCommand always fails.
   if (typeof navigator?.clipboard?.writeText === "function") {
     try {
       await navigator.clipboard.writeText(text);
       return true;
-    } catch {
-      // Clipboard API rejected (e.g. NotAllowedError, permission policy).
-      // User activation is still valid through promise chains per spec, so
-      // execCommand can succeed for callers outside focus-trapped dialogs.
-      // Inside a Radix modal the focus trap will block textarea.focus() and
-      // execCommand returns false harmlessly.
-      return copyWithExecCommand(text);
+    } catch (error) {
+      console.warn("Async clipboard API failed, falling back to execCommand", error);
     }
   }
 
-  // No Clipboard API (older browser / non-secure context): still in the
-  // original user-gesture frame, so execCommand can work.
+  // execCommand works in Safari during a user gesture.
   return copyWithExecCommand(text);
+}
+
+/** Safari drops activation across an await, so the write starts synchronously with a promised
+ * payload. A rejecting payload leaves the clipboard untouched. */
+export async function copyToClipboardFrom(
+  load: () => Promise<string>,
+): Promise<boolean> {
+  const payload = load();
+  // Keep the rejection from being reported as unhandled meanwhile.
+  payload.catch(() => undefined);
+
+  if (
+    !isTauri &&
+    typeof ClipboardItem === "function" &&
+    typeof navigator?.clipboard?.write === "function"
+  ) {
+    try {
+      await navigator.clipboard.write([
+        new ClipboardItem({
+          "text/plain": payload.then((text) => {
+            if (!text) throw new Error("nothing to copy");
+            return new Blob([text], { type: "text/plain" });
+          }),
+        }),
+      ]);
+      return true;
+    } catch (error) {
+      console.warn("Promised clipboard write failed, falling back", error);
+    }
+  }
+
+  try {
+    return await copyToClipboard(await payload);
+  } catch {
+    return false;
+  }
+}
+
+export async function asPng(blob: Blob): Promise<Blob> {
+  if (blob.type === "image/png") return blob;
+  const bitmap = await createImageBitmap(blob);
+  const canvas = document.createElement("canvas");
+  canvas.width = bitmap.width;
+  canvas.height = bitmap.height;
+  canvas.getContext("2d")?.drawImage(bitmap, 0, 0);
+  bitmap.close();
+  return new Promise((resolve, reject) =>
+    canvas.toBlob((png) => (png ? resolve(png) : reject(new Error("PNG encoding failed"))), "image/png"),
+  );
 }

@@ -1,11 +1,8 @@
 # Copyright 2023-present Daniel Han-Chen & the Unsloth team. All rights reserved.
-#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
-#
 #     http://www.apache.org/licenses/LICENSE-2.0
-#
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -15,12 +12,16 @@
 from transformers import AutoTokenizer
 from transformers.convert_slow_tokenizer import convert_slow_tokenizer
 from transformers import PreTrainedTokenizerFast
+from transformers import __version__ as transformers_version
 import re
 import os
+import json
+import shutil
+import tempfile
+import weakref
 from transformers.models.llama.modeling_llama import logger
 from peft import PeftModelForCausalLM
 import torch
-import itertools
 import collections
 import numpy as np
 import gc
@@ -55,7 +56,7 @@ IGNORED_TOKENIZER_CHECKING = frozenset(
 
 
 IGNORED_TOKENIZER_NAMES = [
-    # Qwen Coder did not train on tool calling. Math did!
+    # Qwen Coder did not train on tool calling; Math did.
     "unsloth/Qwen2.5-Coder-1.5B-Instruct",
     "unsloth/Qwen2.5-Coder-7B-Instruct",
 ]
@@ -65,12 +66,521 @@ IGNORED_TOKENIZER_NAMES = frozenset(
 )
 os.environ["UNSLOTH_IGNORED_TOKENIZER_NAMES"] = "\n".join(IGNORED_TOKENIZER_NAMES)
 
-# Check environments
-keynames = "\n" + "\n".join(os.environ.keys())
-IS_COLAB_ENVIRONMENT = "\nCOLAB_" in keynames
-IS_KAGGLE_ENVIRONMENT = "\nKAGGLE_" in keynames
-KAGGLE_TMP = "/tmp"
-del keynames
+# gemma-4 base mirrors do not prepend <bos>. Not keyed on add_bos_token or repo name; -it is
+# skipped since its chat_template emits BOS. unslothai/unsloth#7903
+_GEMMA4_INSTRUCT_EOS = "<turn|>"
+
+# Anchored: a future gemma-4.5 / gemma_45 has its own BOS policy, and DiffusionGemma4... is not gemma 4.
+_GEMMA4_NAME_RE = re.compile(r"^gemma[\s_-]*4(?![\d.])", re.IGNORECASE)
+
+# A bos_token inside a Jinja comment renders to nothing, so it is not an emission.
+_JINJA_COMMENT_RE = re.compile(r"\{#.*?#\}", re.DOTALL)
+
+
+def _tokenizer_objects(tokenizer):
+    """Yield the processor and its inner tokenizer once each."""
+    seen = []
+    for obj in (tokenizer, getattr(tokenizer, "tokenizer", None)):
+        # Identity, not equality: a wrapper defining __eq__ would compare fields.
+        if obj is None or any(obj is s for s in seen):
+            continue
+        seen.append(obj)
+        yield obj
+
+
+def _is_gemma4_config(config):
+    if config is None:
+        return False
+    for cfg in (config, getattr(config, "text_config", None)):
+        if cfg is None:
+            continue
+        model_type = getattr(cfg, "model_type", None)
+        if model_type is not None and _GEMMA4_NAME_RE.match(str(model_type)):
+            return True
+        if any(_GEMMA4_NAME_RE.match(str(a)) for a in (getattr(cfg, "architectures", None) or [])):
+            return True
+    return False
+
+
+def _is_gemma4_tokenizer(tokenizer):
+    """processor_class = Gemma4Processor, usually only in init_kwargs. The class is GemmaTokenizer, so a class-name check never fires."""
+    for obj in _tokenizer_objects(tokenizer):
+        processor_class = getattr(obj, "processor_class", None)
+        if processor_class is None:
+            processor_class = (getattr(obj, "init_kwargs", None) or {}).get("processor_class")
+        if str(processor_class or "").strip().lower() == "gemma4processor":
+            return True
+    return False
+
+
+def _chat_template_emits_bos(tokenizer):
+    for obj in _tokenizer_objects(tokenizer):
+        template = getattr(obj, "chat_template", None)
+        if not template:
+            continue
+        chunks = template.values() if isinstance(template, dict) else (template,)
+        for chunk in chunks:
+            text = _JINJA_COMMENT_RE.sub("", chunk if isinstance(chunk, str) else str(chunk))
+            if "bos_token" in text or "<bos>" in text:
+                return True
+    return False
+
+
+def _tokenizer_auto_adds_bos(tokenizer):
+    """Does this tokenizer already emit <bos>? Not add_bos_token: google/gemma-4-E2B reports False and still prepends."""
+    bos_token_id = getattr(tokenizer, "bos_token_id", None)
+    if bos_token_id is None:
+        return bool(getattr(tokenizer, "add_bos_token", False))
+    try:
+        input_ids = tokenizer("A")["input_ids"]
+    except Exception:
+        return bool(getattr(tokenizer, "add_bos_token", False))
+    # Processors return a batched nested list.
+    while (
+        isinstance(input_ids, (list, tuple))
+        and input_ids
+        and isinstance(input_ids[0], (list, tuple))
+    ):
+        input_ids = input_ids[0]
+    return bool(input_ids) and input_ids[0] == bos_token_id
+
+
+def _special_ids_added_on_encode(tokenizer):
+    """Ids the tokenizer itself adds to plain text (post-processor BOS / EOS); empty if it cannot be asked."""
+    tokenizer = getattr(tokenizer, "tokenizer", tokenizer)
+    try:
+        with_special = tokenizer("A")["input_ids"]
+        without_special = tokenizer("A", add_special_tokens = False)["input_ids"]
+    except Exception:
+        return frozenset()
+
+    def flat(ids):
+        while isinstance(ids, (list, tuple)) and ids and isinstance(ids[0], (list, tuple)):
+            ids = ids[0]
+        return ids if isinstance(ids, (list, tuple)) else []
+
+    return frozenset(flat(with_special)) - frozenset(flat(without_special))
+
+
+def _as_id_set(ids):
+    if ids is None:
+        return set()
+    if isinstance(ids, int):
+        return {ids}
+    return {i for i in ids if isinstance(i, int)}
+
+
+def zero_pad_embedding_rows(model, tokenizer):
+    """Zero the tokenizer's pad row, except for an EOS id (stopping), an id the tokenizer adds to every
+    input (#4984, harrier pools it) or an lm_head-tied embedding (pad logit 0 beats Gemma's negatives)."""
+    pad_token_id = getattr(tokenizer, "pad_token_id", None) if tokenizer is not None else None
+    if not isinstance(pad_token_id, int):
+        return
+    eos_ids = _as_id_set(getattr(tokenizer, "eos_token_id", None))
+    for config in (getattr(model, "config", None), getattr(model, "generation_config", None)):
+        eos_ids |= _as_id_set(getattr(config, "eos_token_id", None))
+    if pad_token_id in eos_ids or pad_token_id in _special_ids_added_on_encode(tokenizer):
+        return
+    lm_head_weight = getattr(getattr(model, "lm_head", None), "weight", None)
+    with torch.no_grad():
+        for module in model.modules():
+            if (
+                type(module) is torch.nn.Embedding
+                and module.padding_idx == pad_token_id
+                and pad_token_id < module.weight.shape[0]
+                and (
+                    lm_head_weight is None or module.weight.data_ptr() != lm_head_weight.data_ptr()
+                )
+            ):
+                module.weight[pad_token_id] = 0
+
+
+def _strip_bos_from_chat_template_text(chat_template):
+    if not isinstance(chat_template, str) or not chat_template:
+        return chat_template
+    stripped = re.sub(r"\{[\s\-]*\{[\s\-]*bos\_token[\s\-]*\}[\s\-]*\}", "", chat_template, count = 1)
+    # Drop only the `bos_token +` term: Llama 2's `{{ }}` and Llama 3's `{% set %}` must survive.
+    return re.sub(r"\bbos\_token\s*\+\s*", "", stripped, count = 1)
+
+
+def _dedupe_bos_chat_template(tokenizer):
+    """Drop template-emitted BOS when the tokenizer already prepends one. A processor keeps its own copy and save_pretrained writes that one, so both must lose it. Only the inner tokenizer can be asked: calling a processor needs an image."""
+    if not _tokenizer_auto_adds_bos(getattr(tokenizer, "tokenizer", tokenizer)):
+        return
+    for obj in _tokenizer_objects(tokenizer):
+        template = getattr(obj, "chat_template", None)
+        if template is None:
+            continue
+        if isinstance(template, dict):
+            obj.chat_template = {
+                k: _strip_bos_from_chat_template_text(v) if isinstance(v, str) else v
+                for k, v in template.items()
+            }
+        elif isinstance(template, str):
+            obj.chat_template = _strip_bos_from_chat_template_text(template)
+
+
+def _is_gemma4_instruct_tokenizer(tokenizer):
+    """-it emits BOS from its chat template, so flipping the flag would double it."""
+    if _chat_template_emits_bos(tokenizer):
+        return True
+    return any(
+        getattr(o, "eos_token", None) == _GEMMA4_INSTRUCT_EOS for o in _tokenizer_objects(tokenizer)
+    )
+
+
+def _needs_gemma4_base_bos(tokenizer, config = None):
+    if tokenizer is None or _is_gemma4_instruct_tokenizer(tokenizer):
+        return False
+    return _is_gemma4_tokenizer(tokenizer) or _is_gemma4_config(config)
+
+
+def _enable_add_bos_token(tokenizer):
+    """Make the tokenizer prepend <bos>, and warn if that could not be done. Nothing is recorded for save_pretrained: transformers 5.x drops add_bos_token from tokenizer_config.json, so the setter's post_processor rewrite is what persists."""
+    for obj in _tokenizer_objects(tokenizer):
+        # Already correct: keep its post_processor rather than rebuilding one.
+        if _tokenizer_auto_adds_bos(obj):
+            continue
+        try:
+            obj.add_bos_token = True
+        except AttributeError:
+            continue  # Read-only property, or rejects the attribute. Not our tokenizer.
+        except ValueError as error:
+            # Raised when bos_token is None; swallowing it would fake success.
+            logger.warning(f"Unsloth: Could not enable add_bos_token for Gemma 4: {error}")
+            continue
+        # Pre-5.x fast tokenizers accept the attribute without changing what they emit.
+        if not _tokenizer_auto_adds_bos(obj):
+            logger.warning(
+                "Unsloth: add_bos_token was set for this Gemma 4 base tokenizer but it still "
+                "does not prepend <bos>. See unslothai/unsloth#7903."
+            )
+
+
+def _fix_gemma4_base_bos_token(tokenizer, config = None):
+    if tokenizer is None or not _needs_gemma4_base_bos(tokenizer, config = config):
+        return tokenizer
+    _enable_add_bos_token(tokenizer)
+    return tokenizer
+
+
+def _fix_llava_num_additional_image_tokens(tokenizer, config = None):
+    # A CLIP tower emits a CLS token on top of the patches, so a LLaVA processor saved without
+    # num_additional_image_tokens (default 0) is one image token short and generate raises
+    # "Image features and image tokens do not match" (#2225, #3783; llava-hf ships 1).
+    if getattr(tokenizer, "num_additional_image_tokens", None) != 0:
+        return tokenizer
+    vision_config = getattr(config, "vision_config", None)
+    if isinstance(vision_config, dict):
+        model_type = vision_config.get("model_type")
+    else:
+        model_type = getattr(vision_config, "model_type", None)
+    if model_type != "clip_vision_model":
+        return tokenizer
+    tokenizer.num_additional_image_tokens = 1
+    return tokenizer
+
+
+# v5 loads byte-level BPE repos declaring LlamaTokenizerFast with Metaspace, dropping spaces (transformers#45488, #48206).
+_BACKEND_ROUNDTRIP_PROBE = "Hello world, this is a test."
+_BACKEND_IDS_PROBE = (
+    "Hello world! def f(x): return x**2  # code\n你好 éè Αβγ 12345.678 नमस्ते दुनिया open(path):\n"
+)
+# v5 __init__ overwrites tokenizer.json's pre-tokenizer: text round-trips but ids differ (tiny-aya).
+_V5_REBUILT_PRETOKENIZER_CLASSES = frozenset(("CohereTokenizer",))
+
+
+def _backend_roundtrip(backend, text):
+    # One leading space still counts: ByteLevel(add_prefix_space = True) adds it by design.
+    try:
+        ids = backend.encode(text, add_special_tokens = False).ids
+        return backend.decode(ids, skip_special_tokens = False) in (text, " " + text), ids
+    except Exception:
+        return None, None
+
+
+def _resolve_tokenizer_json(
+    tokenizer,
+    cache_dir = None,
+    revision = None,
+    filename = "tokenizer.json",
+    allow_default_cache = True,
+):
+    name = getattr(tokenizer, "name_or_path", None)
+    if not isinstance(name, str) or not name:
+        return None
+    if os.path.isdir(name):
+        path = os.path.join(name, filename)
+        return path if os.path.isfile(path) else None
+    try:
+        from huggingface_hub import try_to_load_from_cache
+    except Exception:
+        return None
+    cache_dirs = (cache_dir, None) if allow_default_cache else (cache_dir,)
+    for _cache_dir in dict.fromkeys(cache_dirs):
+        try:
+            path = try_to_load_from_cache(name, filename, cache_dir = _cache_dir, revision = revision)
+        except Exception:
+            path = None
+        if isinstance(path, str) and os.path.isfile(path):
+            return path
+    return None
+
+
+def _inferred_tokenizer_max_length(
+    tokenizer,
+    cache_dir = None,
+    revision = None,
+):
+    backend = getattr(tokenizer, "_tokenizer", None)
+    truncation = getattr(backend, "truncation", None)
+    padding = getattr(backend, "padding", None)
+    limit = truncation["max_length"] if truncation else padding.get("length") if padding else None
+    if limit is None or getattr(tokenizer, "init_kwargs", {}).get("max_length") != limit:
+        return None
+    path = _resolve_tokenizer_json(
+        tokenizer,
+        cache_dir = cache_dir,
+        revision = revision,
+        filename = "tokenizer_config.json",
+        allow_default_cache = False,
+    )
+    if path is None:
+        return None
+    try:
+        with open(path, "r", encoding = "utf-8") as file:
+            config = json.load(file)
+        return limit if isinstance(config, dict) and "max_length" not in config else None
+    except Exception:
+        return None
+
+
+def _repair_one_tokenizer_backend(
+    tokenizer,
+    cache_dir = None,
+    revision = None,
+):
+    backend = getattr(tokenizer, "_tokenizer", None)
+    if backend is None or not hasattr(backend, "pre_tokenizer"):
+        return False
+    ok, _ = _backend_roundtrip(backend, _BACKEND_ROUNDTRIP_PROBE)
+    if ok is None or (ok and type(tokenizer).__name__ not in _V5_REBUILT_PRETOKENIZER_CLASSES):
+        return False
+    path = _resolve_tokenizer_json(tokenizer, cache_dir = cache_dir, revision = revision)
+    if path is None:
+        return False
+    try:
+        from tokenizers import Tokenizer
+        reference = Tokenizer.from_file(path)
+    except Exception:
+        return False
+    ref_ok, _ = _backend_roundtrip(reference, _BACKEND_ROUNDTRIP_PROBE)
+    if not ref_ok:
+        return False
+    try:
+        if backend.get_vocab(with_added_tokens = False) != reference.get_vocab(
+            with_added_tokens = False
+        ):
+            return False
+    except Exception:
+        return False
+    _, ref_ids = _backend_roundtrip(reference, _BACKEND_IDS_PROBE)
+    if ok and _backend_roundtrip(backend, _BACKEND_IDS_PROBE)[1] == ref_ids:
+        return False
+    saved = (backend.model, backend.normalizer, backend.pre_tokenizer, backend.decoder)
+    try:
+        # Keep the loaded post_processor, padding, truncation and added tokens.
+        backend.model = reference.model
+        backend.normalizer = reference.normalizer
+        backend.pre_tokenizer = reference.pre_tokenizer
+        backend.decoder = reference.decoder
+        new_ok, _ = _backend_roundtrip(backend, _BACKEND_ROUNDTRIP_PROBE)
+        _, new_ids = _backend_roundtrip(backend, _BACKEND_IDS_PROBE)
+        if new_ok and new_ids == ref_ids:
+            return True
+    except Exception:
+        pass
+    try:
+        backend.model, backend.normalizer, backend.pre_tokenizer, backend.decoder = saved
+    except Exception:
+        pass
+    return False
+
+
+def _repair_tokenizer_backend_from_json(
+    tokenizer,
+    cache_dir = None,
+    revision = None,
+):
+    for obj in _tokenizer_objects(tokenizer):
+        backend = getattr(obj, "_tokenizer", None)
+        if backend is None or hasattr(obj, "_unsloth_loaded_runtime_max_length"):
+            continue
+        obj._unsloth_loaded_runtime_max_length = _inferred_tokenizer_max_length(
+            obj, cache_dir = cache_dir, revision = revision
+        )
+    if tokenizer is None or os.environ.get("UNSLOTH_DISABLE_TOKENIZER_JSON_REPAIR", "0") == "1":
+        return tokenizer
+    for obj in _tokenizer_objects(tokenizer):
+        if _repair_one_tokenizer_backend(obj, cache_dir = cache_dir, revision = revision):
+            obj._unsloth_tokenizer_json_repaired = True
+            getattr(logger, "warning_once", logger.warning)(
+                f"Unsloth: {type(obj).__name__} for {getattr(obj, 'name_or_path', '')} did not "
+                "match tokenizer.json (transformers v5 replaced its pre-tokenizer), so it was "
+                "rebuilt from tokenizer.json."
+            )
+    return tokenizer
+
+
+def _literal_regex(text):
+    return r"\s*".join(re.escape(part) for part in text.split())
+
+
+# Unsloth's 2025 Mistral Small 3.2 template emitted [AVAILABLE_TOOLS] only when the last message was a
+# user or tool turn, so training rows ending in an assistant reply lost the tool list. mistral_common
+# (serving and finetuning) puts it before the last user message; rewrite to that (unslothai/unsloth#3096).
+_MISTRAL_TOOLS_REWRITES = (
+    (
+        re.compile(
+            _literal_regex(
+                "{#- Tool description appended ONLY to last user message. Edits made by Unsloth #}"
+            )
+            + r".*?(?="
+            + _literal_regex(
+                "{%- for message in loop_messages %} {%- if message['role'] == 'user' %}"
+            )
+            + r")",
+            re.S,
+        ),
+        '{%- set tools_description = "" %}\n'
+        "{%- set has_tools = false %}\n"
+        "{%- set ns = namespace(last_user_index=-1) %}\n"
+        "{%- if tools is defined and tools is not none and tools|length > 0 %}\n"
+        "    {%- set has_tools = true %}\n"
+        '    {%- set tools_description = "[AVAILABLE_TOOLS]" + (tools | tojson) + "[/AVAILABLE_TOOLS]" %}\n'
+        "    {%- for message in loop_messages %}\n"
+        "        {%- if message['role'] == 'user' %}\n"
+        "            {%- set ns.last_user_index = loop.index0 %}\n"
+        "        {%- endif %}\n"
+        "    {%- endfor %}\n"
+        "{%- endif %}\n\n",
+    ),
+    (
+        re.compile(
+            _literal_regex(
+                "{%- if has_tools and loop.last %} {{- tools_description }} {%- endif %} "
+                "{#- If directly called tools in first turn, prepend to user #} "
+                "{%- if ns.append_tools and ns.append_tools_index == 0 %} {{- tools_description }} {%- endif %}"
+            )
+        ),
+        "{%- if has_tools and loop.index0 == ns.last_user_index %}\n"
+        "            {{- tools_description }}\n"
+        "        {%- endif %}",
+    ),
+    (
+        re.compile(
+            _literal_regex(
+                "{#- If User,Assistant,Tool,Tool we also need to append tools_description. Edits made by Unsloth #} "
+                "{%- if has_tools and (loop.index0 == ns.append_tools_index) %} {{- eos_token }} {{- tools_description }} {%- endif %}"
+            )
+            + r"\s*"
+        ),
+        "",
+    ),
+    (
+        re.compile(
+            _literal_regex(
+                "{#- Must not add EOS if added tools_description. Unsloth edits. #} "
+                "{%- if (loop.index0 != ns.append_tools_index) %} {{- eos_token }} {%- endif %}"
+            )
+        ),
+        "{{- eos_token }}",
+    ),
+)
+
+
+def _rewrite_mistral_tools_chat_template(template):
+    if not isinstance(template, str) or "ns.append_tools_index" not in template:
+        return template
+    new = template
+    for pattern, replacement in _MISTRAL_TOOLS_REWRITES:
+        new, n = pattern.subn(lambda _: replacement, new)
+        if n != 1:
+            return template
+    if "append_tools" in new:
+        return template
+    try:
+        import jinja2
+        jinja2.Environment(extensions = ["jinja2.ext.loopcontrols"]).parse(new)
+    except Exception:
+        return template
+    return new
+
+
+def _fix_mistral_tools_chat_template(tokenizer):
+    for obj in _tokenizer_objects(tokenizer):
+        template = getattr(obj, "chat_template", None)
+        new = _rewrite_mistral_tools_chat_template(template)
+        if new is not template:
+            obj.chat_template = new
+    return tokenizer
+
+
+def _apply_post_load_tokenizer_fixes(
+    tokenizer,
+    fix_tokenizer = True,
+    config = None,
+    cache_dir = None,
+    revision = None,
+):
+    # Runs even with fix_tokenizer = False: a tokenizer dropping spaces is never wanted.
+    tokenizer = _repair_tokenizer_backend_from_json(
+        tokenizer, cache_dir = cache_dir, revision = revision
+    )
+    from .models.loader_utils import _mark_loaded_revision
+
+    _mark_loaded_revision(tokenizer, revision, cache_dir = cache_dir, load_kwargs = {})
+    tokenizer = _fix_llava_num_additional_image_tokens(tokenizer, config = config)
+    if not fix_tokenizer:
+        return tokenizer
+    tokenizer = _fix_gemma4_base_bos_token(tokenizer, config = config)
+    tokenizer = _fix_mistral_tools_chat_template(tokenizer)
+    return _fix_post_load_chat_template(tokenizer)
+
+
+def _fix_post_load_chat_template(tokenizer):
+    # FastModel twin of load_correct_tokenizer's template repair, same exclusions.
+    text_tokenizer = getattr(tokenizer, "tokenizer", tokenizer)
+    old = getattr(text_tokenizer, "chat_template", None)
+    if not isinstance(old, str) or not old:
+        return tokenizer
+    name = str(getattr(text_tokenizer, "name_or_path", "")).lower()
+    if any(s in name for s in ("mistral", "qwen3guard")):
+        return tokenizer
+    if "[/INST]" in old and "[INST]" in old and "bos_token" in old and "eos_token" in old:
+        return tokenizer
+    try:
+        new = _fix_chat_template_for_tokenizer(text_tokenizer, old)
+    except RuntimeError:
+        raise  # UNSLOTH_STRICT_CHAT_TEMPLATE=1
+    except Exception:
+        return tokenizer
+    if isinstance(new, str) and new != old:
+        text_tokenizer.chat_template = new
+        if tokenizer is not text_tokenizer and getattr(tokenizer, "chat_template", None) == old:
+            tokenizer.chat_template = new
+    return tokenizer
+
+
+# A KAGGLE_* variable is not a Kaggle kernel: the Kaggle CLI reads KAGGLE_USERNAME / KAGGLE_KEY on ordinary machines, and redirecting their tokenizer cache to /tmp because of it was wrong.
+from .disk_utils import (
+    KAGGLE_TMP,
+    is_colab_environment,
+    is_kaggle_environment,
+)
+
+IS_COLAB_ENVIRONMENT = is_colab_environment()
+IS_KAGGLE_ENVIRONMENT = is_kaggle_environment()
 
 
 def try_fix_tokenizer(tokenizer, prepend = True):
@@ -81,13 +591,12 @@ def try_fix_tokenizer(tokenizer, prepend = True):
 
     tokenizer_string = converted_tokenizer.to_str()
 
-    # Llama does _apple. Sometimes this is wrong!!
+    # Llama does _apple; sometimes this is wrong.
     prepend_text = '{"type":"Prepend","prepend":"▁"},'
     if not prepend and prepend_text in tokenizer_string:
         tokenizer_string = tokenizer_string.replace(prepend_text, "", 1)
 
     dir_names = dir(tokenizer)
-    # Get eos_token, bos_token etc
     token_names = [x for x in dir_names if x.endswith("_token") and x.count("_") == 1]
 
     for token_name in token_names:
@@ -98,7 +607,6 @@ def try_fix_tokenizer(tokenizer, prepend = True):
         if token_id is None:
             continue
 
-        # Locate the token's id mapping in the string
         find_text = f'"id":{token_id},"content":"'
         find_pos = tokenizer_string.find(find_text)
         if find_pos == -1:
@@ -109,13 +617,11 @@ def try_fix_tokenizer(tokenizer, prepend = True):
             continue
 
         bad_token = tokenizer_string[start:end]
-        # Check if token is the actual same one - if not, edit it
         if bad_token != token:
             bad_text = f'{find_text}{bad_token}",'
             good_text = f'{find_text}{token}",'
             tokenizer_string = tokenizer_string.replace(bad_text, good_text, 1)
 
-            # And replace vocab section
             bad_text = f'"{bad_token}":{token_id},'
             good_text = f'"{token}":{token_id},'
             tokenizer_string = tokenizer_string.replace(bad_text, good_text, 1)
@@ -135,10 +641,7 @@ def get_sorted_dict(dictionary):
     return sorted_dictionary
 
 
-def convert_to_fast_tokenizer(
-    slow_tokenizer,
-    temporary_location = "_unsloth_sentencepiece_temp",
-):
+def convert_to_fast_tokenizer(slow_tokenizer, temporary_location = "_unsloth_sentencepiece_temp"):
     is_fast = getattr(slow_tokenizer, "is_fast", False)
     if is_fast:
         return slow_tokenizer
@@ -156,13 +659,11 @@ def convert_to_fast_tokenizer(
     except:
         FastTokenizer = PreTrainedTokenizerFast
 
-    # Get all arguments (bos_token, etc)
     docs = FastTokenizer.__doc__
     docs = docs[docs.find("Args:") :]
     args = re.findall(r"\n[\s]+([^\s]{1,}) \(", docs, flags = re.MULTILINE)
     args = [x for x in args if not x.endswith("_file")]
 
-    # Also some missing maybe!
     docs = PreTrainedTokenizerFast.__doc__
     docs = docs[docs.find("Args:") :]
     args2 = re.findall(r"\n[\s]+([^\s]{1,}) \(", docs, flags = re.MULTILINE)
@@ -172,40 +673,36 @@ def convert_to_fast_tokenizer(
     kwargs = {}
     for arg in args:
         kwargs[arg] = getattr(slow_tokenizer, arg, None)
-    kwargs["tokenizer_object"] = try_fix_tokenizer(slow_tokenizer, prepend = True)
-    fast_tokenizer = FastTokenizer(**kwargs)
+    # Remote-code slow tokenizers (e.g. Teuken's SPTokenizer, no vocab_file) can't always be converted:
+    # keep the slow one, as the vocab / tokenization mismatch checks below already do.
+    try:
+        kwargs["tokenizer_object"] = try_fix_tokenizer(slow_tokenizer, prepend = True)
+        fast_tokenizer = FastTokenizer(**kwargs)
+    except Exception:
+        return slow_tokenizer
 
-    # Check if they're similar!
     sorted_slow_tokenizer = get_sorted_dict(slow_tokenizer.get_vocab())
     sorted_fast_tokenizer = get_sorted_dict(fast_tokenizer.get_vocab())
 
     check_vocab = sorted_slow_tokenizer == sorted_fast_tokenizer
-    check_special = (
-        slow_tokenizer.all_special_tokens == fast_tokenizer.all_special_tokens
-    )
+    check_special = slow_tokenizer.all_special_tokens == fast_tokenizer.all_special_tokens
 
-    # Failure so return slow_tokenizer
     if not check_vocab or not check_special:
         return slow_tokenizer
 
-    # Now confirm if they match
     if not assert_same_tokenization(slow_tokenizer, fast_tokenizer):
-        # Maybe remove prepending of __apple?
         kwargs["tokenizer_object"] = try_fix_tokenizer(slow_tokenizer, prepend = False)
         fast_tokenizer = FastTokenizer(**kwargs)
         if not assert_same_tokenization(slow_tokenizer, fast_tokenizer):
-            # Failure :(
             return slow_tokenizer
 
-    # Also tokenizer.model is missing!
     name = slow_tokenizer.name_or_path.replace("/", "_")
-    if not os.path.exists(temporary_location):
-        os.makedirs(temporary_location)
+    # exist_ok: a check-then-create races when two processes share a working directory.
+    os.makedirs(temporary_location, exist_ok = True)
     new_location = f"{temporary_location}/{name}"
     slow_tokenizer.save_pretrained(new_location)
     fast_tokenizer.save_pretrained(new_location)
 
-    # Now load it!
     fast_tokenizer = AutoTokenizer.from_pretrained(new_location)
     if assert_same_tokenization(slow_tokenizer, fast_tokenizer):
         return fast_tokenizer
@@ -261,10 +758,7 @@ llama_template = (
 )
 
 
-def assert_same_tokenization(slow_tokenizer, fast_tokenizer):
-    # Get eos_token, bos_token etc
-    if not hasattr(slow_tokenizer, "all_special_tokens"):
-        return True
+def _same_tokenization_special_tokens(slow_tokenizer):
     dir_names = dir(slow_tokenizer)
     special_tokens = list(
         filter(
@@ -278,11 +772,23 @@ def assert_same_tokenization(slow_tokenizer, fast_tokenizer):
     )
     all_special_tokens = list(set(special_tokens + slow_tokenizer.all_special_tokens))
 
-    # Remove replacement char for false positive
     replacement_char = b"\xc3\xaf\xc2\xbf\xc2\xbd".decode("utf-8")
-    all_special_tokens = [x for x in all_special_tokens if x != replacement_char]
+    return [x for x in all_special_tokens if x != replacement_char]
 
-    # Check if chat template is enabled!
+
+def _same_tokenization_text(all_special_tokens):
+    return (
+        "\n".join(all_special_tokens)
+        + "A quick brown fox jumps over the lazy dog!!\n\nHi</s>\n\n"
+        + "".join(all_special_tokens)
+    )
+
+
+def assert_same_tokenization(slow_tokenizer, fast_tokenizer):
+    if not hasattr(slow_tokenizer, "all_special_tokens"):
+        return True
+    all_special_tokens = _same_tokenization_special_tokens(slow_tokenizer)
+
     check_chat_template1 = True
     check_chat_template2 = True
     check_chat_template3 = True
@@ -324,26 +830,15 @@ def assert_same_tokenization(slow_tokenizer, fast_tokenizer):
     slow_tokenizer.chat_template = slow_chat_template
     fast_tokenizer.chat_template = fast_chat_template
     """
-    check_chat_template = (
-        check_chat_template1 and check_chat_template2 and check_chat_template3
-    )
+    check_chat_template = check_chat_template1 and check_chat_template2 and check_chat_template3
 
-    # Try special tokens
     try:
-        string = (
-            "\n".join(all_special_tokens)
-            + "A quick brown fox jumps over the lazy dog!!\n\nHi</s>\n\n"
-            + "".join(all_special_tokens)
-        )
-        check_special_tokens = (
-            slow_tokenizer(string).input_ids == fast_tokenizer(string).input_ids
-        )
+        string = _same_tokenization_text(all_special_tokens)
+        check_special_tokens = slow_tokenizer(string).input_ids == fast_tokenizer(string).input_ids
 
         return check_chat_template and check_special_tokens
     except:
-        # For eg see https://github.com/unslothai/unsloth/issues/292
-        # Sometimes tokenizer has weird tokens, causing a combined tokenization to fail.
-        # [TODO] We temporarily disable this for CodeLlama tokenizers
+        # Sometimes a tokenizer has weird tokens, causing a combined tokenization to fail; temporarily disabled for CodeLlama tokenizers (#292).
         if slow_tokenizer.__repr__().split("(", 1)[0] in IGNORED_TOKENIZER_CHECKING:
             return check_chat_template
         else:
@@ -356,11 +851,9 @@ def fix_sentencepiece_tokenizer(
     token_mapping,
     temporary_location = "_unsloth_sentencepiece_temp",
 ):
-    # From https://github.com/google/sentencepiece/issues/121
-    # We need to manually edit the sentencepiece tokenizer!
+    # The sentencepiece tokenizer must be edited manually; see google/sentencepiece#121. Only works for SentencePiece <= 3.20.3.
     try:
         from transformers.convert_slow_tokenizer import import_protobuf
-
         sentencepiece_model_pb2 = import_protobuf()
     except Exception as e:
         try:
@@ -377,36 +870,33 @@ def fix_sentencepiece_tokenizer(
             # This will only work for older SentencePiece versions <= 3.20.3
             from transformers.utils import sentencepiece_model_pb2
 
-    if not os.path.exists(temporary_location):
-        os.makedirs(temporary_location)
+    # exist_ok: a check-then-create races when two processes share a working directory.
+    os.makedirs(temporary_location, exist_ok = True)
 
-    # Check if tokenizer.model exists
-    if not os.path.isfile(f"{temporary_location}/tokenizer.model"):
-        return new_tokenizer
+    # Fresh per-call subdir so concurrent or repeated calls cannot clobber each other's tokenizer.model or leak stale files, without deleting anything the caller owns.
+    temporary_location = tempfile.mkdtemp(prefix = "tokenizer_", dir = temporary_location)
 
-    # First save the old tokenizer
     old_tokenizer.save_pretrained(temporary_location)
 
-    tokenizer_file = sentencepiece_model_pb2.ModelProto()
-    tokenizer_file.ParseFromString(
-        open(f"{temporary_location}/tokenizer.model", "rb").read()
-    )
+    if not os.path.isfile(f"{temporary_location}/tokenizer.model"):
+        shutil.rmtree(temporary_location, ignore_errors = True)
+        return new_tokenizer
 
-    # Now save the new tokenizer
+    tokenizer_file = sentencepiece_model_pb2.ModelProto()
+    tokenizer_file.ParseFromString(open(f"{temporary_location}/tokenizer.model", "rb").read())
+
     new_tokenizer.save_pretrained(temporary_location)
 
-    # Now correct the old tokenizer's .model file
     for old_token, new_token in token_mapping.items():
         ids = old_tokenizer([old_token], add_special_tokens = False).input_ids
         ids = ids[0]
         if len(ids) != 1:
-            # Skip this token!
             print(
                 f"Skip mapping {old_token} to {new_token} since {new_token} is already in the tokenizer!"
             )
             continue
         ids = ids[0]
-        # [TODO] Hack for Starling - try except
+        # Hack for Starling: try/except.
         try:
             tokenizer_piece = tokenizer_file.pieces[ids]
         except:
@@ -414,11 +904,9 @@ def fix_sentencepiece_tokenizer(
         assert tokenizer_piece.piece == old_token
         tokenizer_piece.piece = new_token
 
-    # And now write it
     with open(f"{temporary_location}/tokenizer.model", "wb") as file:
         file.write(tokenizer_file.SerializeToString())
 
-    # And load it!
     from transformers import AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(
@@ -426,16 +914,24 @@ def fix_sentencepiece_tokenizer(
         eos_token = new_tokenizer.eos_token,
         pad_token = new_tokenizer.pad_token,
     )
+    # vocab_file points here, so the dir must outlive the tokenizer (a later save_pretrained copies the patched tokenizer.model from it); reclaim it on GC.
+    weakref.finalize(tokenizer, shutil.rmtree, temporary_location, ignore_errors = True)
     return tokenizer
 
 
 def fix_sentencepiece_gguf(saved_location):
-    """
-    Fixes sentencepiece tokenizers which did not extend the vocabulary with
-    user defined tokens.
-    Inspiration from https://github.com/ggerganov/llama.cpp/blob/master/convert_hf_to_gguf.py
-    """
+    """Fix sentencepiece tokenizers that didn't extend the vocab with user-defined tokens. Inspired by llama.cpp's convert_hf_to_gguf.py. Also retypes special tokens (e.g. Gemma 3's <start_of_turn>/<end_of_turn>) that exist in the sentencepiece model but are typed NORMAL instead of CONTROL: NORMAL writes token_type=1 to GGUF, breaking llama.cpp chat inference since parse_special only matches CONTROL (type=3)."""
     from copy import deepcopy
+    import sys
+
+    try:
+        from transformers.convert_slow_tokenizer import import_protobuf
+        sys.modules.setdefault(
+            "transformers.utils.sentencepiece_model_pb2",
+            import_protobuf(),
+        )
+    except Exception:
+        pass
     from transformers.utils import sentencepiece_model_pb2
     import json
     from enum import IntEnum
@@ -448,57 +944,152 @@ def fix_sentencepiece_gguf(saved_location):
         UNUSED = 5
         BYTE = 6
 
-    # Load tokenizer.model
     tokenizer_file = sentencepiece_model_pb2.ModelProto()
     if not os.path.isfile(f"{saved_location}/tokenizer.model"):
         return
-    tokenizer_file.ParseFromString(
-        open(f"{saved_location}/tokenizer.model", "rb").read()
-    )
+    tokenizer_file.ParseFromString(open(f"{saved_location}/tokenizer.model", "rb").read())
     sentence_piece_size = len(tokenizer_file.pieces)
 
-    # Load added_tokens_json
+    # Build a set of token IDs marked special in tokenizer.json: these must use CONTROL type in the sentencepiece model so llama.cpp writes them as CONTROL (type=3) in the GGUF token_type array.
+    special_token_ids = set()
+    if os.path.isfile(f"{saved_location}/tokenizer.json"):
+        with open(f"{saved_location}/tokenizer.json", "r", encoding = "utf-8") as f:
+            tokenizer_json = json.load(f)
+        for entry in tokenizer_json.get("added_tokens", []):
+            token_id = entry.get("id")
+            if entry.get("special", False) and isinstance(token_id, int):
+                special_token_ids.add(token_id)
+
+    # Fix existing sentencepiece tokens marked special in tokenizer.json but typed NORMAL instead of CONTROL in the sentencepiece model.
+    patched = 0
+    for token_id in special_token_ids:
+        if 0 <= token_id < sentence_piece_size:
+            piece = tokenizer_file.pieces[token_id]
+            if piece.type == SentencePieceTokenTypes.NORMAL:
+                piece.type = SentencePieceTokenTypes.CONTROL
+                patched += 1
+    if patched > 0:
+        logger.warning(
+            f"Unsloth: Patched {patched} special token(s) in {saved_location}/tokenizer.model "
+            f"from NORMAL to CONTROL type so llama.cpp / GGUF chat inference works correctly."
+        )
+
     if not os.path.isfile(f"{saved_location}/added_tokens.json"):
+        if patched > 0:
+            with open(f"{saved_location}/tokenizer.model", "wb") as file:
+                file.write(tokenizer_file.SerializeToString())
         return
     with open(f"{saved_location}/added_tokens.json", "r", encoding = "utf-8") as file:
         added_tokens_json = json.load(file)
     if len(added_tokens_json) == 0:
+        if patched > 0:
+            with open(f"{saved_location}/tokenizer.model", "wb") as file:
+                file.write(tokenizer_file.SerializeToString())
         return
 
-    added_tokens_json = dict(
-        sorted(added_tokens_json.items(), key = lambda item: item[1])
-    )
+    added_tokens_json = dict(sorted(added_tokens_json.items(), key = lambda item: item[1]))
     new_size = sentence_piece_size + len(added_tokens_json)
 
-    # Confirm added_tokens_json is correct
     added_tokens_ids = np.array(list(added_tokens_json.values()))
+    _real_added_tokens_ids = added_tokens_ids
+    if len(added_tokens_ids) < 2:
+        added_tokens_ids = np.array([sentence_piece_size, sentence_piece_size + 1])
     diff = np.diff(added_tokens_ids)
     if diff.min() != 1 or diff.max() != 1:
+        if patched > 0:
+            with open(f"{saved_location}/tokenizer.model", "wb") as file:
+                file.write(tokenizer_file.SerializeToString())
         return
+    added_tokens_ids = _real_added_tokens_ids
     if added_tokens_ids.min() != sentence_piece_size:
+        if patched > 0:
+            with open(f"{saved_location}/tokenizer.model", "wb") as file:
+                file.write(tokenizer_file.SerializeToString())
         return
 
-    # Edit sentence piece tokens with added_tokens_json
     logger.warning(
         f"Unsloth: Extending {saved_location}/tokenizer.model with added_tokens.json.\n"
         f"Originally tokenizer.model is of size ({sentence_piece_size}).\n"
         f"But we need to extend to sentencepiece vocab size ({new_size})."
     )
     new_tokens = deepcopy(tokenizer_file.pieces[-len(added_tokens_ids) :])
-    for new_token, added_token in zip(new_tokens, added_tokens_json.keys()):
-        new_token.piece = added_token.encode("utf-8")
+    for new_token, added_token_str in zip(new_tokens, added_tokens_json.keys()):
+        added_token_id = added_tokens_json[added_token_str]
+        new_token.piece = added_token_str.encode("utf-8")
         new_token.score = -1000.0
-        new_token.type = SentencePieceTokenTypes.USER_DEFINED
+        # Use CONTROL type for tokens marked special in tokenizer.json, otherwise fall back to USER_DEFINED.
+        if added_token_id in special_token_ids:
+            new_token.type = SentencePieceTokenTypes.CONTROL
+        else:
+            new_token.type = SentencePieceTokenTypes.USER_DEFINED
 
     tokenizer_file.pieces.extend(new_tokens)
 
     with open(f"{saved_location}/tokenizer.model", "wb") as file:
         file.write(tokenizer_file.SerializeToString())
 
-    # Add padding tokens
-    # actual_vocab_size = model.config.vocab_size
-    # padding = actual_vocab_size - len(tokenizer_file.pieces)
     return
+
+
+def _sync_add_special_tokens(fast_tokenizer, slow_tokenizer):
+    if hasattr(fast_tokenizer, "add_bos_token") and hasattr(slow_tokenizer, "add_bos_token"):
+        fast_tokenizer.add_bos_token = slow_tokenizer.add_bos_token
+    if hasattr(fast_tokenizer, "add_eos_token") and hasattr(slow_tokenizer, "add_eos_token"):
+        fast_tokenizer.add_eos_token = slow_tokenizer.add_eos_token
+
+
+# v5 ignores use_fast/from_slow: the "slow" load is the fast one plus legacy = False, unread by these classes.
+_TRANSFORMERS_V5 = int(transformers_version.split(".")[0]) >= 5
+_V5_LEGACY_FREE_TOKENIZERS = frozenset(
+    (
+        "TokenizersBackend",
+        "Qwen2Tokenizer",
+        "Qwen3_5Tokenizer",
+        "GemmaTokenizer",
+        "GPT2Tokenizer",
+        "CohereTokenizer",
+    )
+)
+
+
+def _slow_load_copies_fast(fast_tokenizer):
+    cls = type(fast_tokenizer)
+    if not _TRANSFORMERS_V5 or not cls.__module__.startswith("transformers."):
+        return False
+    if cls.__name__ in _V5_LEGACY_FREE_TOKENIZERS:
+        return True
+    # LlamaTokenizer builds its pre-tokenizer from legacy, so the copy only matches at legacy = False.
+    return cls.__name__ == "LlamaTokenizer" and getattr(fast_tokenizer, "legacy", None) is False
+
+
+def _same_tokenization_as_own_copy(fast_tokenizer):
+    try:
+        string = _same_tokenization_text(_same_tokenization_special_tokens(fast_tokenizer))
+        before = fast_tokenizer(string).input_ids
+    except Exception:
+        return False
+    # The setters rebuild the post_processor in place; undo them if ids move so the slow path starts as loaded.
+    backend = getattr(fast_tokenizer, "_tokenizer", None)
+    saved_post_processor = getattr(backend, "post_processor", None)
+    saved_flags = {
+        k: fast_tokenizer.__dict__[k]
+        for k in ("_add_bos_token", "_add_eos_token")
+        if k in fast_tokenizer.__dict__
+    }
+    try:
+        _sync_add_special_tokens(fast_tokenizer, fast_tokenizer)
+        same = fast_tokenizer(string).input_ids == before
+    except Exception:
+        same = False
+    if not same:
+        for k in ("_add_bos_token", "_add_eos_token"):
+            if k in saved_flags:
+                object.__setattr__(fast_tokenizer, k, saved_flags[k])
+            else:
+                fast_tokenizer.__dict__.pop(k, None)
+        if backend is not None:
+            backend.post_processor = saved_post_processor
+    return same
 
 
 def _load_correct_tokenizer(
@@ -509,80 +1100,144 @@ def _load_correct_tokenizer(
     trust_remote_code = False,
     cache_dir = "huggingface_tokenizers_cache",
     fix_tokenizer = True,
+    revision = None,
+    config = None,
 ):
     if IS_COLAB_ENVIRONMENT:
         cache_dir = cache_dir
     elif IS_KAGGLE_ENVIRONMENT:
-        # /tmp of Kaggle seems has a 80GB limit!
-        # Let's utilize them
+        # Kaggle's /tmp seems to have an 80GB limit, so use it.
         cache_dir = os.path.join(KAGGLE_TMP, cache_dir)
-    else:
+    elif cache_dir == "huggingface_tokenizers_cache":
+        # This default name is Colab/Kaggle-only; elsewhere use the HF default cache.
         cache_dir = None
+    # else: keep a caller-supplied cache_dir so the tokenizer loads from the prefetch-warmed dir instead of risking an in-process Hub/Xet transfer.
 
-    # Try loading the slow tokenizer. If it fails, then try Fast only
-    # Mainly to solve Deepseek models with no tokenizer.model file
-    slow_tokenizer = None
-    try:
-        slow_tokenizer = AutoTokenizer.from_pretrained(
-            tokenizer_name,
-            model_max_length = model_max_length,
-            padding_side = padding_side,
-            token = token,
-            trust_remote_code = trust_remote_code,
-            # Cannot just use use_fast = False as per https://twitter.com/danielhanchen/status/1789659394302718373
-            use_fast = False,
-            legacy = False,
-            from_slow = True,
-            cache_dir = cache_dir,
-        )
-    except:
-        slow_tokenizer = None
-        # print(
-        #     f"Unsloth: {tokenizer_name} has no tokenizer.model file.\n"\
-        #     "Just informing you about this - this is not a critical error."
-        # )
-    # Unsure why this occurs!
-    if type(slow_tokenizer) is bool:
-        slow_tokenizer = None
-
-    fast_tokenizer = AutoTokenizer.from_pretrained(
-        tokenizer_name,
+    _repair_kwargs = dict(cache_dir = cache_dir, revision = revision)
+    _load_kwargs = dict(
         model_max_length = model_max_length,
         padding_side = padding_side,
         token = token,
         trust_remote_code = trust_remote_code,
-        cache_dir = cache_dir,
     )
+    from .models.loader_utils import _resolved_revision
 
-    if not fix_tokenizer or tokenizer_name in IGNORED_TOKENIZER_NAMES:
-        return fast_tokenizer
-    # Ignore Mistral ones - they're a bit weird to handle!
-    elif "mistral" in tokenizer_name.lower():
-        return fast_tokenizer
-    # Ignore Phi-4 ones as well
-    elif "phi-4" in tokenizer_name.lower():
-        return fast_tokenizer
-    elif slow_tokenizer is not None:
-        if hasattr(fast_tokenizer, "add_bos_token") and hasattr(
-            slow_tokenizer, "add_bos_token"
-        ):
-            fast_tokenizer.add_bos_token = slow_tokenizer.add_bos_token
-        if hasattr(fast_tokenizer, "add_eos_token") and hasattr(
-            slow_tokenizer, "add_eos_token"
-        ):
-            fast_tokenizer.add_eos_token = slow_tokenizer.add_eos_token
+    # Only the AutoTokenizer loads take it; the repairs and _mark_loaded_revision keep the plain ref.
+    revision_for_transformers = _resolved_revision(
+        tokenizer_name, revision, token, cache_dir = cache_dir
+    )
+    _name_lower = tokenizer_name.lower()
+    # These return the fast tokenizer unread by the slow one, so skip the slow load; the post-load fixes repair the fast backend.
+    if (
+        not fix_tokenizer
+        or _name_lower in IGNORED_TOKENIZER_NAMES
+        or "mistral" in _name_lower
+        or "phi-4" in _name_lower
+    ):
+        fast_tokenizer = AutoTokenizer.from_pretrained(
+            tokenizer_name, cache_dir = cache_dir, revision = revision_for_transformers, **_load_kwargs
+        )
+        return _apply_post_load_tokenizer_fixes(
+            fast_tokenizer, fix_tokenizer, config, **_repair_kwargs
+        )
 
-        # Confirm if slow and fast are equivalent!
-        if assert_same_tokenization(slow_tokenizer, fast_tokenizer):
-            return fast_tokenizer
-        else:
-            logger.warning(
-                f"Unsloth: Will load {tokenizer_name} as a legacy tokenizer."
+    fast_tokenizer = None
+    if _TRANSFORMERS_V5:
+        fast_tokenizer = AutoTokenizer.from_pretrained(
+            tokenizer_name, cache_dir = cache_dir, revision = revision_for_transformers, **_load_kwargs
+        )
+        _repair_tokenizer_backend_from_json(fast_tokenizer, **_repair_kwargs)
+        if _slow_load_copies_fast(fast_tokenizer) and _same_tokenization_as_own_copy(
+            fast_tokenizer
+        ):
+            return _apply_post_load_tokenizer_fixes(
+                fast_tokenizer, fix_tokenizer, config, **_repair_kwargs
             )
-            return convert_to_fast_tokenizer(slow_tokenizer)
-        pass
+
+    # Try the slow tokenizer first and fall back to fast only, mainly to solve Deepseek models with no tokenizer.model file.
+    slow_tokenizer = None
+    try:
+        slow_tokenizer = AutoTokenizer.from_pretrained(
+            tokenizer_name,
+            # use_fast = False alone is not enough; see twitter.com/danielhanchen/status/1789659394302718373
+            use_fast = False,
+            legacy = False,
+            from_slow = True,
+            cache_dir = cache_dir,
+            revision = revision_for_transformers,
+            **_load_kwargs,
+        )
+    except:
+        slow_tokenizer = None
+    if type(slow_tokenizer) is bool:
+        slow_tokenizer = None
+
+    load_fast = fast_tokenizer is None
+    if load_fast:
+        fast_tokenizer = AutoTokenizer.from_pretrained(
+            tokenizer_name, cache_dir = cache_dir, revision = revision_for_transformers, **_load_kwargs
+        )
+    # Repair both before comparing them, or a v5 byte-level mismatch detours into the legacy path.
+    if slow_tokenizer is not None:
+        _repair_tokenizer_backend_from_json(slow_tokenizer, **_repair_kwargs)
+    if load_fast:
+        _repair_tokenizer_backend_from_json(fast_tokenizer, **_repair_kwargs)
+
+    if slow_tokenizer is not None:
+        _sync_add_special_tokens(fast_tokenizer, slow_tokenizer)
+
+        if assert_same_tokenization(slow_tokenizer, fast_tokenizer):
+            return _apply_post_load_tokenizer_fixes(
+                fast_tokenizer, fix_tokenizer, config, **_repair_kwargs
+            )
+        else:
+            logger.warning(f"Unsloth: Will load {tokenizer_name} as a legacy tokenizer.")
+            return _apply_post_load_tokenizer_fixes(
+                convert_to_fast_tokenizer(slow_tokenizer),
+                fix_tokenizer,
+                config,
+                **_repair_kwargs,
+            )
     else:
-        return fast_tokenizer
+        return _apply_post_load_tokenizer_fixes(
+            fast_tokenizer, fix_tokenizer, config, **_repair_kwargs
+        )
+
+
+def _fix_pad_token(tokenizer):
+    """Heal a bad/missing pad_token before chat-template repair. Delegates to unsloth_zoo's shared fix_pad_token (single source of truth); against an older unsloth_zoo without it, this is a no-op (a pad-named token like <|vision_pad|> is already a valid pad). allow_add=False keeps this side-effect free: there is no model here to resize embeddings, so a brand new pad token is never added, and the later model-aware patch_tokenizer call finishes the job and is idempotent."""
+    if tokenizer is None:
+        return tokenizer
+    try:
+        from unsloth_zoo.pad_token import fix_pad_token
+    except Exception:
+        return tokenizer
+    fix_pad_token(tokenizer, allow_add = False)
+    return tokenizer
+
+
+def _sync_pad_token_id(model, tokenizer):
+    """Point config / generation_config pad_token_id at the tokenizer's pad when it has an embedding row (an older
+    unsloth_zoo raised after adding a pad, leaving the config on an id the fallback tokenizer lacks)."""
+    if model is None or tokenizer is None:
+        return model
+    inner = getattr(tokenizer, "tokenizer", None) or tokenizer
+    pad_id = getattr(inner, "pad_token_id", None)
+    if type(pad_id) is not int or pad_id < 0:
+        return model
+    try:
+        rows = model.get_input_embeddings().weight.shape[0]
+    except Exception:
+        return model
+    if pad_id >= rows:
+        return model
+    config = getattr(model, "config", None)
+    if config is not None and getattr(config, "pad_token_id", None) != pad_id:
+        config.update({"pad_token_id": pad_id})
+    generation_config = getattr(model, "generation_config", None)
+    if generation_config is not None and getattr(generation_config, "pad_token_id", None) != pad_id:
+        generation_config.update(pad_token_id = pad_id)
+    return model
 
 
 def load_correct_tokenizer(
@@ -593,28 +1248,49 @@ def load_correct_tokenizer(
     trust_remote_code = False,
     cache_dir = "huggingface_tokenizers_cache",
     fix_tokenizer = True,
+    revision = None,
+    config = None,
+    gguf_file = None,
+    local_files_only = False,
 ):
-    tokenizer = _load_correct_tokenizer(
-        tokenizer_name = tokenizer_name,
+    # A GGUF repo with no tokenizer files: the tokenizer lives in the GGUF's metadata.
+    from ._gguf_load import load_gguf_tokenizer_if_missing
+
+    tokenizer = load_gguf_tokenizer_if_missing(
+        tokenizer_name,
+        gguf_file,
+        revision = revision,
+        token = token,
+        cache_dir = None if cache_dir == "huggingface_tokenizers_cache" else cache_dir,
+        local_files_only = local_files_only,
         model_max_length = model_max_length,
         padding_side = padding_side,
-        token = token,
         trust_remote_code = trust_remote_code,
-        cache_dir = cache_dir,
-        fix_tokenizer = fix_tokenizer,
     )
+    if tokenizer is None:
+        tokenizer = _load_correct_tokenizer(
+            tokenizer_name = tokenizer_name,
+            model_max_length = model_max_length,
+            padding_side = padding_side,
+            token = token,
+            trust_remote_code = trust_remote_code,
+            cache_dir = cache_dir,
+            fix_tokenizer = fix_tokenizer,
+            revision = revision,
+            config = config,
+        )
 
-    ### 1. Fixup tokenizer's chat_template
+    if fix_tokenizer:
+        _fix_pad_token(tokenizer)
+
     old_chat_template = getattr(tokenizer, "chat_template", None)
 
-    # Ignore mistral type models since they don't have an add_generation_prompt
+    # Ignore mistral type models, which have no add_generation_prompt, and check Llama-2 old style models too.
     if any(
-        s in str(getattr(tokenizer, "name_or_path", "")).lower()
-        for s in ["mistral", "qwen3guard"]
+        s in str(getattr(tokenizer, "name_or_path", "")).lower() for s in ["mistral", "qwen3guard"]
     ):
         chat_template = old_chat_template
 
-    # Also check Llama-2 old style models
     elif (
         old_chat_template is not None
         and "[/INST]" in old_chat_template
@@ -632,22 +1308,28 @@ def load_correct_tokenizer(
             )
         pass
 
+    if fix_tokenizer:
+        chat_template = _rewrite_mistral_tools_chat_template(chat_template)
     tokenizer.chat_template = chat_template
+    # Saving restores sentencepiece assets from the repo name alone, which carries no branch, so stamp it for the save path. Imported late to break a circular import.
+    from .models.loader_utils import _mark_loaded_revision
+
+    _mark_loaded_revision(tokenizer, revision)
     return tokenizer
 
 
-# All four Jinja whitespace-control variants of endfor/endif:
-#   {% endfor %}    {%- endfor %}    {% endfor -%}    {%- endfor -%}
+# All four Jinja whitespace-control variants of endfor/endif.
 _RE_ENDFOR = re.compile(r"\{%(-?)\s*endfor\s*(-?)%\}")
 _RE_ENDIF = re.compile(r"\{%(-?)\s*endif\s*(-?)%\}")
 _RE_JINJA_COMMENT = re.compile(r"\{#.*?#\}", flags = re.DOTALL)
 
 
-def _find_end_position(template, endfor = None, endif = None):
-    """Rightmost {% endfor %}/{% endif %} (any dash variant), as a dict
-    with start/end/text/dash_left/dash_right. Tokens inside Jinja comments
-    are ignored. `endfor`/`endif` kwargs kept for back-compat, ignored."""
-    # Space-pad comments so positions still map 1:1 to the original.
+def _find_end_position(
+    template,
+    endfor = None,
+    endif = None,
+):
+    """Rightmost {% endfor %}/{% endif %} (any dash variant), as a dict with start/end/text/dash_left/dash_right. Tokens inside Jinja comments are ignored. `endfor`/`endif` kwargs kept for back-compat, ignored."""
     scrubbed = _RE_JINJA_COMMENT.sub(lambda m: " " * len(m.group(0)), template)
     endfor_matches = list(_RE_ENDFOR.finditer(scrubbed))
     endif_matches = list(_RE_ENDIF.finditer(scrubbed))
@@ -667,17 +1349,10 @@ def _find_end_position(template, endfor = None, endif = None):
 
 
 def _template_ends_with_toplevel_for(chat_template):
-    """Return True if the last structural node at the template's top level is
-    a For (message-iteration) loop, ignoring trailing pure-whitespace Output
-    nodes. Unwraps benign outer-If guards (no else branch, not testing
-    add_generation_prompt) so that templates like
-    ``{% if messages %}{% for ... %}{% endfor %}{% endif %}`` are still
-    repairable. Rejects real structural wrappers (e.g. Qwen3-Guard with
-    else branches)."""
+    """Return True if the last structural node at the template's top level is a For (message-iteration) loop, ignoring trailing pure-whitespace Output nodes. Unwraps benign outer-If guards (no else branch, not testing add_generation_prompt) so templates like ``{% if messages %}{% for ... %}{% endfor %}{% endif %}`` are still repairable. Rejects real structural wrappers (e.g. Qwen3-Guard with else branches)."""
     try:
         import jinja2
         import jinja2.nodes
-
         ast = jinja2.Environment().parse(chat_template)
     except Exception:
         return False
@@ -686,8 +1361,7 @@ def _template_ends_with_toplevel_for(chat_template):
         for node in reversed(nodes):
             if isinstance(node, jinja2.nodes.Output):
                 only_ws = all(
-                    isinstance(child, jinja2.nodes.TemplateData)
-                    and child.data.strip() == ""
+                    isinstance(child, jinja2.nodes.TemplateData) and child.data.strip() == ""
                     for child in node.nodes
                 )
                 if only_ws:
@@ -709,39 +1383,28 @@ def _template_ends_with_toplevel_for(chat_template):
 
 
 def _if_body_emits_content(if_node):
-    """True if the If's body contains any Output node (directly or nested).
-    Distinguishes a real generation block from a header guard that only
-    does `{% set ... %}`."""
+    """True if the If's body contains any Output node (directly or nested). Distinguishes a real generation block from a header guard that only does `{% set ... %}`."""
     import jinja2.nodes
 
     for node in if_node.body:
         if isinstance(node, jinja2.nodes.Output):
             return True
-        if any(
-            isinstance(d, jinja2.nodes.Output)
-            for d in node.find_all(jinja2.nodes.Output)
-        ):
+        if any(isinstance(d, jinja2.nodes.Output) for d in node.find_all(jinja2.nodes.Output)):
             return True
     return False
 
 
 def _has_add_generation_prompt_block(chat_template):
-    """True if the template has a *positive* `{% if add_generation_prompt %}`
-    gate whose body emits output. Rejects header guards like
-    `{% if not add_generation_prompt is defined %}{% set ... %}{% endif %}`
-    that reference the name but emit nothing. AST-based; string-scan
-    fallback if Jinja fails to parse."""
+    """True if the template has a *positive* `{% if add_generation_prompt %}` gate whose body emits output. Rejects header guards like `{% if not add_generation_prompt is defined %}{% set ... %}{% endif %}` that reference the name but emit nothing. AST-based; string-scan fallback if Jinja fails to parse."""
     try:
         import jinja2
         import jinja2.nodes
-
         ast = jinja2.Environment().parse(chat_template)
     except Exception:
         return "if add_generation_prompt" in chat_template and "%}" in chat_template
     for if_node in ast.find_all(jinja2.nodes.If):
         test = if_node.test
-        # Reject negated gates: `{% if not add_generation_prompt %}` fires
-        # when agp=False, so it's not a generation block even if it emits.
+        # Reject negated gates: `{% if not add_generation_prompt %}` fires when agp=False, so it is not a generation block even if it emits.
         if isinstance(test, jinja2.nodes.Not):
             continue
         # find_all skips the test root, so check bare Name tests explicitly.
@@ -758,28 +1421,14 @@ def _has_add_generation_prompt_block(chat_template):
     return False
 
 
-# Sentinels for _derive_assistant_prefix_by_render. Diverge at char 0 so
-# commonprefix can't absorb them; long random tail makes collision with real
-# template literals negligible (see T18).
+# Sentinels for _derive_assistant_prefix_by_render: they diverge at char 0 so commonprefix cannot absorb them, and the long random tail makes collision with real template literals negligible.
 _RENDER_DIFF_SENTINEL_A = "AAAA_0123456789_UNSLOTH_RENDER_DIFF_SENTINEL"
 _RENDER_DIFF_SENTINEL_B = "BBBB_0123456789_UNSLOTH_RENDER_DIFF_SENTINEL"
 _RENDER_DIFF_SENTINEL_C = "CCCC_0123456789_UNSLOTH_RENDER_DIFF_SENTINEL"
 
 
 def _derive_assistant_prefix_by_render(chat_template, is_sharegpt = False):
-    """Return the assistant-turn prefix the template emits, derived by
-    rendering two dialogs that differ only in assistant content: the common
-    prefix of their tails (after the base [user]-only render) is what the
-    template emits for an assistant turn. None if any guard fails.
-
-    Works for Llama-3 / Gemma / Phi-3 and other non-ChatML shapes; the
-    template is its own ground truth.
-
-    Known limitation: an `eos-on-non-last` pattern (turn-end sentinel only
-    emitted for non-last messages) would produce a consistent but wrong
-    prefix that `_validate_patched_template` can't catch. No real-world
-    template is known to use this.
-    """
+    """Return the assistant-turn prefix the template emits, derived by rendering two dialogs that differ only in assistant content: the common prefix of their tails (after the base [user]-only render) is what the template emits for an assistant turn. None if any guard fails. Works for Llama-3 / Gemma / Phi-3 and other non-ChatML shapes; the template is its own ground truth. Known limitation: an `eos-on-non-last` pattern (turn-end sentinel only emitted for non-last messages) would produce a consistent but wrong prefix that `_validate_patched_template` cannot catch, though no real-world template is known to use this."""
     try:
         from jinja2.sandbox import SandboxedEnvironment
     except Exception:
@@ -789,21 +1438,14 @@ def _derive_assistant_prefix_by_render(chat_template, is_sharegpt = False):
         base_msgs = [{"from": "human", "value": "Hi"}]
         sent_a_msgs = base_msgs + [{"from": "gpt", "value": _RENDER_DIFF_SENTINEL_A}]
         sent_b_msgs = base_msgs + [{"from": "gpt", "value": _RENDER_DIFF_SENTINEL_B}]
-        # User-role cross-check (Guard C below).
         sent_c_msgs = base_msgs + [{"from": "human", "value": _RENDER_DIFF_SENTINEL_C}]
     else:
         base_msgs = [{"role": "user", "content": "Hi"}]
-        sent_a_msgs = base_msgs + [
-            {"role": "assistant", "content": _RENDER_DIFF_SENTINEL_A}
-        ]
-        sent_b_msgs = base_msgs + [
-            {"role": "assistant", "content": _RENDER_DIFF_SENTINEL_B}
-        ]
+        sent_a_msgs = base_msgs + [{"role": "assistant", "content": _RENDER_DIFF_SENTINEL_A}]
+        sent_b_msgs = base_msgs + [{"role": "assistant", "content": _RENDER_DIFF_SENTINEL_B}]
         sent_c_msgs = base_msgs + [{"role": "user", "content": _RENDER_DIFF_SENTINEL_C}]
 
-    # Strip trailing whitespace/comments after the last endfor/endif: they
-    # appear after the message loop and would break Guard A. The splice in
-    # `_fix_chat_template` drops them too.
+    # Strip trailing whitespace/comments after the last endfor/endif: they appear after the message loop and would break Guard A, and the splice in _fix_chat_template drops them too.
     probe_template = chat_template
     end = _find_end_position(chat_template)
     if end is not None:
@@ -811,8 +1453,7 @@ def _derive_assistant_prefix_by_render(chat_template, is_sharegpt = False):
         if _RE_JINJA_COMMENT.sub("", after).strip() == "":
             probe_template = chat_template[: end["end"]]
 
-    # Sandboxed: probe renders at load time, before user calls
-    # apply_chat_template. SandboxedEnvironment blocks attribute-chain exploits.
+    # Sandboxed: probe renders run at load time, before the user calls apply_chat_template, and SandboxedEnvironment blocks attribute-chain exploits.
     try:
         env = SandboxedEnvironment(
             autoescape = False,
@@ -825,9 +1466,7 @@ def _derive_assistant_prefix_by_render(chat_template, is_sharegpt = False):
     except Exception:
         return None
 
-    # Best-effort: alternation-enforcing templates (e.g. Gemma's
-    # raise_exception) fail on [user, user]; that's a positive signal
-    # for Guard C, not a probe failure.
+    # Best-effort: alternation-enforcing templates (Gemma's raise_exception) fail on [user, user], which is a positive signal for Guard C rather than a probe failure.
     out_user_c = None
     try:
         out_user_c = tmpl.render(messages = sent_c_msgs, add_generation_prompt = False)
@@ -852,8 +1491,7 @@ def _derive_assistant_prefix_by_render(chat_template, is_sharegpt = False):
     ):
         return None
 
-    # Guard C: reject if a [user, user] render also emits the same prefix
-    # (role-insensitive template, e.g. `{% set greeting='Hi' %}...`).
+    # Guard C: reject if a [user, user] render also emits the same prefix, i.e. a role-insensitive template.
     if out_user_c is not None and out_user_c.startswith(out_base):
         tail_c = out_user_c[len(out_base) :]
         if tail_c.startswith(prefix) and prefix != "":
@@ -866,10 +1504,7 @@ def _derive_assistant_prefix_by_render(chat_template, is_sharegpt = False):
 
 
 def _fix_chat_template(chat_template, is_sharegpt = False):
-    # Fast path: already has an {% if add_generation_prompt %} block, nothing
-    # to do. This catches cases the old string-based check would miss (e.g.
-    # templates that use {%- if add_generation_prompt -%} with both-side dash,
-    # or that sneak the block into a nested If/For).
+    # Fast path: an {% if add_generation_prompt %} block already exists. This catches cases the old string-based check would miss, such as both-side dashes or a block nested inside an If/For.
     if _has_add_generation_prompt_block(chat_template):
         return chat_template
 
@@ -882,43 +1517,32 @@ def _fix_chat_template(chat_template, is_sharegpt = False):
     dash_r = "-" if end["dash_right"] else ""
     open_tag = lambda body: "{%" + dash_l + " " + body + " " + dash_r + "%}"
 
-    # Case 1 (pre-existing base case): template ends with a single trailing
-    # {{ expr }} that is the generation prefix. Wrap it in an
-    # {% if add_generation_prompt %} ... {% endif %}.
+    # Case 1: a single trailing {{ expr }} is the generation prefix; wrap it in an agp block.
+    # Surrounding whitespace allowed (ERNIE-4.5).
+    trailing = after_endfor.strip()
     if (
         "{%" + dash_l + " if" not in after_endfor
         and "{%" + dash_l + " set " not in after_endfor
-        and after_endfor.startswith("{{")
-        and after_endfor.endswith("}}")
-        and after_endfor.count("{{") == 1
-        and after_endfor.count("}}") == 1
+        and trailing.startswith("{{")
+        and trailing.endswith("}}")
+        and trailing.count("{{") == 1
+        and trailing.count("}}") == 1
+        # An EOS footer closes the last turn; wrapping it would strip EOS from every training text.
+        and "eos_token" not in trailing
     ):
-        wrapped = (
-            open_tag("if add_generation_prompt") + after_endfor + open_tag("endif")
-        )
+        wrapped = open_tag("if add_generation_prompt") + after_endfor + open_tag("endif")
         return chat_template[: end["end"]] + wrapped
 
-    # Case 2 (GH#4150): template ends at {% endfor %} with only whitespace
-    # or comments left. Inject an {% if add_generation_prompt %} block with
-    # the assistant prefix derived by render-diff. The top-level-For gate
-    # keeps us out of outer-If wrappers (e.g. Qwen3-Guard).
-    if _RE_JINJA_COMMENT.sub(
-        "", after_endfor
-    ).strip() == "" and _template_ends_with_toplevel_for(chat_template):
-        # No redundant "agp not in scrubbed" check: the fast path already
-        # confirmed no *positive* block, and a mere reference (header
-        # guard) should still get repaired.
-        assistant_prefix = _derive_assistant_prefix_by_render(
-            chat_template, is_sharegpt
-        )
-        # Dual-probe: dict/list callers don't know the shape up front.
+    # Case 2 (#4150): the template ends at {% endfor %} with only whitespace or comments left, so inject an {% if add_generation_prompt %} block with the assistant prefix derived by render-diff.
+    if _RE_JINJA_COMMENT.sub("", after_endfor).strip() == "" and _template_ends_with_toplevel_for(
+        chat_template
+    ):
+        # No redundant "agp not in scrubbed" check: the fast path already confirmed no POSITIVE block, and a mere reference (header guard) should still get repaired.
+        assistant_prefix = _derive_assistant_prefix_by_render(chat_template, is_sharegpt)
         if assistant_prefix is None and not is_sharegpt:
-            assistant_prefix = _derive_assistant_prefix_by_render(
-                chat_template, is_sharegpt = True
-            )
+            assistant_prefix = _derive_assistant_prefix_by_render(chat_template, is_sharegpt = True)
         if assistant_prefix is None:
             return chat_template
-        # Escape for a double-quoted Jinja string literal.
         escaped = (
             assistant_prefix.replace("\\", "\\\\")
             .replace('"', '\\"')
@@ -926,11 +1550,7 @@ def _fix_chat_template(chat_template, is_sharegpt = False):
             .replace("\r", "\\r")
         )
         generation_block = (
-            open_tag("if add_generation_prompt")
-            + '{{ "'
-            + escaped
-            + '" }}'
-            + open_tag("endif")
+            open_tag("if add_generation_prompt") + '{{ "' + escaped + '" }}' + open_tag("endif")
         )
         return chat_template[: end["end"]] + generation_block
 
@@ -944,9 +1564,7 @@ def _is_strict_chat_template_mode():
 
 
 def _name_is_local_path(name_or_path):
-    """True if name_or_path refers to an existing local directory. Used to
-    tailor the warning message: for local paths the user cannot 'file a bug
-    report to the maintainers of <path>' since that path is their own."""
+    """True if name_or_path refers to an existing local directory. Used to tailor the warning message: for local paths the user cannot 'file a bug report to the maintainers of <path>' since that path is their own."""
     if not name_or_path:
         return False
     try:
@@ -962,8 +1580,7 @@ def _format_chat_template_message(
     local_path_source = None,
     strict = False,
 ):
-    """Build a user-facing warning/error message that points at the right
-    responsible party (user's downstream tool vs. upstream model maintainer)."""
+    """Build a user-facing warning/error message that points at the right responsible party (user's downstream tool vs. upstream model maintainer)."""
     local = _name_is_local_path(
         local_path_source if local_path_source is not None else name_or_path
     )
@@ -981,9 +1598,7 @@ def _format_chat_template_message(
             "Consider filing a bug report with the model maintainers."
         ).format(name = name_or_path)
     strict_suffix = (
-        ""
-        if strict
-        else (" Set UNSLOTH_STRICT_CHAT_TEMPLATE=1 to raise instead of warn.")
+        "" if strict else (" Set UNSLOTH_STRICT_CHAT_TEMPLATE=1 to raise instead of warn.")
     )
     if repaired:
         return (
@@ -1016,21 +1631,16 @@ def _format_chat_template_message(
 
 
 def _validate_patched_template(tokenizer, patched_template, is_sharegpt):
-    """Render the just-patched template with and without
-    add_generation_prompt, and confirm the patched output responds to the
-    flag by appending (not replacing) content. Returns True if validation
-    passes."""
+    """Render the just-patched template with and without add_generation_prompt, and confirm the patched output responds to the flag by appending (not replacing) content. Returns True if validation passes."""
     msgs = (
-        [{"from": "human", "value": "Hi"}]
-        if is_sharegpt
-        else [{"role": "user", "content": "Hi"}]
+        [{"from": "human", "value": "Hi"}] if is_sharegpt else [{"role": "user", "content": "Hi"}]
     )
     original = getattr(tokenizer, "chat_template", None)
     try:
         try:
             tokenizer.chat_template = patched_template
         except Exception:
-            return False  # read-only tokenizer, skip validation
+            return False
         try:
             yes = tokenizer.apply_chat_template(
                 msgs,
@@ -1049,22 +1659,16 @@ def _validate_patched_template(tokenizer, patched_template, is_sharegpt):
             tokenizer.chat_template = original
         except Exception:
             pass  # best-effort restore
-    # Contract after a successful repair: the two renders differ, and the
-    # "yes" render is a strict extension of the "no" render (we only
-    # appended content inside the new add_generation_prompt block).
+    # Contract after a successful repair: the two renders differ, and the "yes" render is a strict extension of the "no" render, since content was only appended in the new block.
     return yes != no and yes.startswith(no)
 
 
 def _repair_string_template(tokenizer, chat_template, is_sharegpt):
-    """Core string-template repair. Returns the repaired template on success,
-    or None if repair was not possible / failed validation."""
+    """Core string-template repair. Returns the repaired template on success, or None if repair was not possible / failed validation."""
     candidate = _fix_chat_template(chat_template, is_sharegpt = is_sharegpt)
     if not _has_add_generation_prompt_block(candidate):
         return None
-    # Validate with the caller's is_sharegpt first. If that fails, the
-    # dual-probe in _fix_chat_template may have fallen back to the other
-    # schema internally -- try validating with the opposite schema before
-    # giving up.
+    # Validate with the caller's is_sharegpt first; if that fails, the dual-probe in _fix_chat_template may have fallen back to the other schema, so try the opposite one.
     if _validate_patched_template(tokenizer, candidate, is_sharegpt):
         return candidate
     if _validate_patched_template(tokenizer, candidate, not is_sharegpt):
@@ -1072,17 +1676,36 @@ def _repair_string_template(tokenizer, chat_template, is_sharegpt):
     return None
 
 
-def _fix_chat_template_for_tokenizer(tokenizer, chat_template):
-    """Entry point for a string chat_template. Runs the no==yes diagnostic,
-    attempts repair if needed, and returns the (possibly patched) template.
+# Chat templates that render nothing for add_generation_prompt ON PURPOSE, keyed on their own
+# marker tokens (all must be present) so a genuinely broken template still gets the warning.
+# Inkling 2 (inkling2 / inkling2_loop): transformers' own examples call
+# apply_chat_template(add_generation_prompt = True) and the model emits `<|message_model|>`
+# itself; appending that marker would make it start a second turn header.
+_TEMPLATES_WITHOUT_GENERATION_PROMPT = {
+    "Inkling 2": (
+        "<|message_user|>",
+        "<|message_model|>",
+        "<|end_message|>",
+        "<|content_text|>",
+    ),
+}
 
-    On repair failure, the behavior is controlled by
-    UNSLOTH_STRICT_CHAT_TEMPLATE: warn + return original (default) or raise
-    RuntimeError (strict)."""
+
+def _template_without_generation_prompt_by_design(chat_template):
+    """Family name when `chat_template` is a known template with no generation prompt by design, else None."""
+    if not isinstance(chat_template, str) or "add_generation_prompt" in chat_template:
+        return None
+    for family, markers in _TEMPLATES_WITHOUT_GENERATION_PROMPT.items():
+        if all(marker in chat_template for marker in markers):
+            return family
+    return None
+
+
+def _fix_chat_template_for_tokenizer(tokenizer, chat_template):
+    """Entry point for a string chat_template. Runs the no==yes diagnostic, attempts repair if needed, and returns the (possibly patched) template. On repair failure the behavior is controlled by UNSLOTH_STRICT_CHAT_TEMPLATE: warn + return original (default) or raise RuntimeError (strict)."""
     name = getattr(tokenizer, "name_or_path", "unknown")
     source_path = getattr(tokenizer, "_source_path", name)
 
-    # Detect ShareGPT vs HF style by probing apply_chat_template.
     is_sharegpt = None
     try:
         tokenizer.apply_chat_template(
@@ -1125,13 +1748,20 @@ def _fix_chat_template_for_tokenizer(tokenizer, chat_template):
         return chat_template
 
     if no != yes:
-        # Template already responds to the flag; leave as is.
         return chat_template
 
-    # no == yes: template ignores add_generation_prompt. Try to repair.
+    family = _template_without_generation_prompt_by_design(chat_template)
+    if family is not None:
+        # Not broken: the model writes its own turn marker, so neither repair nor warn.
+        logger.info(
+            f"Unsloth: `{name}` uses the {family} chat template, which has no "
+            "add_generation_prompt block by design; the model emits its own turn marker."
+        )
+        return chat_template
+
+    # no == yes: the template ignores add_generation_prompt, so try to repair. It may have the block while the output does not change, the "wasn't provided correctly" case.
     if _has_add_generation_prompt_block(chat_template):
-        # Template has the block but it does not change output. This is the
-        # "wasn't provided correctly" case from the pre-warn code path.
+        # Template has the block but it does not change output. This is the "wasn't provided correctly" case from the pre-warn code path.
         strict = _is_strict_chat_template_mode()
         msg = _format_chat_template_message(
             name,
@@ -1170,24 +1800,19 @@ def _fix_chat_template_for_tokenizer(tokenizer, chat_template):
 
 
 class _VariantTokenizerProxy:
-    """Single-variant view of a multi-variant tokenizer. Routes each variant
-    through `_fix_chat_template_for_tokenizer` so the full contract
-    (is_sharegpt probe, no==yes, warn/strict, `_validate_patched_template`)
-    applies instead of jumping straight to structural repair.
+    """Single-variant view of a multi-variant tokenizer. Routes each variant through `_fix_chat_template_for_tokenizer` so the full contract (is_sharegpt probe, no==yes, warn/strict, `_validate_patched_template`) applies instead of jumping straight to structural repair. `apply_chat_template` swaps `base.chat_template` to the variant before calling so tokenizer globals (bos_token, filters, raise_exception) are preserved; falls back to bare Jinja for read-only stubs."""
 
-    `apply_chat_template` swaps `base.chat_template` to the variant before
-    calling so tokenizer globals (bos_token, filters, raise_exception) are
-    preserved; falls back to bare Jinja for read-only stubs.
-    """
-
-    def __init__(self, base_tokenizer, variant_template, variant_label = ""):
+    def __init__(
+        self,
+        base_tokenizer,
+        variant_template,
+        variant_label = "",
+    ):
         self._base = base_tokenizer
         self._template = variant_template
         base_name = getattr(base_tokenizer, "name_or_path", "unknown")
         self._source_path = base_name
-        self.name_or_path = (
-            f"{base_name} ({variant_label})" if variant_label else base_name
-        )
+        self.name_or_path = f"{base_name} ({variant_label})" if variant_label else base_name
 
     @property
     def chat_template(self):
@@ -1234,21 +1859,17 @@ def fix_chat_template(tokenizer):
     if chat_template is None:
         return None
 
-    # Multi-variant dict (e.g. Hermes-3 {default, tool_use}): route each
-    # variant through the full repair contract via _VariantTokenizerProxy.
+    # Multi-variant dict (Hermes-3 {default, tool_use}): route each variant through the full repair contract via _VariantTokenizerProxy.
     if isinstance(chat_template, dict):
         fixed = {}
         for key, tmpl in chat_template.items():
             if not isinstance(tmpl, str):
                 fixed[key] = tmpl
                 continue
-            proxy = _VariantTokenizerProxy(
-                tokenizer, tmpl, variant_label = f"variant={key!r}"
-            )
+            proxy = _VariantTokenizerProxy(tokenizer, tmpl, variant_label = f"variant={key!r}")
             fixed[key] = _fix_chat_template_for_tokenizer(proxy, tmpl)
         return fixed
 
-    # List-of-dicts form (older HF multi-template style).
     if isinstance(chat_template, list):
         fixed = []
         for item in chat_template:
@@ -1279,22 +1900,16 @@ def check_tokenizer(
     padding_side = "right",
     token = None,
     _reload = True,
+    cache_dir = None,
 ):
-    # Checks tokenizer for out of bounds ids.
-    # Mainly a fix for https://huggingface.co/berkeley-nest/Starling-LM-7B-alpha
-    # where <sep> had token id=32002.
-    # See https://huggingface.co/berkeley-nest/Starling-LM-7B-alpha/discussions/25
-    # Seems like the Fast tokenizer in Rust breaks things!
+    # Check the tokenizer for out of bounds ids, mainly for berkeley-nest/Starling-LM-7B-alpha where <sep> had token id=32002 (its discussion 25); the Rust fast tokenizer seems to break things.
 
-    # We ignore some of them!
     if tokenizer.__repr__().split("(", 1)[0] in IGNORED_TOKENIZER_CHECKING:
         return tokenizer
 
     max_embedding_size = model.model.embed_tokens.weight.shape[0]
     added_tokens_fast = tokenizer.added_tokens_decoder
-    added_tokens_fast = {
-        index: str(value) for index, value in added_tokens_fast.items()
-    }
+    added_tokens_fast = {index: str(value) for index, value in added_tokens_fast.items()}
     sorted_keys = sorted(added_tokens_fast)
     added_tokens_fast = {key: added_tokens_fast[key] for key in sorted_keys}
 
@@ -1303,37 +1918,25 @@ def check_tokenizer(
             bad_indices = list(added_tokens_fast.keys())[j:]
             bad_tokens = list(added_tokens_fast.values())[j:]
             if not _reload:
-                # Try removing the token
                 added_tokens = [str(x) for x in tokenizer.added_tokens_decoder.values()]
-                special_tokens = tokenizer.special_tokens_map
-                import itertools
-
-                special_tokens = frozenset(
-                    itertools.chain.from_iterable(
-                        [x] if type(x) is str else x for x in special_tokens.values()
-                    )
-                )
+                # special_tokens_map drops the extra special tokens on transformers 5.x
+                special_tokens = frozenset(str(x) for x in tokenizer.all_special_tokens)
                 can_be_removed1 = [x for x in bad_tokens if x not in special_tokens]
                 can_be_removed2 = [
-                    x
-                    for x in can_be_removed1
-                    if x in tokenizer._added_tokens_encoder.keys()
+                    x for x in can_be_removed1 if x in tokenizer.added_tokens_encoder.keys()
                 ]
 
-                # Check of extra tokens can in fact we removed!
                 can_be_removed = (len(can_be_removed1) == len(bad_tokens)) and (
                     len(can_be_removed2) == len(bad_tokens)
                 )
 
-                # Check if sep_token or other generic types
                 remove_generic = False
                 try_mapper = []
                 if not can_be_removed:
-                    names = dir(tokenizer)
-                    names = (
-                        x for x in names if x.endswith("_token") and x.count("_") == 1
-                    )
-                    generic_tokens = [(x, getattr(tokenizer, x, None)) for x in names]
+                    # dir(tokenizer) misses the *_token attributes on transformers 5.x
+                    generic_tokens = [
+                        (x, y) for x, y in tokenizer.special_tokens_map.items() if type(y) is str
+                    ]
 
                     try_removal = []
                     for token in bad_tokens:
@@ -1342,25 +1945,38 @@ def check_tokenizer(
                                 try_removal.append(token)
                                 try_mapper.append(name_token)
 
-                    # Recheck!
                     can_be_removed = len(try_removal) == len(bad_tokens)
                     if can_be_removed:
                         remove_generic = True
                     can_be_removed1 = bad_tokens
 
                 if can_be_removed:
-                    # Yes it can be fixed!
-                    for j, bad_token in enumerate(can_be_removed1):
-                        remove_id = tokenizer._added_tokens_encoder[bad_token]
-                        del tokenizer._added_tokens_decoder[remove_id]
-                        del tokenizer._added_tokens_encoder[bad_token]
+                    if getattr(tokenizer, "is_fast", False):
+                        # Fast tokenizers read added tokens from the Rust backend, so drop them there.
+                        import json
 
+                        state = json.loads(tokenizer._tokenizer.to_str())
+                        state["added_tokens"] = [
+                            x for x in state["added_tokens"] if x["content"] not in can_be_removed1
+                        ]
+                        tokenizer._tokenizer = tokenizer._tokenizer.from_str(json.dumps(state))
+                    else:
+                        for bad_token in can_be_removed1:
+                            remove_id = tokenizer._added_tokens_encoder[bad_token]
+                            del tokenizer._added_tokens_decoder[remove_id]
+                            del tokenizer._added_tokens_encoder[bad_token]
+                    for j, bad_token in enumerate(can_be_removed1):
                         if remove_generic and (try_removal[j] == bad_token):
-                            # Remove sep token for example
                             setattr(tokenizer, try_mapper[j], None)
                             setattr(tokenizer, try_mapper[j] + "_id", None)
-                    # Confirm 1 more time!
-                    if max(tokenizer.added_tokens_decoder.keys()) < max_embedding_size:
+                    # Ids left in the base vocab or emitted by a post-processor template must fit too.
+                    probe_ids = [max(tokenizer.get_vocab().values(), default = -1)]
+                    probe_ids += tokenizer("a").input_ids
+                    try:
+                        probe_ids += tokenizer("a", "a").input_ids
+                    except Exception:
+                        pass
+                    if max(probe_ids, default = -1) < max_embedding_size:
                         logger.warning_once(
                             f"Unsloth loaded a broken tokenizer `{model_name}`, but managed to repair it!\n"
                             f"Tokens {bad_tokens} with ids {bad_indices} exceeds the max vocab size of {max_embedding_size}.\n"
@@ -1368,86 +1984,49 @@ def check_tokenizer(
                         )
                         return convert_to_fast_tokenizer(tokenizer)
 
-                # :( Failure
                 raise RuntimeError(
                     f"Unsloth tried to load `{model_name}`, but cannot succeed.\n"
                     f"Tokens {bad_tokens} with ids {bad_indices} exceeds the max vocab size of {max_embedding_size}.\n"
                     f"Fix your tokenizer since it'll perform out of bounds memory accesses."
                 )
 
-            if IS_COLAB_ENVIRONMENT or IS_KAGGLE_ENVIRONMENT:
-                cache_dir = "huggingface_tokenizers_cache"
-            else:
-                cache_dir = None
+            # Reuse a caller-supplied cache_dir (the warmed cache) for the repair reload; else the Colab/Kaggle sentinel, as load_correct_tokenizer does.
+            reload_cache_dir = cache_dir
+            if reload_cache_dir is None and (IS_COLAB_ENVIRONMENT or IS_KAGGLE_ENVIRONMENT):
+                reload_cache_dir = "huggingface_tokenizers_cache"
 
-            # Sometimes slow tokenizer does not work like Deepseek
+            # Sometimes the slow tokenizer does not work, e.g. Deepseek, but it can also fix things.
             try:
-                # Try slow tokenizer which can fix things!
                 tokenizer = AutoTokenizer.from_pretrained(
                     model_name,
                     model_max_length = model_max_length,
                     padding_side = padding_side,
                     token = token,
-                    # Cannot just use use_fast = False as per https://twitter.com/danielhanchen/status/1789659394302718373
+                    # use_fast = False alone is not enough; see twitter.com/danielhanchen/status/1789659394302718373
                     use_fast = False,
                     legacy = False,
                     from_slow = True,
-                    cache_dir = cache_dir,
+                    cache_dir = reload_cache_dir,
                 )
-                return check_tokenizer(
-                    model = model,
-                    tokenizer = tokenizer,
-                    model_name = model_name,
-                    model_max_length = model_max_length,
-                    padding_side = padding_side,
-                    token = token,
-                    _reload = False,
-                )
-                break
-            except:
-                # Tokenizer has out of bounds issues and we can't
-                # load the slow tokenizer version :(
-                logger.warning_once(
-                    "Unsloth: Tokenizer is most likely buggy, and Unsloth failed to repair it.\n"
-                    "It will still work, but beware of out of bounds memory accesses.\n"
-                    "Please file an issue on the model owner's repo about this issue."
-                )
-                return tokenizer
+            except Exception:
+                # No usable slow tokenizer (fast-only repos on transformers 4.x): repair the one we have.
+                pass
+            # Outside the try: an unrepairable tokenizer must raise, not come back with a warning.
+            return check_tokenizer(
+                model = model,
+                tokenizer = tokenizer,
+                model_name = model_name,
+                model_max_length = model_max_length,
+                padding_side = padding_side,
+                token = token,
+                _reload = False,
+                cache_dir = cache_dir,
+            )
     return convert_to_fast_tokenizer(tokenizer)
 
 
 def get_tokenizer_info(tokenizer) -> dict:
-    """Return a concise diagnostic summary of a tokenizer instance.
-
-    Collects key properties into a plain dict suitable for logging, debugging,
-    or displaying in the Unsloth Studio UI. All fields are safe to access —
-    missing attributes fall back to ``None`` rather than raising.
-
-    Example output::
-
-        {
-            "name_or_path": "unsloth/Llama-3.2-1B-Instruct",
-            "tokenizer_class": "PreTrainedTokenizerFast",
-            "is_fast": True,
-            "vocab_size": 128000,
-            "added_tokens_count": 256,
-            "model_max_length": 131072,
-            "padding_side": "right",
-            "bos_token": "<|begin_of_text|>",
-            "eos_token": "<|eot_id|>",
-            "pad_token": "<|finetune_right_pad_id|>",
-            "unk_token": None,
-            "has_chat_template": True,
-            "special_tokens_count": 3,
-        }
-
-    Args:
-        tokenizer: Any HuggingFace ``PreTrainedTokenizer`` or
-                   ``PreTrainedTokenizerFast`` instance.
-
-    Returns:
-        A ``dict`` of tokenizer properties. Safe to serialize to JSON.
-    """
+    """Return a concise diagnostic summary of a tokenizer instance, as a JSON-safe dict for logging, debugging or the Unsloth UI: name_or_path, tokenizer_class, is_fast, vocab_size, added_tokens_count, model_max_length, padding_side, bos/eos/pad/unk tokens, has_chat_template and special_tokens_count. Missing attributes fall back to ``None`` rather than raising."""
     return {
         "name_or_path": getattr(tokenizer, "name_or_path", None),
         "tokenizer_class": type(tokenizer).__name__,
@@ -1477,27 +2056,7 @@ try:
 except:
 
     def neftune_post_forward_hook(module, input, output):
-        """
-        Implements the NEFTune forward pass for the model using forward hooks. Note this works only for
-        torch.nn.Embedding layers. This method is slightly adapted from the original source code
-        that can be found here: https://github.com/neelsjain/NEFTune
-
-        Simply add it to your model as follows:
-        ```python
-        model = ...
-        model.embed_tokens.neftune_noise_alpha = 0.1
-        model.embed_tokens.register_forward_hook(neftune_post_forward_hook)
-        ```
-
-        Args:
-            module (`torch.nn.Module`):
-                The embedding module where the hook is attached. Note that you need to set
-                `module.neftune_noise_alpha` to the desired noise alpha value.
-            input (`torch.Tensor`):
-                The input tensor to the model.
-            output (`torch.Tensor`):
-                The output tensor of the model (i.e. the embeddings).
-        """
+        """Implements the NEFTune forward pass for the model using forward hooks, for torch.nn.Embedding layers only. Adapted from https://github.com/neelsjain/NEFTune. Attach with ``model.embed_tokens.neftune_noise_alpha = 0.1`` then ``model.embed_tokens.register_forward_hook(neftune_post_forward_hook)``; ``module`` is the embedding module the hook is attached to and must carry ``neftune_noise_alpha``, ``input`` is the input tensor and ``output`` the embeddings."""
         if module.training:
             dims = torch.tensor(output.size(1) * output.size(2))
             mag_norm = module.neftune_noise_alpha / torch.sqrt(dims)
@@ -1506,20 +2065,19 @@ except:
 
 
 def patch_sft_trainer_tokenizer():
-    """
-    Patches the trainer with changes
-    """
+    """Patches the trainer with changes"""
     try:
         sft_trainer = eval(f"trl.trainer.sft_trainer.SFTTrainer")
     except:
         return
     all_imports = dir(trl.trainer.sft_trainer)
+    # Make typing names available to the exec'd source bodies: TRL >= 1.x type-hints _prepare_dataset with Union[...] and friends, which become NameErrors at exec time without these imports.
+    from typing import Union, Optional, List, Any, Callable, Tuple, Dict, Iterator  # noqa: F401
 
     for (
         function_name,
         replacer,
     ) in (
-        # ("_prepare_non_packed_dataloader", "def tokenize(element):",),
         (
             "_prepare_non_packed_dataloader",
             None,
@@ -1528,7 +2086,6 @@ def patch_sft_trainer_tokenizer():
             "_prepare_dataset",
             None,
         ),
-        # ("_prepare_packed_dataloader", "if dataset_text_field is not None",),
     ):
         if not hasattr(sft_trainer, function_name):
             continue
@@ -1569,7 +2126,7 @@ def patch_sft_trainer_tokenizer():
         check_text = check_text.rstrip() + "\n"
 
         if replacer is None:
-            # .*? matches first match. .+? matches final match.
+            # .*? matches the first match, .+? the final one.
             replacer = re.findall(
                 f"def {function_name}" + r"\(.*?\).*?\:\n",
                 function,
@@ -1597,7 +2154,6 @@ def patch_sft_trainer_tokenizer():
             globals(),
         )
 
-    # Patch train with fix_untrained_tokens
     for path_to_trainer in (
         "sft_trainer.SFTTrainer",
         "dpo_trainer.DPOTrainer",
@@ -1644,7 +2200,6 @@ def patch_sft_trainer_tokenizer():
             "fix_zero_training_loss(self.model, tokenizer, self.train_dataset)\n\n"
         )
 
-        # Warn on gradient accumulation steps if it's used
         check_text += (
             "\n"
             "try:\n"
@@ -1660,7 +2215,7 @@ def patch_sft_trainer_tokenizer():
             "\n\n"
         )
 
-        # Add NEFTune since it doesn't seem to work?? We need to manually inject it
+        # NEFTune does not seem to work, so inject it manually.
         check_text += (
             "\n"
             "if hasattr(self, 'neftune_hook_handle'):\n"
@@ -1674,7 +2229,7 @@ def patch_sft_trainer_tokenizer():
             "\n"
         )
 
-        # Also DPO weirdly tokenizes non numeric columns? Delete them!
+        # DPO weirdly tokenizes non numeric columns, so delete them.
         check_text += (
             "\n"
             "if hasattr(self.train_dataset, 'column_names'):\n"
@@ -1698,7 +2253,3 @@ def patch_sft_trainer_tokenizer():
             f"trl.trainer.{path_to_trainer}.{function_name} = {function_name}",
             globals(),
         )
-
-
-# Finally patch TRL tokenizer things -> moved to RL
-# patch_sft_trainer_tokenizer()

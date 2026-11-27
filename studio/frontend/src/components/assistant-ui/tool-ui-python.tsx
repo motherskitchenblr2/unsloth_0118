@@ -3,182 +3,189 @@
 
 "use client";
 
-import { copyToClipboard } from "@/lib/copy-to-clipboard";
-import { getAuthToken } from "@/features/auth/session";
+import { CodeIcon } from "@hugeicons/core-free-icons";
+import { HugeiconsIcon } from "@hugeicons/react";
+import { Spinner } from "@/components/ui/spinner";
+
+import { SandboxFiles } from "./sandbox-files-view";
+import { isSandboxFileList, type SandboxFile } from "./sandbox-files";
+import {
+  preferSanitizedFullToolOutput,
+  toolResultText,
+  useChatPreferencesStore,
+  useToolAwaitingApproval,
+  useToolOutput,
+} from "@/features/chat";
 import type { ToolCallMessagePartComponent } from "@assistant-ui/react";
-import { code as codePlugin } from "@streamdown/code";
-import { CheckIcon, CodeIcon, CopyIcon, LoaderIcon } from "lucide-react";
-import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Streamdown } from "streamdown";
+import { useToolArgsStatus } from "@assistant-ui/react";
+import { memo, useMemo } from "react";
+import { pythonToolImagePath } from "./python-tool-image-path";
+import { useSandboxImage } from "./use-sandbox-image";
+import { CopyBtn, ToolCodeCell } from "./tool-code-cell";
+import { isToolCallRunning, toolArgText } from "./tool-arg-text";
 import {
   ToolFallbackContent,
   ToolFallbackRoot,
   ToolFallbackTrigger,
 } from "./tool-fallback";
+import { ToolLiveOutput } from "./tool-live-output";
+import { ToolResultOutput } from "./tool-result-output";
 
 interface StructuredResult {
   text: string;
   images: string[];
   sessionId: string;
+  files?: SandboxFile[];
 }
 
-const MAX_DISPLAY = 10_000;
-const COPY_RESET_MS = 2000;
-const SHIKI_THEME = ["github-light", "github-dark"] as ["github-light", "github-dark"];
 
-function truncate(text: string): string {
-  return text.length <= MAX_DISPLAY
-    ? text
-    : `${text.slice(0, MAX_DISPLAY)}\n... (truncated)`;
+function CodeGlyph(props: { className?: string }) {
+  return <HugeiconsIcon icon={CodeIcon} {...props} />;
 }
-
-function CopyBtn({ text }: { text: string }) {
-  const [copied, setCopied] = useState(false);
-  const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
-
-  useEffect(() => {
-    return () => {
-      if (timer.current) {
-        clearTimeout(timer.current);
-      }
-    };
-  }, []);
-
-  const copy = useCallback(() => {
-    if (copyToClipboard(text)) {
-      setCopied(true);
-      if (timer.current) {
-        clearTimeout(timer.current);
-      }
-      timer.current = setTimeout(() => setCopied(false), COPY_RESET_MS);
-    }
-  }, [text]);
-
-  return (
-    <button
-      type="button"
-      onClick={copy}
-      className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-xs text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
-      aria-label="Copy to clipboard"
-    >
-      {copied ? (
-        <CheckIcon className="size-3" />
-      ) : (
-        <CopyIcon className="size-3" />
-      )}
-      {copied ? "Copied" : "Copy"}
-    </button>
-  );
-}
-
-/** Render code with syntax highlighting via Streamdown + shiki. No extra borders — inherits parent container. */
-function HighlightedCode({ code: source, language }: { code: string; language: string }) {
-  const markdown = useMemo(
-    () => `\`\`\`${language}\n${truncate(source)}\n\`\`\``,
-    [source, language],
-  );
-  return (
-    <div className="max-h-48 overflow-auto text-xs [&_pre]:!m-0 [&_pre]:!bg-transparent [&_pre]:!p-0 [&_pre]:!text-xs [&_[data-streamdown=code-block]]:!my-0 [&_[data-streamdown=code-block]]:!p-0 [&_[data-streamdown=code-block]]:!border-0">
-      <Streamdown
-        mode="static"
-        plugins={{ code: codePlugin }}
-        controls={{ code: false }}
-        shikiTheme={SHIKI_THEME}
-      >
-        {markdown}
-      </Streamdown>
-    </div>
-  );
-}
-
 function isStructuredResult(val: unknown): val is StructuredResult {
+  if (typeof val !== "object" || val === null) return false;
+  const v = val as { files?: unknown };
   return (
-    typeof val === "object" &&
-    val !== null &&
     "text" in val &&
     "images" in val &&
-    "sessionId" in val
+    "sessionId" in val &&
+    // Persisted content can carry anything, and the card reads name off each entry.
+    isSandboxFileList(v.files)
+  );
+}
+
+function PythonToolImage({
+  sessionId,
+  filename,
+}: {
+  sessionId: string;
+  filename: string;
+}) {
+  // Shared hook: authed fetch, object URL lifetime, keyed by url so stale responses cannot land.
+  const { ref, state } = useSandboxImage(pythonToolImagePath(sessionId, filename));
+
+  return (
+    <img
+      ref={ref}
+      src={state.status === "loaded" ? state.url : undefined}
+      alt={filename}
+      loading="lazy"
+      className="max-w-full rounded-lg border border-border"
+    />
   );
 }
 
 const PythonToolUIImpl: ToolCallMessagePartComponent = ({
+  toolCallId,
   args,
   result,
   status,
 }) => {
-  const code = (args as { code?: string })?.code ?? "";
+  const code = toolArgText((args as { code?: unknown })?.code);
   const firstLine = code.split("\n")[0]?.slice(0, 60) ?? "";
-  const isRunning = status?.type === "running";
+  const isRunning = isToolCallRunning(status);
+  // Args still streaming = the model is WRITING the code, not running it yet.
+  const { propStatus } = useToolArgsStatus();
+  const isWritingCode = isRunning && propStatus.code === "streaming";
 
   let output: string;
   let images: string[] = [];
+  let files: SandboxFile[] = [];
   let sessionId = "";
 
   if (isStructuredResult(result)) {
     output = result.text;
     images = result.images;
+    files = result.files ?? [];
     sessionId = result.sessionId;
-  } else if (typeof result === "string") {
-    output = result;
-  } else if (result) {
-    output = JSON.stringify(result, null, 2);
+  } else if (result != null) {
+    output = toolResultText(result);
   } else {
     output = "";
   }
 
-  const authToken = getAuthToken();
+  // Prefer the fuller live stream over a truncated result; after a reload only the result remains.
+  const fullOutput = useToolOutput("toolFullOutput", toolCallId);
+  const displayOutput = useMemo(
+    () => preferSanitizedFullToolOutput(fullOutput, output),
+    [fullOutput, output],
+  );
+
+  // The gate opens only once the call parsed, so pending approval means the script is written.
+  const awaitingApproval = useToolAwaitingApproval(toolCallId);
+  const isWriting = isWritingCode && !awaitingApproval;
+  const collapseByDefault = useChatPreferencesStore(
+    (state) => state.toolVisibility === "collapsed",
+  );
+  const scriptCell = code ? (
+    <div className="mt-1 pl-5">
+      <ToolCodeCell
+        label="script"
+        code={code}
+        language="python"
+        downloadName="script.py"
+        streaming={isWriting}
+      />
+    </div>
+  ) : null;
 
   return (
-    <ToolFallbackRoot>
+    // The script renders outside ToolFallbackContent so it stays visible on reopen, except with
+    // tool calls set to collapsed; awaiting approval always shows it. Created files stay outside.
+    <ToolFallbackRoot
+      defaultOpen={isRunning}
+      awaitingApproval={awaitingApproval}
+    >
       <ToolFallbackTrigger
         toolName={firstLine ? `Python: ${firstLine}` : "Python"}
         status={status}
-        icon={CodeIcon}
+        icon={CodeGlyph}
       />
+      {!collapseByDefault && scriptCell}
       <ToolFallbackContent>
+        {collapseByDefault && scriptCell}
         <div className="border-l-2 border-muted-foreground/20 pl-2">
-          {/* Code + copy */}
-          {code && (
-            <div className="flex justify-end">
-              <CopyBtn text={code} />
-            </div>
-          )}
-          {code && <HighlightedCode code={code} language="python" />}
-
-          {/* Output */}
           {isRunning ? (
-            <div className="mt-2 flex items-center gap-2 text-sm text-muted-foreground">
-              <LoaderIcon className="size-3.5 animate-spin" />
-              <span>Running&hellip;</span>
-            </div>
-          ) : output ? (
+            <>
+              <div className="mt-2 flex items-center gap-2 text-sm text-muted-foreground">
+                <Spinner className="size-3.5" />
+                <span>
+                  {awaitingApproval
+                    ? "Waiting for approval…"
+                    : isWriting
+                      ? "Writing code…"
+                      : "Running…"}
+                </span>
+              </div>
+              {/* Live stdout streamed via tool_output SSE events. */}
+              <ToolLiveOutput toolCallId={toolCallId} />
+            </>
+          ) : displayOutput ? (
             <div className="mt-2 border-t border-dashed pt-2">
               <div className="flex items-center justify-between">
-                <span className="text-xs font-medium text-muted-foreground">output</span>
-                <CopyBtn text={output} />
+                <span className="text-xs font-medium text-muted-foreground">
+                  output
+                </span>
+                <CopyBtn text={displayOutput} />
               </div>
-              <pre className="mt-1 max-h-60 overflow-auto whitespace-pre-wrap break-words font-mono text-xs">
-                {truncate(output)}
-              </pre>
+              <ToolResultOutput text={displayOutput} />
             </div>
           ) : null}
 
-          {/* Images from Python tool execution */}
           {images.length > 0 && sessionId && (
             <div className="mt-2 flex flex-col gap-2">
               {images.map((filename) => (
-                <img
+                <PythonToolImage
                   key={filename}
-                  src={`/api/inference/sandbox/${encodeURIComponent(sessionId)}/${encodeURIComponent(filename)}${authToken ? `?token=${encodeURIComponent(authToken)}` : ""}`}
-                  alt={filename}
-                  loading="lazy"
-                  className="max-w-full rounded border border-border"
+                  sessionId={sessionId}
+                  filename={filename}
                 />
               ))}
             </div>
           )}
         </div>
       </ToolFallbackContent>
+      <SandboxFiles className="ml-5" sessionId={sessionId} files={files} />
     </ToolFallbackRoot>
   );
 };

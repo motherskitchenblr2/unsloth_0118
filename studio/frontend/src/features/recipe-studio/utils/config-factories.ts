@@ -20,6 +20,46 @@ import type {
 } from "../types";
 import { nextName } from "./naming";
 
+export function makeUnstructuredUploadUid(): string {
+  if (typeof globalThis.crypto?.randomUUID === "function") {
+    return globalThis.crypto.randomUUID().replace(/-/g, "").toLowerCase();
+  }
+  if (typeof globalThis.crypto?.getRandomValues === "function") {
+    const bytes = new Uint8Array(16);
+    globalThis.crypto.getRandomValues(bytes);
+    return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join(
+      "",
+    );
+  }
+  let uid = "";
+  while (uid.length < 32) {
+    uid += Math.floor(Math.random() * 0x100000000)
+      .toString(16)
+      .padStart(8, "0");
+  }
+  return uid.slice(0, 32);
+}
+
+export function resolveUnstructuredUploadBlockId({
+  configId,
+  uploadUid,
+  generatedUploadUid,
+  unstructuredFileCount,
+}: {
+  configId: string;
+  uploadUid: string;
+  generatedUploadUid: string | null;
+  unstructuredFileCount: number;
+}): string {
+  if (uploadUid) {
+    return uploadUid;
+  }
+  if (generatedUploadUid) {
+    return generatedUploadUid;
+  }
+  return unstructuredFileCount > 0 ? configId : "";
+}
+
 export function makeSamplerConfig(
   id: string,
   samplerType: SamplerType,
@@ -313,11 +353,17 @@ export function makeValidatorConfig(
 ): ValidatorConfig {
   const isSql = validatorType === "code" && codeLang.startsWith("sql:");
   const isOxc = validatorType === "oxc";
+  const isJson = validatorType === "json";
+  const isMarkdown = validatorType === "markdown";
   let namePrefix = "validator_python";
   if (isSql) {
     namePrefix = "validator_sql";
   } else if (isOxc) {
     namePrefix = "validator_oxc";
+  } else if (isJson) {
+    namePrefix = "validator_json";
+  } else if (isMarkdown) {
+    namePrefix = "validator_markdown";
   }
   return {
     id,
@@ -349,6 +395,52 @@ export function makeMarkdownNoteConfig(
   };
 }
 
+// Documents seeds concatenate files in upload order: "ordered" would take every row from the first file.
+export function defaultSeedSamplingStrategy(
+  seedSourceType: SeedSourceType,
+): SeedConfig["sampling_strategy"] {
+  return seedSourceType === "unstructured" ? "shuffle" : "ordered";
+}
+
+// Clears every source field; sampling keeps the user's choice only within the same source type.
+export function swapSeedSourceType(
+  existing: SeedConfig,
+  nextSourceType: SeedSourceType,
+): SeedConfig {
+  return {
+    ...existing,
+    seed_source_type: nextSourceType,
+    sampling_strategy:
+      existing.seed_source_type === nextSourceType
+        ? existing.sampling_strategy
+        : defaultSeedSamplingStrategy(nextSourceType),
+    hf_repo_id: "",
+    hf_subset: "",
+    hf_split: "",
+    hf_path: "",
+    hf_token: "",
+    hf_endpoint: "",
+    local_file_name: "",
+    unstructured_upload_uid:
+      nextSourceType === "unstructured" ? makeUnstructuredUploadUid() : "",
+    unstructured_file_ids: [],
+    unstructured_file_names: [],
+    unstructured_file_sizes: [],
+    resolved_paths: [],
+    seed_columns: [],
+    seed_drop_columns: [],
+    seed_preview_rows: [],
+    unstructured_chunk_size: "1200",
+    unstructured_chunk_overlap: "200",
+    github_repo_slug: "",
+    github_token: "",
+    github_limit: "100",
+    github_item_types: ["issues", "pulls"],
+    github_include_comments: true,
+    github_max_comments_per_item: "30",
+  };
+}
+
 export function makeSeedConfig(
   id: string,
   existing: NodeConfig[],
@@ -366,8 +458,12 @@ export function makeSeedConfig(
     hf_split: "",
     hf_path: "",
     hf_token: "",
-    hf_endpoint: "https://huggingface.co",
+    // Blank, not getHfEndpoint(): buildSeedConfig fills it, so no pre-health seed pins a host.
+    hf_endpoint: "",
     local_file_name: "",
+    ...(seedSourceType === "unstructured"
+      ? { unstructured_upload_uid: makeUnstructuredUploadUid() }
+      : {}),
     unstructured_file_ids: [],
     unstructured_file_names: [],
     unstructured_file_sizes: [],
@@ -377,7 +473,7 @@ export function makeSeedConfig(
     seed_splits: [],
     seed_globs_by_split: {},
     seed_columns: [],
-    sampling_strategy: "ordered",
+    sampling_strategy: defaultSeedSamplingStrategy(seedSourceType),
     selection_type: "none",
     selection_start: "0",
     selection_end: "10",

@@ -2,6 +2,13 @@
 // Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
 import { authFetch } from "@/features/auth";
+import { apiUrl } from "@/lib/api-base";
+import {
+  formatApiErrorBody,
+  readFastApiError,
+} from "@/lib/format-fastapi-error";
+import { openStreamResponse } from "@/lib/open-stream-response";
+import { takeSseFrame } from "@/lib/sse-framing";
 
 const DEFAULT_BASE = "/api/data-recipe";
 
@@ -25,6 +32,28 @@ export type PublishRecipeJobResponse = {
   success: boolean;
   url: string;
   message: string;
+};
+
+export type SourceProgressResponse = {
+  source?: string | null;
+  status?: string | null;
+  repo?: string | null;
+  resource?: string | null;
+  page?: number | null;
+  // biome-ignore lint/style/useNamingConvention: api schema
+  page_items?: number | null;
+  // biome-ignore lint/style/useNamingConvention: api schema
+  fetched_items?: number | null;
+  // biome-ignore lint/style/useNamingConvention: api schema
+  estimated_total?: number | null;
+  percent?: number | null;
+  // biome-ignore lint/style/useNamingConvention: api schema
+  rate_remaining?: number | null;
+  // biome-ignore lint/style/useNamingConvention: api schema
+  retry_after_sec?: number | null;
+  message?: string | null;
+  // biome-ignore lint/style/useNamingConvention: api schema
+  updated_at?: number | null;
 };
 
 export type JobStatusResponse = {
@@ -61,6 +90,8 @@ export type JobStatusResponse = {
     ok?: number | null;
     failed?: number | null;
   };
+  // biome-ignore lint/style/useNamingConvention: api schema
+  source_progress?: SourceProgressResponse | null;
   // biome-ignore lint/style/useNamingConvention: api schema
   model_usage?: Record<string, unknown>;
   rows?: number | null;
@@ -103,18 +134,15 @@ export type SeedInspectRequest = {
 };
 
 export type SeedInspectUploadRequest = {
-  // Legacy single-file
   filename?: string;
   // biome-ignore lint/style/useNamingConvention: api schema
   content_base64?: string;
-  // Multi-file
   // biome-ignore lint/style/useNamingConvention: api schema
   block_id?: string;
   // biome-ignore lint/style/useNamingConvention: api schema
   file_ids?: string[];
   // biome-ignore lint/style/useNamingConvention: api schema
   file_names?: string[];
-  // Shared
   // biome-ignore lint/style/useNamingConvention: api schema
   preview_size?: number;
   // biome-ignore lint/style/useNamingConvention: api schema
@@ -137,6 +165,8 @@ export type SeedInspectResponse = {
   subset?: string | null;
   // biome-ignore lint/style/useNamingConvention: api schema
   resolved_paths?: string[] | null;
+  // biome-ignore lint/style/useNamingConvention: api schema
+  total_rows?: number | null;
 };
 
 export type ValidateError = {
@@ -178,17 +208,14 @@ async function parseErrorResponse(response: Response): Promise<string> {
   }
   try {
     const parsed = JSON.parse(text) as {
-      detail?: string;
-      message?: string;
       // biome-ignore lint/style/useNamingConvention: api schema
       raw_detail?: string;
     };
-    return (
-      parsed.detail ??
-      parsed.message ??
-      parsed.raw_detail ??
-      text
-    );
+    const formatted = formatApiErrorBody(parsed);
+    if (formatted) return formatted;
+    if (typeof parsed.raw_detail === "string" && parsed.raw_detail)
+      return parsed.raw_detail;
+    return text;
   } catch {
     return text;
   }
@@ -264,18 +291,22 @@ export async function validateRecipe(
   return postJson<ValidateResponse>("/validate", payload);
 }
 
-export async function createRecipeJob(payload: unknown): Promise<JobCreateResponse> {
+export async function createRecipeJob(
+  payload: unknown,
+): Promise<JobCreateResponse> {
   return postJson<JobCreateResponse>("/jobs", payload);
 }
 
-export async function getRecipeJobStatus(jobId: string): Promise<JobStatusResponse> {
-  return getJson<JobStatusResponse>(`/jobs/${jobId}/status`);
+export async function getRecipeJobStatus(
+  jobId: string,
+): Promise<JobStatusResponse> {
+  return getJson<JobStatusResponse>(`/jobs/${encodeURIComponent(jobId)}/status`);
 }
 
 export async function getRecipeJobAnalysis(
   jobId: string,
 ): Promise<Record<string, unknown>> {
-  return getJson<Record<string, unknown>>(`/jobs/${jobId}/analysis`);
+  return getJson<Record<string, unknown>>(`/jobs/${encodeURIComponent(jobId)}/analysis`);
 }
 
 export async function getRecipeJobDataset(
@@ -288,19 +319,47 @@ export async function getRecipeJobDataset(
   const limit = options?.limit ?? 20;
   const offset = options?.offset ?? 0;
   return getJson<JobDatasetResponse>(
-    `/jobs/${jobId}/dataset?limit=${limit}&offset=${offset}`,
+    `/jobs/${encodeURIComponent(jobId)}/dataset?limit=${limit}&offset=${offset}`,
   );
 }
 
-export async function cancelRecipeJob(jobId: string): Promise<JobStatusResponse> {
-  return postJson<JobStatusResponse>(`/jobs/${jobId}/cancel`, {});
+export type RecipeJobDownloadFormat = "jsonl" | "parquet";
+
+export async function downloadRecipeJobDataset(
+  jobId: string,
+  options?: {
+    format?: RecipeJobDownloadFormat;
+    artifactPath?: string | null;
+    filename?: string | null;
+  },
+): Promise<{ url: string; filename: string }> {
+  const params = new URLSearchParams();
+  params.set("format", options?.format ?? "jsonl");
+  if (options?.artifactPath) {
+    params.set("artifact_path", options.artifactPath);
+  }
+  if (options?.filename) {
+    params.set("filename", options.filename);
+  }
+  const { path, filename } = await getJson<{ path: string; filename: string }>(
+    `/jobs/${encodeURIComponent(jobId)}/download-url?${params.toString()}`,
+  );
+  // Drop the trailing slash: the native downloader refuses every 3xx redirect.
+  const base = DATA_DESIGNER_API_BASE.replace(/\/+$/, "");
+  return { url: apiUrl(`${base}${path}`), filename };
+}
+
+export async function cancelRecipeJob(
+  jobId: string,
+): Promise<JobStatusResponse> {
+  return postJson<JobStatusResponse>(`/jobs/${encodeURIComponent(jobId)}/cancel`, {});
 }
 
 export async function publishRecipeJob(
   jobId: string,
   payload: PublishRecipeJobRequest,
 ): Promise<PublishRecipeJobResponse> {
-  return postJson<PublishRecipeJobResponse>(`/jobs/${jobId}/publish`, payload);
+  return postJson<PublishRecipeJobResponse>(`/jobs/${encodeURIComponent(jobId)}/publish`, payload);
 }
 
 export async function inspectSeedDataset(
@@ -313,6 +372,13 @@ export async function inspectSeedUpload(
   payload: SeedInspectUploadRequest,
 ): Promise<SeedInspectResponse> {
   return postJson<SeedInspectResponse>("/seed/inspect-upload", payload);
+}
+
+// biome-ignore lint/style/useNamingConvention: api schema
+export type GithubEnvTokenStatus = { has_token: boolean };
+
+export async function getGithubEnvTokenStatus(): Promise<GithubEnvTokenStatus> {
+  return getJson<GithubEnvTokenStatus>("/seed/github/env-token");
 }
 
 export async function listMcpTools(
@@ -335,13 +401,10 @@ export async function streamRecipeJobEvents(options: {
     query = `?after=${options.lastEventId}`;
   }
 
-  const response = await authFetch(
-    `${DATA_DESIGNER_API_BASE}/jobs/${options.jobId}/events${query}`,
-    {
-      method: "GET",
-      headers,
-      signal: options.signal,
-    },
+  const response = await openStreamResponse(
+    authFetch,
+    `${DATA_DESIGNER_API_BASE}/jobs/${encodeURIComponent(options.jobId)}/events${query}`,
+    { headers, signal: options.signal },
   );
   if (!response.ok) {
     throw new Error(await parseErrorResponse(response));
@@ -356,33 +419,39 @@ export async function streamRecipeJobEvents(options: {
   const decoder = new TextDecoder();
   let buffer = "";
 
-  while (true) {
-    const { value, done } = await reader.read();
-    if (done) {
-      break;
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) {
+        break;
+      }
+      buffer += decoder.decode(value, { stream: true });
+      for (
+        let frame = takeSseFrame(buffer);
+        frame;
+        frame = takeSseFrame(buffer)
+      ) {
+        const rawEvent = frame.event;
+        buffer = frame.remainder;
+
+        if (rawEvent.startsWith("retry:")) {
+          continue;
+        }
+
+        const parsed = parseJobEvent(rawEvent);
+        if (parsed) {
+          options.onEvent(parsed);
+        }
+      }
     }
-    buffer += decoder.decode(value, { stream: true });
-    let separatorIndex = buffer.search(/\r?\n\r?\n/);
-    while (separatorIndex >= 0) {
-      const rawEvent = buffer.slice(0, separatorIndex);
-      const separatorLength = buffer[separatorIndex] === "\r" ? 4 : 2;
-      buffer = buffer.slice(separatorIndex + separatorLength);
-
-      if (rawEvent.startsWith("retry:")) {
-        separatorIndex = buffer.search(/\r?\n\r?\n/);
-        continue;
-      }
-
-      const parsed = parseJobEvent(rawEvent);
-      if (parsed) {
-        options.onEvent(parsed);
-      }
-      separatorIndex = buffer.search(/\r?\n\r?\n/);
+  } finally {
+    try {
+      await reader.cancel();
+    } catch {
+      // already closed
     }
   }
 }
-
-// NOTE: preview endpoints removed from harness.
 
 type UnstructuredFileUploadResponse = {
   // biome-ignore lint/style/useNamingConvention: api schema
@@ -394,39 +463,46 @@ type UnstructuredFileUploadResponse = {
   error?: string;
 };
 
+/** A desktop drop, redeemed server-side so the bytes never cross the Tauri bridge. */
+export interface NativeUnstructuredUpload {
+  nativePathLease: string;
+  name: string;
+  size: number;
+}
+
+export type UnstructuredUploadSource = File | NativeUnstructuredUpload;
+
 export async function uploadUnstructuredFile(
-  file: File,
+  file: UnstructuredUploadSource,
   blockId: string,
   signal?: AbortSignal,
-  existingFileIds?: string[],
 ): Promise<UnstructuredFileUploadResponse> {
   const formData = new FormData();
-  formData.append("file", file);
+  if (file instanceof File) formData.append("file", file);
+  else formData.append("nativePathLease", file.nativePathLease);
   formData.append("block_id", blockId);
-  if (existingFileIds?.length) {
-    formData.append("existing_file_ids", existingFileIds.join(","));
-  }
 
-  const res = await authFetch(`${DATA_DESIGNER_API_BASE}/seed/upload-unstructured-file`, {
-    method: "POST",
-    body: formData,
-    signal,
-  });
+  const res = await authFetch(
+    `${DATA_DESIGNER_API_BASE}/seed/upload-unstructured-file`,
+    {
+      method: "POST",
+      body: formData,
+      signal,
+    },
+  );
 
   if (res.status === 413) {
-    const detail = await res.json().catch(() => ({ detail: "File too large" }));
     return {
       file_id: "",
       filename: file.name,
       size_bytes: file.size,
       status: "error",
-      error: typeof detail.detail === "string" ? detail.detail : "File too large",
+      error: await readFastApiError(res, "File too large"),
     };
   }
 
   if (!res.ok) {
-    const detail = await res.json().catch(() => ({ detail: "Upload failed" }));
-    throw new Error(typeof detail.detail === "string" ? detail.detail : "Upload failed");
+    throw new Error(await readFastApiError(res, "Upload failed"));
   }
 
   return res.json();
@@ -442,5 +518,15 @@ export async function removeUnstructuredFile(
   );
   if (!res.ok && res.status !== 404) {
     throw new Error("Failed to remove file");
+  }
+}
+
+export async function removeUnstructuredBlock(blockId: string): Promise<void> {
+  const res = await authFetch(
+    `${DATA_DESIGNER_API_BASE}/seed/unstructured-block/${encodeURIComponent(blockId)}`,
+    { method: "DELETE" },
+  );
+  if (!res.ok && res.status !== 404) {
+    throw new Error("Failed to remove uploaded files");
   }
 }

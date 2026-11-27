@@ -1,15 +1,19 @@
 "use client";
 
+import { openLink } from "@/lib/open-link";
 import {
   memo,
   useState,
   useRef,
   useEffect,
   useCallback,
+  useMemo,
   type ComponentProps,
   type FC,
 } from "react";
-import { useMessage } from "@assistant-ui/react";
+import { useAuiState } from "@assistant-ui/react";
+import { memoOnArray } from "@/components/assistant-ui/message-derived";
+import { useChatPreferencesStore } from "@/features/chat/stores/chat-preferences-store";
 import { cn } from "@/lib/utils";
 import { Badge, badgeVariants, type BadgeProps } from "./badge";
 import {
@@ -17,8 +21,6 @@ import {
   HoverCardTrigger,
   HoverCardContent,
 } from "@/components/ui/hover-card";
-
-// ── Helpers ──────────────────────────────────────────────────
 
 const extractDomain = (url: string): string => {
   try {
@@ -33,25 +35,24 @@ const getDomainInitial = (url: string): string => {
   return domain.charAt(0).toUpperCase();
 };
 
-// ── Sub-components ───────────────────────────────────────────
-
 function SourceIcon({
   url,
   className,
   size = 3,
+  allowRemoteIcons = true,
   ...props
-}: ComponentProps<"span"> & { url: string; size?: number }) {
+}: ComponentProps<"span"> & { url: string; size?: number; allowRemoteIcons?: boolean }) {
   const [hasError, setHasError] = useState(false);
   const domain = extractDomain(url);
   const SIZE_CLASSES: Record<number, string> = { 3: "size-3", 4: "size-4", 5: "size-5" };
   const sizeClass = SIZE_CLASSES[size] ?? "size-3";
 
-  if (hasError) {
+  if (hasError || !allowRemoteIcons) {
     return (
       <span
         data-slot="source-icon-fallback"
         className={cn(
-          `flex ${sizeClass} shrink-0 items-center justify-center rounded-sm bg-muted font-medium text-[10px]`,
+          `flex ${sizeClass} shrink-0 items-center justify-center rounded-sm bg-muted font-medium text-ui-10`,
           className,
         )}
         {...props}
@@ -93,8 +94,8 @@ function Source({
   variant,
   size,
   asChild = false,
-  target = "_blank",
-  rel = "noopener noreferrer",
+  href,
+  onClick,
   ...props
 }: SourceProps) {
   return (
@@ -103,52 +104,79 @@ function Source({
       variant={variant}
       size={size}
       className={cn(
-        "cursor-pointer outline-none focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50",
+        "btn-fill rounded-full cursor-pointer border-transparent outline-none hover:text-chat-icon-fg-hover! focus-visible:border-ring",
         className,
       )}
     >
       <a
         data-slot="source"
-        target={target}
-        rel={rel}
+        href={href}
+        rel="noopener noreferrer"
+        onClick={(e) => {
+          if (href && openLink(href)) {
+            e.preventDefault();
+          }
+          onClick?.(e);
+        }}
         {...(props as ComponentProps<"a">)}
       />
     </Badge>
   );
 }
 
-// ── Source badge with hover card ─────────────────────────────
-
-interface SourceData {
+export interface SourceData {
+  /** Two citations into the same source share a `url`, so React keys on `id`. */
+  id: string;
   url: string;
   title: string;
   description?: string;
 }
 
-const SourceBadge: FC<{ source: SourceData }> = ({ source }) => {
+const SourceBadge: FC<{
+  source: SourceData;
+  allowRemoteIcons?: boolean;
+  showLinkPreviews: boolean;
+}> = ({
+  source,
+  allowRemoteIcons = true,
+  showLinkPreviews,
+}) => {
   const domain = extractDomain(source.url);
   const displayTitle = source.title || domain;
+  const badge = (
+    <span className="inline-block">
+      <Source href={source.url}>
+        <SourceIcon url={source.url} allowRemoteIcons={allowRemoteIcons} />
+        <SourceTitle>{displayTitle}</SourceTitle>
+      </Source>
+    </span>
+  );
+
+  if (!showLinkPreviews) return badge;
 
   return (
-    <HoverCard openDelay={300} closeDelay={100}>
-      <HoverCardTrigger asChild>
-        <span className="inline-block">
-          <Source href={source.url}>
-            <SourceIcon url={source.url} />
-            <SourceTitle>{displayTitle}</SourceTitle>
-          </Source>
-        </span>
-      </HoverCardTrigger>
-      <HoverCardContent side="top" align="start" className="w-72 p-3">
+    <HoverCard openDelay={0} closeDelay={0}>
+      <HoverCardTrigger asChild>{badge}</HoverCardTrigger>
+      <HoverCardContent
+        side="top"
+        align="start"
+        className="!bg-(--tooltip-bg) !text-(--tooltip-fg) !w-72 !p-3 !rounded-2xl !shadow-(--tooltip-shadow) !ring-0 !duration-0"
+        style={{ animation: "none" }}
+      >
         <div className="flex gap-2.5">
-          <SourceIcon url={source.url} size={4} className="mt-0.5 shrink-0" />
+          <SourceIcon
+            url={source.url}
+            size={4}
+            className="mt-0.5 shrink-0"
+            allowRemoteIcons={allowRemoteIcons}
+          />
           <div className="min-w-0 space-y-1">
             <p className="text-sm font-semibold leading-tight truncate">
               {source.title || domain}
             </p>
-            <p className="text-xs text-muted-foreground truncate">{domain}</p>
+            <p className="text-xs text-(--tooltip-muted) truncate">{domain}</p>
             {source.description && (
-              <p className="text-xs text-muted-foreground leading-relaxed line-clamp-3">
+              <p className="text-xs text-(--tooltip-muted) leading-relaxed line-clamp-3">
                 {source.description}
               </p>
             )}
@@ -159,36 +187,69 @@ const SourceBadge: FC<{ source: SourceData }> = ({ source }) => {
   );
 };
 
-// ── Grouped sources with 2-row collapse ─────────────────────
+const NO_SOURCES: readonly SourceData[] = [];
 
-const SourcesGroup: FC = () => {
-  const message = useMessage();
+// A string selector stays equal while streaming rebuilds the content array.
+const urlSourcesKey = memoOnArray((content: readonly unknown[]): string => {
+  const sources: SourceData[] = [];
+  for (const item of content) {
+    const part = item as {
+      type?: unknown;
+      sourceType?: unknown;
+      url?: unknown;
+      id?: unknown;
+      title?: string;
+      metadata?: { description?: string };
+    };
+    if (
+      part.type === "source" &&
+      "sourceType" in part &&
+      part.sourceType === "url" &&
+      "url" in part &&
+      part.url
+    ) {
+      const url = part.url as string;
+      sources.push({
+        id: typeof part.id === "string" ? part.id : url,
+        url,
+        title: part.title || "",
+        description: part.metadata?.description,
+      });
+    }
+  }
+  return sources.length === 0 ? "" : JSON.stringify(sources);
+});
+
+const SourcesGroup: FC<{ sources?: SourceData[]; allowRemoteIcons?: boolean }> = ({
+  sources: suppliedSources,
+  allowRemoteIcons = true,
+}) => {
+  const key = useAuiState(({ message }) =>
+    suppliedSources || !Array.isArray(message.content)
+      ? ""
+      : urlSourcesKey(message.content),
+  );
+  const messageSources = useMemo<readonly SourceData[]>(
+    () => (key === "" ? NO_SOURCES : (JSON.parse(key) as SourceData[])),
+    [key],
+  );
+  return (
+    <SourcesGroupView
+      sources={suppliedSources ?? messageSources}
+      allowRemoteIcons={allowRemoteIcons}
+    />
+  );
+};
+
+const SourcesGroupView = memo<{
+  sources: readonly SourceData[];
+  allowRemoteIcons: boolean;
+}>(({ sources, allowRemoteIcons }) => {
+  const showLinkPreviews = useChatPreferencesStore((s) => s.showLinkPreviews);
   const containerRef = useRef<HTMLDivElement>(null);
   const [visibleCount, setVisibleCount] = useState<number | null>(null);
   const [expanded, setExpanded] = useState(false);
 
-  // Extract source parts from the message
-  const sources: SourceData[] = [];
-  if (message.content) {
-    for (const part of message.content) {
-      if (
-        part.type === "source" &&
-        "sourceType" in part &&
-        part.sourceType === "url" &&
-        "url" in part &&
-        part.url
-      ) {
-        sources.push({
-          url: part.url as string,
-          title: (part as { title?: string }).title || "",
-          description: (part as { metadata?: { description?: string } })
-            .metadata?.description,
-        });
-      }
-    }
-  }
-
-  // Measure how many badges fit in 2 rows
   const measure = useCallback(() => {
     const container = containerRef.current;
     if (!container || sources.length === 0) return;
@@ -196,7 +257,6 @@ const SourcesGroup: FC = () => {
     const children = Array.from(container.children) as HTMLElement[];
     if (children.length === 0) return;
 
-    // Find the top of the first child as baseline
     const firstTop = children[0].offsetTop;
     let rowCount = 1;
     let prevTop = firstTop;
@@ -221,7 +281,6 @@ const SourcesGroup: FC = () => {
     measure();
   }, [measure]);
 
-  // Re-measure on resize
   useEffect(() => {
     const container = containerRef.current;
     if (!container) return;
@@ -238,27 +297,35 @@ const SourcesGroup: FC = () => {
   const hiddenCount = sources.length - (visibleCount ?? sources.length);
 
   return (
-    <div className="relative mt-2">
-      {/* Hidden measurement container — renders all badges to measure row positions */}
+    <div className="relative mt-2 mb-3">
+      {/* Off-screen measurement; the clipped absolute wrapper keeps pills out of scrollHeight. */}
       <div
-        ref={containerRef}
         aria-hidden
-        className="flex w-full flex-wrap gap-1 invisible absolute pointer-events-none"
+        className="absolute pointer-events-none overflow-hidden h-0 w-full left-0 top-0"
       >
-        {sources.map((source) => (
-          <span key={source.url} className="inline-block">
-            <Source href={source.url}>
-              <SourceIcon url={source.url} />
-              <SourceTitle>{source.title || extractDomain(source.url)}</SourceTitle>
-            </Source>
-          </span>
-        ))}
+        <div
+          ref={containerRef}
+          className="flex w-full flex-wrap gap-1 invisible"
+        >
+          {sources.map((source) => (
+            <span key={source.id} className="inline-block">
+              <Source href={source.url}>
+                <SourceIcon url={source.url} allowRemoteIcons={allowRemoteIcons} />
+                <SourceTitle>{source.title || extractDomain(source.url)}</SourceTitle>
+              </Source>
+            </span>
+          ))}
+        </div>
       </div>
 
-      {/* Visible container */}
       <div className="flex flex-wrap gap-1">
         {displayedSources.map((source) => (
-          <SourceBadge key={source.url} source={source} />
+          <SourceBadge
+            key={source.id}
+            source={source}
+            allowRemoteIcons={allowRemoteIcons}
+            showLinkPreviews={showLinkPreviews}
+          />
         ))}
         {shouldCollapse && !expanded && (
           <button
@@ -266,7 +333,7 @@ const SourcesGroup: FC = () => {
             onClick={() => setExpanded(true)}
             className={cn(
               badgeVariants({ variant: "outline", size: "default" }),
-              "cursor-pointer text-muted-foreground hover:text-foreground",
+              "btn-fill rounded-full cursor-pointer border-transparent text-muted-foreground hover:text-chat-icon-fg-hover!",
             )}
           >
             +{hiddenCount} more
@@ -278,7 +345,7 @@ const SourcesGroup: FC = () => {
             onClick={() => setExpanded(false)}
             className={cn(
               badgeVariants({ variant: "outline", size: "default" }),
-              "cursor-pointer text-muted-foreground hover:text-foreground",
+              "btn-fill rounded-full cursor-pointer border-transparent text-muted-foreground hover:text-chat-icon-fg-hover!",
             )}
           >
             Show less
@@ -287,13 +354,11 @@ const SourcesGroup: FC = () => {
       </div>
     </div>
   );
-};
+});
 
-// ── Individual source (renders null — SourcesGroup handles all) ──
+SourcesGroupView.displayName = "SourcesGroupView";
 
 const SourcesNoop: FC<Record<string, unknown>> = () => null;
-
-// ── Exports ──────────────────────────────────────────────────
 
 const Sources = memo(SourcesNoop) as unknown as FC<Record<string, unknown>> & {
   Root: typeof Source;

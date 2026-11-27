@@ -1,75 +1,527 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
+import { normalizeDenseQuantSchemes } from "@/lib/dense-quant-schemes";
+import {
+  type ReportedOffloadFitTier,
+  normalizeReportedOffloadFitTiers,
+} from "@/lib/offload-fit-tiers";
+import {
+  type GpuIndexKind,
+  type PinnableGpuContext,
+  type ReconciledGpuSelection,
+  type SystemGpuDevice,
+  pickLoadDevice,
+  pinnableGpuContext,
+  reconcileGpuSelection,
+  resolveGpuSelectionContext,
+} from "./gpu-selection";
+import {
+  gpuMemoryTotalsGb,
+  gpuSharedHostMemoryGb,
+  sharesHostMemory,
+  systemRamAvailableOutsideSharedPoolGb,
+} from "./gpu-vram";
+import {
+  type GpuDevice,
+  type SystemInfoResponse,
+  fetchSystemInfo,
+  getCachedSystemInfo,
+  subscribeSystemInfo,
+} from "./use-system";
+
+export {
+  pinnableGpuContext,
+  reconcileGpuSelection,
+  type GpuIndexKind,
+  type PinnableGpuContext,
+  type ReconciledGpuSelection,
+  type SystemGpuDevice,
+} from "./gpu-selection";
 
 export interface GpuInfo {
   available: boolean;
+  budgetKnown: boolean;
+  sharedMemory: boolean;
+  /** A unified host pool (ROCm APU) is not a VRAM ceiling for fit verdicts. */
+  unifiedMemory: boolean;
+  /** Carried on the GPU-less path too. Empty until system info arrives. */
+  backend: string;
+  denseQuantSupported: boolean;
+  /** Best first. Empty until system info arrives, and on older backends. */
+  denseQuantSchemes: readonly string[];
+  nvfp4Diffusion: boolean;
+  /** Prequantized LLM checkpoint formats ("fp8", "nvfp4") this host runs natively. Empty until system info arrives. */
+  checkpointQuantFormats: readonly string[];
+  /** Checkpoint kinds that load but run dequantized to 16-bit ("fp8_rowwise": per-channel FP8 on a torch build without
+   * the row-wise FP8 GEMM). Empty until system info arrives, and on older backends. */
+  checkpointQuantDequantOnly?: readonly string[];
+  /** Group offload can stream torchao weights. Absent or false until resolved and on older backends. */
+  quantisedStreaming?: boolean;
+  extraOffloadFitTiers?: Readonly<
+    Record<string, readonly ReportedOffloadFitTier[]>
+  >;
   name: string;
   memoryTotalGb: number;
+  memorySharedGb: number;
+  /** Without shared-memory devices: VRAM beside system RAM, not a view of it. */
+  dedicatedMemoryTotalGb: number;
+  /** Image/video loads live on ONE device, so their fit math must not use the multi-GPU sum. */
+  maxDeviceMemoryGb: number;
+  /** Lowest visible ordinal, where bare "cuda" diffusion lands; not maxDeviceMemoryGb if mixed. */
+  loadDeviceMemoryGb: number;
+  loadDeviceSharedMemory: boolean;
+  /** Includes Linux ROCm APUs, which report only unified_memory; offload frees nothing on either. */
+  loadDeviceSharesHostMemory: boolean;
+  /** How many GPUs memoryTotalGb sums over, for the loader's per-card VRAM reserve. */
+  deviceCount: number;
+  cpuCore: number;
+  cpuThread: number;
+  /** Host RAM free minus the host-backed shared GPU pool. */
   systemRamAvailableGb: number;
+  systemRamAvailableHostGb: number;
+  /** Whether host available memory was reported, including a real zero. */
+  systemRamAvailableKnown?: boolean;
+  systemRamTotalGb: number;
+  /** Apple Silicon only: what llama.cpp (and MLX) admit right now, `min(working set, free) * 0.85`
+   *  (`_apple_metal_memory_budget_bytes`). Null on every other host and on older backends. */
+  unifiedLoadBudgetGb?: number | null;
+  /** `min(working set, free + AGX in use) * 0.85`: the budget once the loader has freed a resident model. */
+  unifiedLoadCeilingGb?: number | null;
+}
+
+/** `_APPLE_UNIFIED_MEMORY_FRACTION` in llama_cpp.py and mlx_inference.py. */
+const APPLE_UNIFIED_MEMORY_FRACTION = 0.85;
+
+function finitePositive(value: number | null | undefined): number | null {
+  return typeof value === "number" && Number.isFinite(value) && value > 0
+    ? value
+    : null;
+}
+
+// A real 0 GiB free reading is the most pressured case, so it must not read as unknown.
+function finiteNonNegative(value: number | null | undefined): number | null {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0
+    ? value
+    : null;
+}
+
+function appleUnifiedLoadBudgetGb(
+  data: SystemInfoResponse | null,
+  inventoryBackend: string | null | undefined,
+  devices: readonly GpuDevice[],
+  afterUnload = false,
+): number | null {
+  const metalInventory = inventoryBackend === "metal";
+  if (
+    (data?.device_backend !== "mlx" && !metalInventory) ||
+    devices.length !== 1
+  ) {
+    return null;
+  }
+  const device = devices[0];
+  const workingSetGb = finitePositive(device.metal_working_set_gb);
+  if (device.shared_memory !== true || workingSetGb === null) return null;
+  let freeGb =
+    finiteNonNegative(device.vram_free_gb) ??
+    finiteNonNegative(data?.memory?.available_gb);
+  // The Metal inventory cannot see the resident's share, so a switch keeps the live budget.
+  if (afterUnload && !metalInventory) {
+    // Resident Metal buffers free on unload; other apps count; unknown usage: ceiling only.
+    const usedGb = finiteNonNegative(device.vram_used_gb);
+    freeGb = freeGb !== null && usedGb !== null ? freeGb + usedGb : null;
+  }
+  // Floored to 0.25 GiB: free memory drifts every poll, and each change re-renders every picker row.
+  return (
+    Math.floor(
+      Math.min(workingSetGb, freeGb ?? workingSetGb) *
+        APPLE_UNIFIED_MEMORY_FRACTION *
+        4,
+    ) / 4
+  );
 }
 
 const DEFAULT_GPU: GpuInfo = {
   available: false,
+  budgetKnown: false,
+  sharedMemory: false,
+  unifiedMemory: false,
+  backend: "",
+  denseQuantSupported: false,
+  denseQuantSchemes: [],
+  nvfp4Diffusion: false,
+  checkpointQuantFormats: [],
+  checkpointQuantDequantOnly: [],
+  quantisedStreaming: false,
   name: "Unknown",
   memoryTotalGb: 0,
+  memorySharedGb: 0,
+  dedicatedMemoryTotalGb: 0,
+  maxDeviceMemoryGb: 0,
+  loadDeviceMemoryGb: 0,
+  loadDeviceSharedMemory: false,
+  loadDeviceSharesHostMemory: false,
+  deviceCount: 0,
+  cpuCore: 0,
+  cpuThread: 0,
   systemRamAvailableGb: 0,
+  systemRamAvailableHostGb: 0,
+  systemRamAvailableKnown: false,
+  systemRamTotalGb: 0,
+  unifiedLoadBudgetGb: null,
+  unifiedLoadCeilingGb: null,
 };
 
-// Module-level cache so multiple components share one fetch.
-let cachedGpu: GpuInfo | null = null;
-let fetchPromise: Promise<GpuInfo> | null = null;
-
-async function fetchGpuOnce(): Promise<GpuInfo> {
-  if (cachedGpu) return cachedGpu;
-  if (fetchPromise) return fetchPromise;
-
-  fetchPromise = (async () => {
-    try {
-      const res = await fetch("/api/system");
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const data = await res.json();
-      const gpuData = data?.gpu;
-      if (!gpuData?.available || !gpuData.devices?.length) return DEFAULT_GPU;
-      const devices = gpuData.devices as Array<{ name?: string; memory_total_gb?: number }>;
-      const totalGb = devices.reduce((sum, d) => sum + (d.memory_total_gb ?? 0), 0);
-      const info: GpuInfo = {
-        available: true,
-        name: devices[0]?.name ?? "Unknown",
-        memoryTotalGb: totalGb,
-        systemRamAvailableGb: data?.memory?.available_gb ?? 0,
-      };
-      cachedGpu = info;
-      return info;
-    } catch {
-      // Reset promise so subsequent calls retry (e.g. backend wasn't ready)
-      fetchPromise = null;
-      return DEFAULT_GPU;
-    }
-  })();
-
-  return fetchPromise;
+function toGpuInfo(
+  data: SystemInfoResponse | null,
+  source: "gpu" | "inference_gpu" = "gpu",
+): GpuInfo {
+  // CPU/RAM exist on GPU-less hosts too, and unified-memory math needs a RAM budget.
+  const base = {
+    backend: data?.device_backend ?? "",
+    denseQuantSupported: data?.dense_quant_supported === true,
+    denseQuantSchemes: normalizeDenseQuantSchemes(data?.dense_quant_schemes),
+    nvfp4Diffusion: data?.nvfp4_diffusion === true,
+    checkpointQuantFormats: normalizeDenseQuantSchemes(
+      data?.checkpoint_quant_formats,
+    ),
+    checkpointQuantDequantOnly: normalizeDenseQuantSchemes(
+      data?.checkpoint_quant_dequant_only,
+    ),
+    quantisedStreaming: data?.quantised_streaming === true,
+    extraOffloadFitTiers: normalizeReportedOffloadFitTiers(
+      data?.diffusers_offload_tiers,
+    ),
+    cpuCore: data?.cpu?.physical_count ?? 0,
+    cpuThread: data?.cpu?.logical_count ?? 0,
+    systemRamAvailableGb: data?.memory?.available_gb ?? 0,
+    systemRamAvailableHostGb: data?.memory?.available_gb ?? 0,
+    systemRamAvailableKnown:
+      Number.isFinite(data?.memory?.available_gb) &&
+      (data?.memory?.available_gb as number) >= 0,
+    systemRamTotalGb: data?.memory?.total_gb ?? 0,
+  };
+  const gpuData =
+    source === "inference_gpu" ? (data?.inference_gpu ?? data?.gpu) : data?.gpu;
+  const devices = gpuData?.devices ?? [];
+  if (!gpuData?.available || !devices.length) {
+    return { ...DEFAULT_GPU, ...base, budgetKnown: data !== null };
+  }
+  const memoryTotals = gpuMemoryTotalsGb(devices);
+  const loadDevice = pickLoadDevice(devices);
+  return {
+    ...base,
+    // Raw: folding first collapsed multi-socket unified pools into one.
+    systemRamAvailableGb: systemRamAvailableOutsideSharedPoolGb(
+      base.systemRamAvailableGb,
+      gpuSharedHostMemoryGb(devices),
+    ),
+    sharedMemory: memoryTotals.shared > 0 && memoryTotals.dedicated === 0,
+    // some(), unlike sharedMemory: one unified part already stops the total being a VRAM ceiling.
+    unifiedMemory: devices.some((device) => device.unified_memory === true),
+    available: true,
+    budgetKnown: true,
+    name: devices[0]?.name ?? "Unknown",
+    memoryTotalGb: memoryTotals.total,
+    dedicatedMemoryTotalGb: memoryTotals.dedicated,
+    memorySharedGb: memoryTotals.shared,
+    maxDeviceMemoryGb: devices.reduce(
+      (max, d) => Math.max(max, d.memory_total_gb ?? 0),
+      0,
+    ),
+    // Lowest visible ordinal = torch's current device = where the pipeline lands.
+    loadDeviceMemoryGb: loadDevice?.memory_total_gb ?? 0,
+    loadDeviceSharedMemory: loadDevice?.shared_memory === true,
+    loadDeviceSharesHostMemory: sharesHostMemory({
+      sharedMemory: loadDevice?.shared_memory === true,
+      unifiedMemory: loadDevice?.unified_memory === true,
+    }),
+    deviceCount: devices.length,
+    unifiedLoadBudgetGb: appleUnifiedLoadBudgetGb(
+      data,
+      gpuData.backend,
+      devices,
+    ),
+    unifiedLoadCeilingGb: appleUnifiedLoadBudgetGb(
+      data,
+      gpuData.backend,
+      devices,
+      true,
+    ),
+  };
 }
 
-/**
- * Fetch GPU info from the backend /api/system endpoint.
- *
- * The result is cached at module level -- only one network request is made
- * regardless of how many components call this hook.
- */
-export function useGpuInfo(): GpuInfo {
-  const [gpu, setGpu] = useState<GpuInfo>(cachedGpu ?? DEFAULT_GPU);
+function toGpuDevices(
+  data: SystemInfoResponse | null,
+  // Diffusion runs on torch, so it reads the torch inventory even on a Vulkan inference build.
+  forDiffusion = false,
+): SystemGpuDevice[] {
+  // GGUF runs via llama-server, so on Vulkan the pickable set is its inventory and ggml ordinals.
+  const inference = data?.inference_gpu;
+  if (!forDiffusion && inference?.backend === "vulkan") {
+    // Confirmed Vulkan: never fall through to torch IDs, which the backend rejects for Vulkan builds.
+    if (!(inference.devices ?? []).length) return [];
+    const picksAccepted = inference.gguf_gpu_ids_supported !== false;
+    return (inference.devices ?? [])
+      .filter((d) => typeof d.index === "number")
+      .map((d) => ({
+        index: d.index as number,
+        indexKind: d.index_kind === "vulkan" ? ("vulkan" as const) : null,
+        name: d.name ?? `GPU ${d.index}`,
+        memoryTotalGb: d.memory_total_gb ?? 0,
+        memoryFreeGb: d.vram_free_gb ?? 0,
+        memoryFreeKnown:
+          Number.isFinite(d.vram_free_gb) && (d.vram_free_gb as number) >= 0,
+        sharedMemory: d.shared_memory === true,
+        sharedMemoryHostBackedGb: d.shared_memory_host_backed_gb,
+        unifiedMemory: d.unified_memory === true,
+        pinnable: picksAccepted && d.index_kind === "vulkan",
+        // The DiffusionGemma runner never speaks ggml ordinals.
+        diffusionPinnable: false,
+      }));
+  }
+  // Unpinnable configs must hide every pick surface; absent gguf_gpu_ids_supported means pinnable.
+  const pinnableBackend = data?.gpu?.gguf_gpu_ids_supported !== false;
+  // ROCm reuses torch.cuda.* and physical IDs; only the label differs.
+  const diffusionBackend =
+    data?.device_backend === "cuda" || data?.device_backend === "rocm";
+  return (data?.gpu?.devices ?? [])
+    .filter((d) => typeof d.index === "number")
+    .map((d) => ({
+      index: d.index as number,
+      indexKind:
+        d.index_kind === "physical" ||
+        d.index_kind === "vulkan" ||
+        d.index_kind === "cuda_device"
+          ? d.index_kind
+          : null,
+      name: d.name ?? `GPU ${d.index}`,
+      memoryTotalGb: d.memory_total_gb ?? 0,
+      memoryFreeGb: d.vram_free_gb ?? 0,
+      memoryFreeKnown:
+        Number.isFinite(d.vram_free_gb) && (d.vram_free_gb as number) >= 0,
+      sharedMemory: d.shared_memory === true,
+      sharedMemoryHostBackedGb: d.shared_memory_host_backed_gb,
+      unifiedMemory: d.unified_memory === true,
+      // The XPU ban covers torch-xpu ordinals, not Vulkan ones.
+      pinnable:
+        pinnableBackend &&
+        (d.index_kind === "vulkan" ||
+          (data?.device_backend !== "xpu" &&
+            (d.index_kind === "physical" || d.index_kind === "cuda_device"))),
+      diffusionPinnable:
+        diffusionBackend &&
+        (d.index_kind === "physical" || d.index_kind === "cuda_device"),
+    }));
+}
 
-  useEffect(() => {
-    if (cachedGpu) return;
+function sameSchemes(
+  held: readonly string[],
+  fresh: readonly string[],
+): boolean {
+  return (
+    held === fresh ||
+    (held.length === fresh.length &&
+      held.every((scheme, index) => scheme === fresh[index]))
+  );
+}
 
-    let cancelled = false;
-    fetchGpuOnce().then((info) => {
-      if (!cancelled) setGpu(info);
+/** Keep array identity when unchanged: consumers memoise pickers and disk probes on these. */
+export function withStableSchemes(current: GpuInfo, next: GpuInfo): GpuInfo {
+  const keepDense =
+    current.denseQuantSchemes !== next.denseQuantSchemes &&
+    sameSchemes(current.denseQuantSchemes, next.denseQuantSchemes);
+  const keepCheckpoint =
+    current.checkpointQuantFormats !== next.checkpointQuantFormats &&
+    sameSchemes(current.checkpointQuantFormats, next.checkpointQuantFormats);
+  if (!keepDense && !keepCheckpoint) return next;
+  return {
+    ...next,
+    ...(keepDense ? { denseQuantSchemes: current.denseQuantSchemes } : {}),
+    ...(keepCheckpoint
+      ? { checkpointQuantFormats: current.checkpointQuantFormats }
+      : {}),
+  };
+}
+
+const RAM_DRIFT_TOLERANCE_GB = 0.25;
+
+/** Keeps `current` when only free RAM drifted, so subscribed pages do not re-render on every poll. */
+export function nextGpuInfo(current: GpuInfo, next: GpuInfo): GpuInfo {
+  const ramDrift = Math.max(
+    Math.abs(current.systemRamAvailableGb - next.systemRamAvailableGb),
+    Math.abs(current.systemRamAvailableHostGb - next.systemRamAvailableHostGb),
+  );
+  const withoutLiveRam = (info: GpuInfo) =>
+    JSON.stringify({
+      ...info,
+      systemRamAvailableGb: 0,
+      systemRamAvailableHostGb: 0,
     });
-    return () => { cancelled = true; };
-  }, []);
+  if (
+    ramDrift < RAM_DRIFT_TOLERANCE_GB &&
+    withoutLiveRam(current) === withoutLiveRam(next)
+  ) {
+    return current;
+  }
+  return withStableSchemes(current, next);
+}
 
+/** Aggregate GPU info from /api/system; shares one module-level fetch across all GPU hooks. */
+function useGpuInfoSource(
+  source: "gpu" | "inference_gpu",
+  enabled = true,
+): GpuInfo {
+  const cachedSystem = getCachedSystemInfo();
+  const [gpu, setGpu] = useState<GpuInfo>(
+    cachedSystem ? toGpuInfo(cachedSystem, source) : DEFAULT_GPU,
+  );
+  useEffect(() => {
+    if (!enabled) return;
+    // No early return on cachedSystem: a consumer mounting as the cache fills would stay default.
+    let cancelled = false;
+    const sync = (data: SystemInfoResponse) => {
+      if (cancelled) return;
+      const next = toGpuInfo(data, source);
+      setGpu((current) => nextGpuInfo(current, next));
+    };
+    const update = () => {
+      fetchSystemInfo().then((d) => {
+        if (cancelled) return;
+        if (!d) return;
+        // A cache hit publishes no snapshot, so sync here.
+        sync(d);
+      });
+    };
+    const unsubscribe = subscribeSystemInfo(sync, {
+      retryUnavailableVulkan: source === "inference_gpu",
+    });
+    update();
+    return () => {
+      cancelled = true;
+      unsubscribe();
+    };
+  }, [source, enabled]);
   return gpu;
+}
+
+/** `enabled` false reads only the cache, for a consumer mounted long before it is shown. */
+export function useGpuInfo(enabled = true): GpuInfo {
+  return useGpuInfoSource("gpu", enabled);
+}
+
+/** Includes a separately installed Vulkan backend. */
+export function useInferenceGpuInfo(enabled = true): GpuInfo {
+  return useGpuInfoSource("inference_gpu", enabled);
+}
+
+/** Optional engines launch on torch's physical CUDA/ROCm ids (`useGpuDevices(true)`), never a Vulkan ordinal. */
+export function isEngineGpuDevice(device: SystemGpuDevice): boolean {
+  return device.diffusionPinnable;
+}
+
+/** Where the backend puts an optional engine given no GPUs: the first one Studio sees. */
+export function defaultEngineGpuIds(): number[] {
+  const first = toGpuDevices(getCachedSystemInfo(), true).find(
+    isEngineGpuDevice,
+  );
+  return first ? [first.index] : [0];
+}
+
+export function useGpuDevices(forDiffusion = false): SystemGpuDevice[] {
+  const cachedSystem = getCachedSystemInfo();
+  const [devices, setDevices] = useState<SystemGpuDevice[]>(
+    cachedSystem ? toGpuDevices(cachedSystem, forDiffusion) : [],
+  );
+  useEffect(() => {
+    // No early return on cachedSystem: a consumer mounting as the cache fills would stay default.
+    let cancelled = false;
+    let lastSerialized: string | null = null;
+    const sync = (data: SystemInfoResponse | null) => {
+      if (cancelled) return;
+      const next = toGpuDevices(data, forDiffusion);
+      // Compare by value, or the 3s Vulkan retry would re-render forever.
+      const serialized = JSON.stringify(next);
+      if (serialized === lastSerialized) return;
+      lastSerialized = serialized;
+      setDevices(next);
+    };
+    const unsubscribe = subscribeSystemInfo(sync, {
+      retryUnavailableVulkan: true,
+    });
+    fetchSystemInfo().then(sync);
+    return () => {
+      cancelled = true;
+      unsubscribe();
+    };
+  }, [forDiffusion]);
+  return devices;
+}
+
+/** Empty when there is nothing to choose; diffusion checkpoints are never sharded. */
+export function useDiffusionGpuChoices(): SystemGpuDevice[] {
+  const devices = useGpuDevices(true);
+  // Memoized: fresh arrays each render made the GGUF picker re-POST download plans every poll.
+  return useMemo(() => {
+    const context = pinnableGpuContext(devices, true);
+    return (context.ids?.length ?? 0) > 1 ? (context.devices ?? []) : [];
+  }, [devices]);
+}
+
+export function gpuDeviceCacheReady(): boolean {
+  const cachedSystem = getCachedSystemInfo();
+  if (cachedSystem === null) {
+    return false;
+  }
+  const inferenceGpu = cachedSystem.inference_gpu;
+  return !(inferenceGpu?.backend === "vulkan" && !inferenceGpu.available);
+}
+
+export async function ensureGpuDeviceCache(): Promise<void> {
+  await fetchSystemInfo();
+}
+
+/** null before fetch, [] when pinning is unavailable. */
+export function cachedPinnableGpuIndices(
+  forDiffusion = false,
+): number[] | null {
+  return cachedPinnableGpuContext(forDiffusion).ids;
+}
+
+/** undefined before fetch, null when unavailable. */
+export function cachedPinnableGpuIndexKind(
+  forDiffusion = false,
+): GpuIndexKind | null | undefined {
+  return cachedPinnableGpuContext(forDiffusion).indexKind;
+}
+
+/** An unavailable Vulkan probe leaves membership unknown while the namespace stays authoritative. */
+export function cachedPinnableGpuContext(
+  forDiffusion = false,
+  devices?: SystemGpuDevice[],
+): PinnableGpuContext {
+  const cachedSystem = getCachedSystemInfo();
+  const unavailableVulkan =
+    cachedSystem?.inference_gpu?.backend === "vulkan" &&
+    !cachedSystem.inference_gpu.available;
+  return resolveGpuSelectionContext(
+    cachedSystem ? (devices ?? toGpuDevices(cachedSystem)) : null,
+    forDiffusion,
+    unavailableVulkan ? "vulkan" : undefined,
+  );
+}
+
+export function reconcileCachedGpuSelection(
+  ids: number[] | null,
+  savedIndexKind?: GpuIndexKind | null,
+  forDiffusion = false,
+): ReconciledGpuSelection {
+  const context = cachedPinnableGpuContext(forDiffusion);
+  return reconcileGpuSelection(
+    ids,
+    savedIndexKind,
+    context.indexKind,
+    context.ids,
+  );
 }

@@ -1,12 +1,7 @@
-# Model defaults for unsloth/Ministral-3-3B-Instruct-2512
-# Based on Ministral_3_VL_(3B)_Vision.ipynb
 # Also applies to: unsloth/Ministral-3-3B-Instruct-2512
-# added inference parameters from unsloth guides
 
 training:
-  trust_remote_code: false
   max_seq_length: 2048
-  # num_epochs: 4
   num_epochs: 0
   learning_rate: 2e-4
   batch_size: 4
@@ -36,6 +31,7 @@ lora:
     - "down_proj"
   use_rslora: false
   use_loftq: false
+  use_dora: false
   finetune_vision_layers: true
   finetune_language_layers: true
   finetune_attention_modules: true
@@ -49,7 +45,6 @@ logging:
   log_frequency: 10
 
 inference:
-  trust_remote_code: false
   temperature: 0.15
   top_p: 0.95
 

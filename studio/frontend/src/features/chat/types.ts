@@ -4,17 +4,62 @@
 export type ModelType = "base" | "lora" | "model1" | "model2";
 
 export type ChatView =
-  | { mode: "single"; threadId?: string; newThreadNonce?: string }
-  | { mode: "compare"; pairId: string };
+  | {
+      mode: "project";
+      projectId: string;
+    }
+  | {
+      mode: "single";
+      threadId?: string;
+      newThreadNonce?: string;
+      projectId?: string | null;
+    }
+  | { mode: "compare"; pairId: string; projectId?: string | null };
+
+export interface ProjectRecord {
+  id: string;
+  name: string;
+  instructions?: string;
+  mcpServerIds?: string[] | null;
+  rootPath?: string | null;
+  sandboxPath?: string | null;
+  workingFolder?: string | null;
+  workingFolderStatus?: "ok" | "missing" | "replaced" | null;
+  workingFolderDisplay?: string | null;
+  workingFolderBranch?: string | null;
+  archived: boolean;
+  createdAt: number;
+  updatedAt: number;
+  lastActivityAt?: number | null;
+}
 
 export interface ThreadRecord {
   id: string;
   title: string;
   modelType: ModelType;
   modelId?: string;
+  modelGgufVariant?: string | null;
   pairId?: string;
+  projectId?: string | null;
   archived: boolean;
   createdAt: number;
+  updatedAt?: number;
+  /** OpenAI shell container from a prior response; cleared on `container_invalidated`. */
+  openaiCodeExecContainerId?: string | null;
+  /** Anthropic code_execution container from a prior response; cleared on `container_invalidated`. */
+  anthropicCodeExecContainerId?: string | null;
+  forkedFromThreadId?: string | null;
+  forkedFromMessageId?: string | null;
+  /** Null on forks made before the column existed, which show no divider. */
+  forkBoundaryMessageId?: string | null;
+  forkTitleBase?: string | null;
+  modifiedAt?: number | null;
+  /** The scheduled task whose run made this chat (server-set). */
+  scheduledTaskId?: string | null;
+  /** this chat's own settings, applied when it is opened; absent means the global ones. */
+  settings?:
+    | import("./utils/thread-scoped-settings").ThreadScopedSettings
+    | null;
 }
 
 export interface MessageRecord {
@@ -26,4 +71,13 @@ export interface MessageRecord {
   attachments?: import("@assistant-ui/react").ThreadMessage["attachments"];
   metadata?: Record<string, unknown>;
   createdAt: number;
+}
+
+export interface ParsedConversation {
+  title: string;
+  threadId: string;
+  messages: MessageRecord[];
+  archived?: boolean;
+  createdAt?: number;
+  thread?: Partial<Omit<ThreadRecord, "id" | "title" | "archived">>;
 }

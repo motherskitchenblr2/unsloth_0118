@@ -1,12 +1,7 @@
-# Model defaults for unsloth/Qwen3-4B-Thinking-2507
-# Based on Qwen3_(4B)-Thinking.ipynb
 # Also applies to: unsloth/Qwen3-4B-Thinking-2507-unsloth-bnb-4bit, Qwen/Qwen3-4B-Thinking-2507, unsloth/Qwen3-4B-Thinking-2507-bnb-4bit, Qwen/Qwen3-4B-Thinking-2507-FP8, unsloth/Qwen3-4B-Thinking-2507-FP8
-# added inference parameters from unsloth guides
 
 training:
-  trust_remote_code: false
   max_seq_length: 2048
-  # num_epochs: 4
   num_epochs: 0
   learning_rate: 2e-4
   batch_size: 2
@@ -36,6 +31,7 @@ lora:
     - "down_proj"
   use_rslora: false
   use_loftq: false
+  use_dora: false
 
 logging:
   enable_wandb: false
@@ -45,7 +41,6 @@ logging:
   log_frequency: 10
 
 inference:
-  trust_remote_code: false
   temperature: 0.6
   top_p: 0.95
   top_k: 20
