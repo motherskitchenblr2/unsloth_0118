@@ -1,12 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
-"""
-Model and template mappings for dataset processing.
-
-This module contains the mapping dictionaries that associate model names
-with their corresponding chat templates and response markers.
-"""
+"""Maps model names to chat templates and response markers for dataset processing."""
 
 TEMPLATE_TO_MODEL_MAPPER = {
     "phi-3.5": (
@@ -37,14 +32,6 @@ TEMPLATE_TO_MODEL_MAPPER = {
         "unsloth/phi-4-reasoning-plus",
         "microsoft/Phi-4-reasoning-plus",
         "unsloth/phi-4-reasoning-plus-bnb-4bit",
-        "unsloth/phi-4-mini-reasoning-unsloth-bnb-4bit",
-        "unsloth/phi-4-mini-reasoning",
-        "microsoft/Phi-4-mini-reasoning",
-        "unsloth/phi-4-mini-reasoning-bnb-4bit",
-        "unsloth/Phi-4-mini-instruct-unsloth-bnb-4bit",
-        "unsloth/Phi-4-mini-instruct",
-        "microsoft/Phi-4-mini-instruct",
-        "unsloth/Phi-4-mini-instruct-bnb-4bit",
     ),
     "mistral": (
         "unsloth/mistral-7b-instruct-v0.1-bnb-4bit",
@@ -369,8 +356,13 @@ TEMPLATE_TO_MODEL_MAPPER = {
         "unsloth/Qwen3.5-0.8B",
         "unsloth/Qwen3.5-2B",
         "unsloth/Qwen3.5-4B",
+        "unsloth/Qwen3.5-9B",
         "unsloth/Qwen3.5-27B",
         "unsloth/Qwen3.5-35B-A3B",
+        "Qwen/Qwen3.6-35B-A3B",
+        "unsloth/Qwen3.6-35B-A3B",
+        "Qwen/Qwen3.6-27B",
+        "unsloth/Qwen3.6-27B",
     ),
     "zephyr": (
         "unsloth/zephyr-sft-bnb-4bit",
@@ -431,10 +423,26 @@ for key, values in TEMPLATE_TO_MODEL_MAPPER.items():
     for value in values:
         MODEL_TO_TEMPLATE_MAPPER[value] = key
 
-    # Get lowercased
+    # Also map lowercased names.
     lowered_key = key.lower()
     for value in values:
         MODEL_TO_TEMPLATE_MAPPER[value.lower()] = lowered_key
+
+
+def is_gpt_oss_model_name(name: str) -> bool:
+    """Name-only check, so the in-process backend and orchestrator detect harmony models without IPC."""
+    name = (name or "").lower()
+    if not name:
+        return False
+    try:
+        if MODEL_TO_TEMPLATE_MAPPER.get(name) == "gpt-oss":
+            return True
+        for key, tmpl in MODEL_TO_TEMPLATE_MAPPER.items():
+            if tmpl == "gpt-oss" and (key in name or name in key):
+                return True
+    except Exception:
+        pass
+    return "gpt-oss" in name
 
 
 TEMPLATE_TO_RESPONSES_MAPPER = {
@@ -462,9 +470,10 @@ TEMPLATE_TO_RESPONSES_MAPPER = {
         "instruction": "<|im_start|>user\n",
         "response": "<|im_start|>assistant\n",
     },
+    # No <think> suffix: Qwen3-Thinking-2507 strips it from non-final turns and QwQ renders none, so a marker with it masks those responses.
     "qwen3-thinking": {
         "instruction": "<|im_start|>user\n",
-        "response": "<|im_start|>assistant\n<think>\n",
+        "response": "<|im_start|>assistant\n",
     },
     "qwen3": {
         "instruction": "<|im_start|>user\n",
@@ -502,29 +511,32 @@ TEMPLATE_TO_RESPONSES_MAPPER = {
         "instruction": "<|im_start|>user<|im_sep|>",
         "response": "<|im_start|>assistant<|im_sep|>",
     },
+    # No padding: [INST] and [/INST] are single special tokens, so padded markers never match and everything masks.
     "mistral": {
-        "instruction": "[INST] ",
-        "response": " [/INST]",
+        "instruction": "[INST]",
+        "response": "[/INST]",
     },
     "llama": {
-        "instruction": "[INST] ",
-        "response": " [/INST]",
+        # Anchored on <s>: transformers 5.x tokenizes [INST] after <s> as a bare "[".
+        "instruction": "<s>[INST]",
+        "response": "[/INST]",
     },
     "chatml": {
         "instruction": "<|im_start|>user\n",
         "response": "<|im_start|>assistant\n",
     },
+    # Leading newline required: Zephyr's role tags are plain text
     "zephyr": {
-        "instruction": "<|user|>\n",
-        "response": "<|assistant|>\n",
+        "instruction": "\n<|user|>\n",
+        "response": "\n<|assistant|>\n",
     },
     "unsloth": {
-        "instruction": ">>> User: ",
-        "response": ">>> Assistant: ",
+        "instruction": ">>> User:",
+        "response": ">>> Assistant:",
     },
     "vicuna": {
-        "instruction": "USER: ",
-        "response": "ASSISTANT: ",
+        "instruction": "USER:",
+        "response": "ASSISTANT:",
     },
     "alpaca": {
         "instruction": "### Instruction:\n",
@@ -550,16 +562,18 @@ TEMPLATE_TO_RESPONSES_MAPPER = {
         "instruction": "<|im_start|>user\n",
         "response": "<|im_start|>assistant\n",
     },
+    # No trailing space: SentencePiece folds it into the next token, so it never matches.
     "starling": {
-        "instruction": "GPT4 Correct User: ",
-        "response": "GPT4 Correct Assistant: ",
+        "instruction": "GPT4 Correct User:",
+        "response": "GPT4 Correct Assistant:",
     },
     "yi-chat": {
         "instruction": "<|im_start|>user\n",
         "response": "<|im_start|>assistant\n",
     },
+    # GLM renders "<think>" as a lone "</think>" on non-final turns, so it is omitted.
     "glm": {
-        "instruction": "[gMASK]<sop><|user|>",
-        "response": "<|assistant|><think>",
+        "instruction": "<|user|>",
+        "response": "<|assistant|>",
     },
 }

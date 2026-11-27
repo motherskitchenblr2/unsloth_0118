@@ -1,17 +1,19 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
 set -euo pipefail
+
+# Releases must use `./build.sh publish` (or stamp -> build -> verify-dist -> upload) so
+# artifacts carry the display-only release version.
 
 # 1. Build frontend (Vite outputs to dist/)
 cd studio/frontend
 
-# Clean stale dist to force a full rebuild
 rm -rf dist
 
-# Tailwind v4's oxide scanner respects .gitignore in parent directories.
-# Python venvs create a .gitignore with "*" (ignore everything), which
-# prevents Tailwind from scanning .tsx source files for class names.
-# Temporarily hide any such .gitignore during the build, then restore it.
+# Tailwind v4's oxide scanner honours parent .gitignore files, and a venv's "*" .gitignore
+# hides the .tsx sources; hide them during the build.
 _HIDDEN_GITIGNORES=()
 _dir="$(pwd)"
 while [ "$_dir" != "/" ]; do
@@ -29,10 +31,16 @@ _restore_gitignores() {
 }
 trap _restore_gitignores EXIT
 
-# Use bun for install if available (faster), fall back to npm.
+# UNSLOTH_NPM_REGISTRY overrides frontend/.npmrc's registry for corporate mirrors.
+_NPM_REGISTRY_ARGS=()
+if [ -n "${UNSLOTH_NPM_REGISTRY:-}" ]; then
+    _NPM_REGISTRY_ARGS=(--registry "$UNSLOTH_NPM_REGISTRY")
+fi
+
+# package-lock.json always wins (`npm ci`); bun only without one, since bun.lock is gitignored.
 _install_ok=false
-if command -v bun &>/dev/null; then
-    if bun install; then
+if [ ! -f package-lock.json ] && [ -f bun.lock ] && command -v bun &>/dev/null; then
+    if bun install --frozen-lockfile "${_NPM_REGISTRY_ARGS[@]+"${_NPM_REGISTRY_ARGS[@]}"}"; then
         _install_ok=true
     else
         echo "⚠ bun install failed, falling back to npm"
@@ -40,17 +48,21 @@ if command -v bun &>/dev/null; then
     fi
 fi
 if [ "$_install_ok" != "true" ]; then
-    if ! npm install; then
+    _npm_install=install
+    [ -f package-lock.json ] && _npm_install=ci
+    if ! npm "$_npm_install" "${_NPM_REGISTRY_ARGS[@]+"${_NPM_REGISTRY_ARGS[@]}"}"; then
         echo "❌ ERROR: package install failed" >&2
+        echo "   If you are behind a corporate firewall/proxy, set UNSLOTH_NPM_REGISTRY to your mirror and retry, e.g.:" >&2
+        echo "   UNSLOTH_NPM_REGISTRY=https://your-mirror.example/api/npm/ ./build.sh" >&2
         exit 1
     fi
 fi
-npm run build       # outputs to studio/frontend/dist/
+npm run build
 
 _restore_gitignores
 trap - EXIT
 
-# Validate CSS output -- catch truncated Tailwind builds before packaging
+# Catch truncated Tailwind builds before packaging.
 MAX_CSS_SIZE=$(find dist/assets -name '*.css' -exec wc -c {} + 2>/dev/null | sort -n | tail -1 | awk '{print $1}')
 if [ -z "$MAX_CSS_SIZE" ]; then
     echo "❌ ERROR: No CSS files were emitted into dist/assets."
@@ -70,10 +82,34 @@ cd ../..
 # 2. Clean old artifacts
 rm -rf build dist *.egg-info
 
-# 3. Build wheel
+# 3. Stamp display-only Unsloth release metadata for packaged builds.
+_STUDIO_BUILD_INFO="studio/backend/utils/_studio_release_build.py"
+_STUDIO_BUILD_INFO_BACKUP="$(mktemp)"
+cp "$_STUDIO_BUILD_INFO" "$_STUDIO_BUILD_INFO_BACKUP"
+_restore_studio_build_info() {
+    cp "$_STUDIO_BUILD_INFO_BACKUP" "$_STUDIO_BUILD_INFO" 2>/dev/null || true
+    rm -f "$_STUDIO_BUILD_INFO_BACKUP"
+}
+trap _restore_studio_build_info EXIT
+
+if [ "${1:-}" = "publish" ]; then
+    STUDIO_STAMPED_VERSION="$(python scripts/stamp_studio_release.py --require-release)"
+else
+    STUDIO_STAMPED_VERSION="$(python scripts/stamp_studio_release.py)"
+fi
+
+# 4. Build wheel/sdist.
 python -m build
 
-# 4. Optionally publish
 if [ "${1:-}" = "publish" ]; then
-    python -m twine upload dist/*
+    python scripts/stamp_studio_release.py --verify-dist dist --expected "$STUDIO_STAMPED_VERSION"
+fi
+
+_restore_studio_build_info
+trap - EXIT
+
+# 5. Optionally publish. Wheel only: the sdist is still built for --verify-dist, but the
+# py3-none-any wheel covers every installer and halves the size against PyPI's limit.
+if [ "${1:-}" = "publish" ]; then
+    python -m twine upload dist/*.whl
 fi

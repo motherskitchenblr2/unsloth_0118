@@ -1,11 +1,8 @@
 # Copyright 2023-present Daniel Han-Chen & the Unsloth team. All rights reserved.
-#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
-#
 #     http://www.apache.org/licenses/LICENSE-2.0
-#
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -21,7 +18,7 @@ from .utils import (
     torch_gpu_device,
 )
 
-# signed int32 max is 2**31-1 so num_elements cannot exceed 2**31
+# signed int32 max is 2**31-1, so num_elements cannot exceed 2**31.
 NUM_INT32_ELEMENTS = 2**31
 SAFE_INT32_BUFFER_MULTIPLIER = 4
 BLOCK_SIZE = 1024
@@ -34,29 +31,25 @@ def _exact_forward_kernel(
     g,
     h,
     n_elements,
-    BLOCK_SIZE: tl.constexpr,
-    LONG_INDEXING: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,  # elements per program
+    LONG_INDEXING: tl.constexpr,  # int64 offsets past 2**31
 ):
     block_idx = tl.program_id(0)
     if LONG_INDEXING:
-        offsets = block_idx.to(tl.int64) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE).to(
-            tl.int64
-        )
+        offsets = block_idx.to(tl.int64) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE).to(tl.int64)
         n_elements = tl.cast(n_elements, tl.int64)
     else:
         offsets = block_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = offsets < n_elements
 
-    # f = 1/2 * e * (1 + erf(1/sqrt(2) * e))
-    # h = f * up
+    # f = 1/2 * e * (1 + erf(1/sqrt(2) * e)), h = f * up.
     e_row = tl.load(e + offsets, mask = mask, other = 0).to(tl.float32)
-    g_row = tl.load(g + offsets, mask = mask, other = 0)  # .to(tl.float32)
+    g_row = tl.load(g + offsets, mask = mask, other = 0)
 
     f_row = 0.5 * e_row * (tl.math.erf(tl.math.rsqrt(2.0) * e_row) + 1.0)
     f_row = f_row.to(g_row.dtype)  # Exact copy from HF
     h_row = f_row * g_row
 
-    # Store h
     tl.store(h + offsets, h_row, mask = mask)
 
 
@@ -74,6 +67,7 @@ def geglu_exact_forward_kernel(gate, up):
             n_elements,
             BLOCK_SIZE = BLOCK_SIZE,
             LONG_INDEXING = 0 if n_elements <= INT32_SAFETY_BUFFER else 1,
+            enable_fp_fusion = True,
         )
     return out
 
@@ -84,8 +78,8 @@ def _exact_backward_kernel(
     e,
     g,
     n_elements,
-    BLOCK_SIZE: tl.constexpr,
-    LONG_INDEXING: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,  # elements per program
+    LONG_INDEXING: tl.constexpr,  # int64 offsets past 2**31
 ):
     """
     f = 1/2 * e * (1 + erf(1/sqrt(2) * e))
@@ -99,20 +93,17 @@ def _exact_backward_kernel(
     """
     block_idx = tl.program_id(0)
     if LONG_INDEXING:
-        offsets = block_idx.to(tl.int64) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE).to(
-            tl.int64
-        )
+        offsets = block_idx.to(tl.int64) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE).to(tl.int64)
         n_elements = tl.cast(n_elements, tl.int64)
     else:
         offsets = block_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = offsets < n_elements
 
-    DW_row = tl.load(DW + offsets, mask = mask, other = 0)  # .to(tl.float32)
+    DW_row = tl.load(DW + offsets, mask = mask, other = 0)
     e_row = tl.load(e + offsets, mask = mask, other = 0).to(tl.float32)
-    g_row = tl.load(g + offsets, mask = mask, other = 0)  # .to(tl.float32)
+    g_row = tl.load(g + offsets, mask = mask, other = 0)
 
-    # Break e_row away for re-use
-    # f = 1/2 * e * (1 + erf(1/sqrt(2) * e))
+    # Break e_row away for reuse f = 1/2 * e * (1 + erf(1/sqrt(2) * e))
     f_partial_row = 0.5 * (tl.math.erf(tl.math.rsqrt(2.0) * e_row) + 1.0)
     f_row = f_partial_row * e_row
 
@@ -124,17 +115,16 @@ def _exact_backward_kernel(
     # dg = DW * g
     dg_row = DW_row * g_row
 
-    # df/de = 1/2 * (1 + erf(1/sqrt(2) * e)) + 1/sqrt(2*pi) * e * exp(-1/2 * e^2)
-    t = 0.3989422804014327  # 1/sqrt(2*pi)
+    # df/de = 1/2 * (1 + erf(1/sqrt(2) * e)) + 1/sqrt(2*pi) * e * exp(-1/2 * e^2).
+    t = 0.3989422804014327
     df_de = f_partial_row + t * e_row * tl.exp(-0.5 * e_row * e_row)
 
     de_row = dg_row.to(tl.float32) * df_de
     de_row = de_row.to(DW_row.dtype)
 
-    # Store derivatives in buffers
-    tl.store(DW + offsets, h_row, mask = mask)  # h  = f * g
-    tl.store(e + offsets, df_row, mask = mask)  # df = DW * f
-    tl.store(g + offsets, de_row, mask = mask)  # de
+    tl.store(DW + offsets, h_row, mask = mask)
+    tl.store(e + offsets, df_row, mask = mask)
+    tl.store(g + offsets, de_row, mask = mask)
 
 
 def geglu_exact_backward_kernel(DW, e, g):
@@ -149,6 +139,7 @@ def geglu_exact_backward_kernel(DW, e, g):
             n_elements,
             BLOCK_SIZE = BLOCK_SIZE,
             LONG_INDEXING = 0 if n_elements <= INT32_SAFETY_BUFFER else 1,
+            enable_fp_fusion = True,
         )
     return DW, e, g
 
@@ -159,34 +150,27 @@ def _approx_forward_kernel(
     g,
     h,
     n_elements,
-    BLOCK_SIZE: tl.constexpr,
-    LONG_INDEXING: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,  # elements per program
+    LONG_INDEXING: tl.constexpr,  # int64 offsets past 2**31
 ):
     block_idx = tl.program_id(0)
     if LONG_INDEXING:
-        offsets = block_idx.to(tl.int64) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE).to(
-            tl.int64
-        )
+        offsets = block_idx.to(tl.int64) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE).to(tl.int64)
         n_elements = tl.cast(n_elements, tl.int64)
     else:
         offsets = block_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = offsets < n_elements
 
-    # f = 1/2 * e * (1 + tanh( sqrt(2/pi) * (x + 0.044715 * x^3 ) ))
-    # f = 1/2 * e * (1 + tanh( sqrt(2/pi) * x * (1 + 0.044715 * x^2 ) ))
-    # h = f * up
-    s = 0.7978845608028654  # math.sqrt(2 / math.pi)
+    # f = 1/2 * e * (1 + tanh(sqrt(2/pi) * x * (1 + 0.044715 * x^2))), h = f * up.
+    s = 0.7978845608028654
 
     e_row = tl.load(e + offsets, mask = mask, other = 0).to(tl.float32)
-    g_row = tl.load(g + offsets, mask = mask, other = 0)  # .to(tl.float32)
+    g_row = tl.load(g + offsets, mask = mask, other = 0)
 
-    f_row = (
-        0.5 * e_row * (triton_tanh(s * e_row * (1.0 + 0.044715 * e_row * e_row)) + 1.0)
-    )
+    f_row = 0.5 * e_row * (triton_tanh(s * e_row * (1.0 + 0.044715 * e_row * e_row)) + 1.0)
     f_row = f_row.to(g_row.dtype)  # Exact copy from HF
     h_row = f_row * g_row
 
-    # Store h
     tl.store(h + offsets, h_row, mask = mask)
 
 
@@ -204,6 +188,7 @@ def geglu_approx_forward_kernel(gate, up):
             n_elements,
             BLOCK_SIZE = BLOCK_SIZE,
             LONG_INDEXING = 0 if n_elements <= INT32_SAFETY_BUFFER else 1,
+            enable_fp_fusion = True,
         )
     return out
 
@@ -214,8 +199,8 @@ def _approx_backward_kernel(
     e,
     g,
     n_elements,
-    BLOCK_SIZE: tl.constexpr,
-    LONG_INDEXING: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,  # elements per program
+    LONG_INDEXING: tl.constexpr,  # int64 offsets past 2**31
 ):
     """
     f = 1/2 * e * (1 + tanh( sqrt(2/pi) * x * (1 + 0.044715 * x^2 ) ))
@@ -233,27 +218,25 @@ def _approx_backward_kernel(
     """
     block_idx = tl.program_id(0)
     if LONG_INDEXING:
-        offsets = block_idx.to(tl.int64) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE).to(
-            tl.int64
-        )
+        offsets = block_idx.to(tl.int64) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE).to(tl.int64)
         n_elements = tl.cast(n_elements, tl.int64)
     else:
         offsets = block_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = offsets < n_elements
 
-    DW_row = tl.load(DW + offsets, mask = mask, other = 0)  # .to(tl.float32)
+    DW_row = tl.load(DW + offsets, mask = mask, other = 0)
     e_row = tl.load(e + offsets, mask = mask, other = 0).to(tl.float32)
-    g_row = tl.load(g + offsets, mask = mask, other = 0)  # .to(tl.float32)
+    g_row = tl.load(g + offsets, mask = mask, other = 0)
 
-    # See https://www.desmos.com/calculator/nqprfoni6x
-    s = 0.7978845608028654  # math.sqrt(2 / math.pi)
-    a = s * e_row  # a = sqrt(2 / pi) * x
-    b = a * 0.044715 * e_row * e_row  # b = a * 0.044715 * x^2
+    # See desmos.com/calculator/nqprfoni6x
+    s = 0.7978845608028654
+    a = s * e_row
+    b = a * 0.044715 * e_row * e_row
     T = 1.0 + triton_tanh(a + b)
     T2 = 0.5 * T
-    # Q = 0.5 * -T * (T - 2.0) * (a + 3.0 * b)
+    # Q = 0.5 * -T * (T - 2.0) * (a + 3.0 * b), where a = sqrt(2/pi) * x and b = a * 0.044715 * x^2.
     Q2 = -T2 * (T - 2.0) * (a + 3.0 * b)
-    df_de = T2 + Q2  # 1/2 * (T + Q)
+    df_de = T2 + Q2
 
     # f = 1/2 * e * (1 + tanh( sqrt(2/pi) * (x + 0.044715 * x^3 ) ))
     f_row = T2 * e_row
@@ -268,10 +251,9 @@ def _approx_backward_kernel(
     de_row = dg_row.to(tl.float32) * df_de
     de_row = de_row.to(DW_row.dtype)
 
-    # Store derivatives in buffers
-    tl.store(DW + offsets, h_row, mask = mask)  # h  = f * g
-    tl.store(e + offsets, df_row, mask = mask)  # df = DW * f
-    tl.store(g + offsets, de_row, mask = mask)  # de
+    tl.store(DW + offsets, h_row, mask = mask)
+    tl.store(e + offsets, df_row, mask = mask)
+    tl.store(g + offsets, de_row, mask = mask)
 
 
 def geglu_approx_backward_kernel(DW, e, g):
@@ -286,5 +268,6 @@ def geglu_approx_backward_kernel(DW, e, g):
             n_elements,
             BLOCK_SIZE = BLOCK_SIZE,
             LONG_INDEXING = 0 if n_elements <= INT32_SAFETY_BUFFER else 1,
+            enable_fp_fusion = True,
         )
     return DW, e, g

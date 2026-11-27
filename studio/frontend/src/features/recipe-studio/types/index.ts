@@ -22,13 +22,15 @@ export type ValidatorCodeLang =
   | "jsx"
   | "tsx"
   | "python"
+  | "json"
+  | "markdown"
   | "sql:sqlite"
   | "sql:postgres"
   | "sql:mysql"
   | "sql:tsql"
   | "sql:bigquery"
   | "sql:ansi";
-export type ValidatorType = "code" | "oxc";
+export type ValidatorType = "code" | "oxc" | "json" | "markdown";
 export type OxcValidationMode = "syntax" | "lint" | "syntax+lint";
 export type OxcCodeShape = "auto" | "module" | "snippet";
 
@@ -38,7 +40,10 @@ export type LayoutDirection = "LR" | "TB";
 
 export type SeedSamplingStrategy = "ordered" | "shuffle";
 export type SeedSelectionType = "none" | "index_range" | "partition_block";
-export type SeedSourceType = "hf" | "local" | "unstructured";
+export type SeedSourceType = "hf" | "local" | "unstructured" | "github_repo";
+
+export type GithubItemType = "issues" | "pulls" | "commits";
+export type GithubStateFilter = "all" | "open" | "closed";
 export const INFRA_NODE_KINDS = new Set([
   "model_provider",
   "model_config",
@@ -65,6 +70,8 @@ export type RecipeNodeData = {
     | "validator_python"
     | "validator_sql"
     | "validator_oxc"
+    | "validator_json"
+    | "validator_markdown"
     | "expression"
     | "seed"
     | "markdown_note"
@@ -88,7 +95,6 @@ export type CategoryConditionalParams = {
 export type SamplerConfig = {
   id: string;
   kind: "sampler";
-  // ui-only
   advancedOpen?: boolean;
   // biome-ignore lint/style/useNamingConvention: api schema
   sampler_type: SamplerType;
@@ -148,7 +154,7 @@ export type Score = {
   options: ScoreOption[];
 };
 
-export type McpProviderType = "stdio" | "streamable_http";
+export type McpProviderType = "stdio" | "sse" | "streamable_http";
 
 export type McpEnvVar = {
   key: string;
@@ -210,7 +216,6 @@ export type LlmTraceType = "none" | "last_message" | "all_messages";
 export type LlmConfig = {
   id: string;
   kind: "llm";
-  // ui-only
   advancedOpen?: boolean;
   // biome-ignore lint/style/useNamingConvention: api schema
   llm_type: LlmType;
@@ -228,7 +233,7 @@ export type LlmConfig = {
   // biome-ignore lint/style/useNamingConvention: api schema
   tool_alias?: string;
   scores?: Score[];
-  // ui-only, serialized into multi_modal_context for DataDesigner
+  // ui-only, serialized into multi_modal_context
   // biome-ignore lint/style/useNamingConvention: ui schema
   image_context?: LlmImageContextConfig;
   // biome-ignore lint/style/useNamingConvention: api schema
@@ -261,6 +266,8 @@ export type ModelConfig = {
   kind: "model_config";
   name: string;
   model: string;
+  // biome-ignore lint/style/useNamingConvention: api schema
+  gguf_variant?: string;
   provider: string;
   // biome-ignore lint/style/useNamingConvention: api schema
   inference_temperature?: string;
@@ -288,21 +295,17 @@ export type ExpressionConfig = {
 export type ValidatorConfig = {
   id: string;
   kind: "validator";
-  // ui-only
   advancedOpen?: boolean;
   name: string;
   drop?: boolean;
   // biome-ignore lint/style/useNamingConvention: api schema
   target_columns: string[];
-  // ui-only
   validator_type: ValidatorType;
   // biome-ignore lint/style/useNamingConvention: api schema
   code_lang: ValidatorCodeLang;
-  // ui-only (used for OXC validators)
   oxc_validation_mode: OxcValidationMode;
-  // ui-only (used for OXC validators)
   oxc_code_shape: OxcCodeShape;
-  // ui ergonomics (serialized to int in payload)
+  // serialized to int in payload
   batch_size: string;
 };
 
@@ -311,23 +314,19 @@ export type MarkdownNoteConfig = {
   kind: "markdown_note";
   name: string;
   markdown: string;
-  // ui-only
   note_color?: string;
-  // ui-only (0-100 as string for slider/input ergonomics)
+  // ui-only, 0-100 as a string
   note_opacity?: string;
 };
 
 export type SeedConfig = {
   id: string;
   kind: "seed";
-  // ui-only
   advancedOpen?: boolean;
   name: string;
   drop?: boolean;
-  // ui-only: explicit per-column drop for structured seed sources (hf/local)
   seed_drop_columns?: string[];
   seed_source_type: SeedSourceType;
-  // ui-only (serialized in seed_config)
   hf_repo_id: string;
   hf_subset?: string;
   hf_split?: string;
@@ -335,18 +334,33 @@ export type SeedConfig = {
   hf_token?: string;
   hf_endpoint?: string;
   local_file_name?: string;
+  // Stable per-block upload id, since node ids collide across imports.
+  unstructured_upload_uid?: string;
   unstructured_file_ids?: string[];
   unstructured_file_names?: string[];
   unstructured_file_sizes?: number[];
+  // biome-ignore lint/style/useNamingConvention: api schema
+  github_repo_slug?: string;
+  // biome-ignore lint/style/useNamingConvention: api schema
+  github_token?: string;
+  // biome-ignore lint/style/useNamingConvention: api schema
+  github_limit?: string;
+  // biome-ignore lint/style/useNamingConvention: api schema
+  github_item_types?: GithubItemType[];
+  // biome-ignore lint/style/useNamingConvention: api schema
+  github_state?: GithubStateFilter;
+  // biome-ignore lint/style/useNamingConvention: api schema
+  github_include_comments?: boolean;
+  // biome-ignore lint/style/useNamingConvention: api schema
+  github_max_comments_per_item?: string;
   resolved_paths?: string[];
-  // ui-only
   seed_preview_rows?: Record<string, unknown>[];
+  // ui-only
+  seed_total_rows?: number;
   // ui-only (string for input ergonomics)
   unstructured_chunk_size?: string;
-  // ui-only (string for input ergonomics)
   unstructured_chunk_overlap?: string;
   seed_splits?: string[];
-  // ui-only
   // biome-ignore lint/style/useNamingConvention: ui schema
   seed_globs_by_split?: Record<string, string>;
   seed_columns?: string[];

@@ -4,6 +4,7 @@
 import { MarkdownPreview } from "@/components/markdown/markdown-preview";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Spinner } from "@/components/ui/spinner";
 import { cn } from "@/lib/utils";
 import {
   BalanceScaleIcon,
@@ -30,12 +31,13 @@ import {
   Position,
   useUpdateNodeInternals,
 } from "@xyflow/react";
-import { type ReactElement, memo, useEffect, useMemo } from "react";
+import { type ReactElement, memo, useEffect } from "react";
 import {
   MAX_NODE_WIDTH,
   MAX_NOTE_NODE_WIDTH,
   MIN_NODE_WIDTH,
 } from "../constants";
+import { useLocalProviderNames } from "../hooks/use-local-provider-names";
 import { useNodeConnectionStatus } from "../hooks/use-node-connection-status";
 import { useRecipeStudioStore } from "../stores/recipe-studio";
 import type {
@@ -337,7 +339,7 @@ function renderNodeBody(
               <Badge
                 key={providerName}
                 variant="secondary"
-                className="corner-squircle font-mono text-[11px]"
+                className="corner-squircle font-mono text-ui-11"
               >
                 {providerName}
               </Badge>
@@ -362,16 +364,7 @@ function RecipeGraphNodeBase({
   const config = useRecipeStudioStore((state) => state.configs[id]);
   const openConfig = useRecipeStudioStore((state) => state.openConfig);
   const updateConfig = useRecipeStudioStore((state) => state.updateConfig);
-  const allConfigs = useRecipeStudioStore((state) => state.configs);
-  const localProviderNames = useMemo(() => {
-    const names = new Set<string>();
-    for (const cfg of Object.values(allConfigs)) {
-      if (cfg.kind === "model_provider" && cfg.is_local === true) {
-        names.add(cfg.name);
-      }
-    }
-    return names;
-  }, [allConfigs]);
+  const localProviderNames = useLocalProviderNames();
   const llmAuxVisible = useRecipeStudioStore(
     (state) => state.llmAuxVisibility[id] ?? false,
   );
@@ -399,7 +392,7 @@ function RecipeGraphNodeBase({
 
     return (
       <BaseNode
-        className="corner-squircle relative w-full min-w-0 overflow-visible rounded-lg border-border/60 shadow-sm"
+        className="corner-squircle relative w-full min-w-0 overflow-visible rounded-xl border-border/60 shadow-sm"
         style={noteStyle}
       >
         <NodeResizer
@@ -454,7 +447,7 @@ function RecipeGraphNodeBase({
       : meta.tone;
   const runtimeNodeTone =
     runtimeState === "running"
-      ? "border-primary/70 ring-2 ring-primary/20 shadow-md"
+      ? "border-ring-strong shadow-md"
       : runtimeState === "done"
         ? "border-emerald-500/60 ring-1 ring-emerald-500/20"
         : "";
@@ -465,7 +458,7 @@ function RecipeGraphNodeBase({
   return (
     <BaseNode
       className={cn(
-        "corner-squircle relative w-full min-w-0 overflow-visible rounded-lg border-border/60 shadow-sm",
+        "corner-squircle relative w-full min-w-0 overflow-visible rounded-xl border-border/60 shadow-sm",
         runtimeNodeTone,
         hasConnectionIssue &&
           runtimeState === "idle" &&
@@ -473,11 +466,8 @@ function RecipeGraphNodeBase({
       )}
     >
       {runtimeState === "running" && config?.kind === "llm" && (
-        <div className="pointer-events-none absolute -top-7 right-2 z-20">
-          <span
-            className="block size-6 animate-spin rounded-full border-[3px] border-primary/90 border-t-transparent bg-background"
-            aria-label="Running"
-          />
+        <div className="pointer-events-none absolute -top-7 right-2 z-20 rounded-full bg-background">
+          <Spinner className="size-6 text-primary/90" />
         </div>
       )}
       <NodeResizer
@@ -496,7 +486,7 @@ function RecipeGraphNodeBase({
         <div className="flex min-w-0 items-center gap-2">
           <div
             className={cn(
-              "corner-squircle flex size-7 items-center justify-center rounded-md border",
+              "corner-squircle flex size-7 items-center justify-center rounded-sm border",
               iconTone,
             )}
           >
@@ -506,7 +496,7 @@ function RecipeGraphNodeBase({
             <BaseNodeHeaderTitle className="truncate text-sm">
               {data.name}
             </BaseNodeHeaderTitle>
-            <p className="truncate text-[11px] text-muted-foreground">
+            <p className="truncate text-ui-11 text-muted-foreground">
               {data.subtype} · {data.title}
             </p>
           </div>

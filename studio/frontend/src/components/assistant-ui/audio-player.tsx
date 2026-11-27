@@ -4,14 +4,23 @@
 "use client";
 
 import { Button } from "@/components/ui/button";
-import { DownloadIcon, PauseIcon, PlayIcon } from "lucide-react";
+import { downloadUrl, isDownloadCancelled } from "@/lib/native-files";
+import { toast } from "@/lib/toast";
+import { Download01Icon } from "@hugeicons/core-free-icons";
+import { PauseIcon } from "@/lib/media-control-icons";
+import { HugeiconsIcon } from "@hugeicons/react";
+import { PlayIcon } from "lucide-react";
 import { type FC, useRef, useState } from "react";
 
 interface AudioPlayerProps {
   src: string;
+  filename?: string;
 }
 
-export const AudioPlayer: FC<AudioPlayerProps> = ({ src }) => {
+export const AudioPlayer: FC<AudioPlayerProps> = ({
+  src,
+  filename = "generated-audio.wav",
+}) => {
   const audioRef = useRef<HTMLAudioElement>(null);
   const [isPlaying, setIsPlaying] = useState(false);
   const [progress, setProgress] = useState(0);
@@ -22,10 +31,14 @@ export const AudioPlayer: FC<AudioPlayerProps> = ({ src }) => {
     if (!audio) return;
     if (isPlaying) {
       audio.pause();
-    } else {
-      audio.play();
+      setIsPlaying(false);
+      return;
     }
-    setIsPlaying(!isPlaying);
+    // The file may carry a codec the webview cannot decode, so flip only once playback starts.
+    audio.play().then(
+      () => setIsPlaying(true),
+      () => setIsPlaying(false),
+    );
   };
 
   const handleTimeUpdate = () => {
@@ -54,10 +67,11 @@ export const AudioPlayer: FC<AudioPlayerProps> = ({ src }) => {
   };
 
   const handleDownload = () => {
-    const link = document.createElement("a");
-    link.href = src;
-    link.download = "generated-audio.wav";
-    link.click();
+    void downloadUrl(src, filename).catch((error) => {
+      if (!isDownloadCancelled(error)) {
+        toast.error("Could not save audio.");
+      }
+    });
   };
 
   const formatTime = (t: number) => {
@@ -67,13 +81,14 @@ export const AudioPlayer: FC<AudioPlayerProps> = ({ src }) => {
   };
 
   return (
-    <div className="my-2 flex max-w-md items-center gap-3 rounded-xl border bg-muted/50 px-4 py-3">
+    <div className="my-2 flex max-w-md items-center gap-3 rounded-lg border bg-muted/50 px-4 py-3">
       <audio
         ref={audioRef}
         src={src}
         onTimeUpdate={handleTimeUpdate}
         onLoadedMetadata={handleLoadedMetadata}
         onEnded={handleEnded}
+        onError={() => setIsPlaying(false)}
         preload="metadata"
       />
       <Button
@@ -83,7 +98,7 @@ export const AudioPlayer: FC<AudioPlayerProps> = ({ src }) => {
         onClick={togglePlay}
       >
         {isPlaying ? (
-          <PauseIcon className="size-4" />
+          <HugeiconsIcon icon={PauseIcon} className="size-4" />
         ) : (
           <PlayIcon className="size-4" />
         )}
@@ -96,9 +111,13 @@ export const AudioPlayer: FC<AudioPlayerProps> = ({ src }) => {
           step={0.01}
           value={progress}
           onChange={handleSeek}
-          className="h-1.5 w-full cursor-pointer accent-primary"
+          className="native-range w-full"
+          style={{
+            ["--range-ratio" as string]:
+              duration > 0 ? Math.min(1, progress / duration) : 0,
+          }}
         />
-        <div className="flex justify-between text-[10px] text-muted-foreground">
+        <div className="flex justify-between text-ui-10 text-muted-foreground">
           <span>{formatTime(progress)}</span>
           <span>{formatTime(duration)}</span>
         </div>
@@ -110,7 +129,7 @@ export const AudioPlayer: FC<AudioPlayerProps> = ({ src }) => {
         onClick={handleDownload}
         title="Download audio"
       >
-        <DownloadIcon className="size-3.5" />
+        <HugeiconsIcon icon={Download01Icon} className="size-3.5" />
       </Button>
     </div>
   );

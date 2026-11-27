@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
+import { withTimeFormat } from "../../../lib/time-format.ts";
 import type {
   RecipeExecutionAnalysis,
   RecipeExecutionRecord,
@@ -18,10 +19,10 @@ export function formatSavedLabel(savedAt: number | null): string {
   if (!savedAt) {
     return "Not saved yet";
   }
-  const time = new Date(savedAt).toLocaleTimeString([], {
-    hour: "numeric",
-    minute: "2-digit",
-  });
+  const time = new Date(savedAt).toLocaleTimeString(
+    [],
+    withTimeFormat({ hour: "numeric", minute: "2-digit" }),
+  );
   return `Saved ${time}`;
 }
 
@@ -122,6 +123,14 @@ export function sortExecutions(records: RecipeExecutionRecord[]): RecipeExecutio
   return next;
 }
 
+/** A cached page is complete only when the producer recorded the full row count. */
+export function hasCompleteLocalDataset(execution: RecipeExecutionRecord): boolean {
+  return (
+    typeof execution.datasetTotal === "number" &&
+    execution.dataset.length >= execution.datasetTotal
+  );
+}
+
 export function withExecutionDefaults(
   record: RecipeExecutionRecord,
 ): RecipeExecutionRecord {
@@ -140,7 +149,7 @@ export function withExecutionDefaults(
   const datasetTotal =
     typeof record.datasetTotal === "number" && record.datasetTotal >= 0
       ? record.datasetTotal
-      : dataset.length;
+      : null;
 
   return {
     ...record,
@@ -164,31 +173,4 @@ export function delay(ms: number): Promise<void> {
   return new Promise((resolve) => {
     window.setTimeout(resolve, ms);
   });
-}
-
-export async function copyTextToClipboard(text: string): Promise<boolean> {
-  try {
-    if (navigator.clipboard?.writeText) {
-      await navigator.clipboard.writeText(text);
-      return true;
-    }
-  } catch {
-    // fallthrough to legacy path
-  }
-
-  try {
-    const textarea = document.createElement("textarea");
-    textarea.value = text;
-    textarea.setAttribute("readonly", "");
-    textarea.style.position = "fixed";
-    textarea.style.top = "0";
-    textarea.style.left = "-9999px";
-    document.body.appendChild(textarea);
-    textarea.select();
-    const ok = document.execCommand("copy");
-    document.body.removeChild(textarea);
-    return ok;
-  } catch {
-    return false;
-  }
 }

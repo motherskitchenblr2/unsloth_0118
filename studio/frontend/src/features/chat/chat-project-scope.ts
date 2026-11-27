@@ -1,0 +1,11 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
+
+import { createContext, useContext } from "react";
+
+/** Read from context, not the store, so the composer's claim and the adapter's filing agree. */
+export const ChatProjectScopeContext = createContext<string | null>(null);
+
+export function useChatProjectScope(): string | null {
+  return useContext(ChatProjectScopeContext);
+}

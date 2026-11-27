@@ -14,20 +14,19 @@
 #
 # Tests for Q-GaLore integration (unsloth/optimizers/).
 
+import inspect
 import pytest
 import sys
 import os
 import torch
 import torch.nn as nn
 
-# Import the optimizers module directly to avoid triggering unsloth.__init__
-# which requires unsloth_zoo and other heavy dependencies.
+# Load directly to avoid unsloth.__init__ heavy deps.
 _repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 _optimizers_dir = os.path.join(_repo_root, "unsloth", "optimizers")
 if _repo_root not in sys.path:
     sys.path.insert(0, _repo_root)
 
-# Direct import of the actual modules (avoids unsloth/__init__.py)
 import importlib.util
 
 
@@ -39,7 +38,6 @@ def _load_module(name, filepath):
     return mod
 
 
-# Load projector module first (no dependencies on unsloth)
 _projector_mod = _load_module(
     "unsloth.optimizers.q_galore_projector",
     os.path.join(_optimizers_dir, "q_galore_projector.py"),
@@ -49,12 +47,270 @@ _quantize = _projector_mod._quantize
 _dequantize = _projector_mod._dequantize
 _quantize_stochastic = _projector_mod._quantize_stochastic
 
-# Load adamw module (depends on projector, may skip bitsandbytes)
 _adamw_mod = _load_module(
     "unsloth.optimizers.q_galore_adamw",
     os.path.join(_optimizers_dir, "q_galore_adamw.py"),
 )
 make_q_galore_param_groups = _adamw_mod.make_q_galore_param_groups
+
+
+_BNB_OPTIMIZER_BACKEND = {}
+
+
+def requires_bnb_optimizer(device):
+    """Probes a real optimizer step: supported_torch_devices lists cpu before its kernels landed in 0.50."""
+    available = _BNB_OPTIMIZER_BACKEND.get(device)
+    if available is None:
+        try:
+            import bitsandbytes
+
+            probe = nn.Parameter(torch.ones(2, device = device))
+            probe.grad = torch.zeros(2, device = device)
+            bitsandbytes.optim.AdamW32bit([probe], lr = 0.0).step()
+            available = True
+        except Exception:
+            available = False
+        _BNB_OPTIMIZER_BACKEND[device] = available
+    if not available:
+        pytest.skip(f"This bitsandbytes version cannot run an optimizer step on {device}")
+
+
+@pytest.mark.skipif(not _adamw_mod._HAS_BNB, reason = "bitsandbytes is required")
+def test_optimizer_constructs_against_the_installed_bitsandbytes():
+    """Construction needs no kernels, so it also runs in the 0.45.x-0.49.x jobs; it must assert
+    bound arguments, since 0.50.x misbinding kept the arity and raised nothing."""
+    signature = inspect.signature(_adamw_mod.Optimizer2State.__init__)
+    captured = {}
+    original = _adamw_mod.Optimizer2State.__init__
+
+    def record(self, *args, **kwargs):
+        bound = signature.bind(self, *args, **kwargs)
+        bound.apply_defaults()
+        captured.update(bound.arguments)
+        return original(self, *args, **kwargs)
+
+    _adamw_mod.Optimizer2State.__init__ = record
+    try:
+        _adamw_mod.QGaLoreAdamW8bit([nn.Parameter(torch.ones(8, 8))], lr = 1e-3)
+    finally:
+        _adamw_mod.Optimizer2State.__init__ = original
+
+    assert captured.get("optimizer_name") == "adam"
+    assert captured.get("optim_bits") == 8
+    for name, default in (("max_unorm", 0.0), ("skip_zeros", False)):
+        if name in signature.parameters:
+            assert captured.get(name) == default, (
+                f"bitsandbytes received {name}={captured.get(name)!r}, but its default is "
+                f"{default!r}; an option is landing in the wrong parameter positionally."
+            )
+
+
+@pytest.mark.skipif(not _adamw_mod._HAS_BNB, reason = "bitsandbytes is required")
+@pytest.mark.parametrize("projected", [True, False])
+@pytest.mark.parametrize("initial_value", [0.0, 1.0])
+@pytest.mark.parametrize("weight_decay", [0.0, 0.1])
+def test_default_optimizer_updates_match_adamw(projected, initial_value, weight_decay):
+    bnb = pytest.importorskip("bitsandbytes")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    requires_bnb_optimizer(device)
+    param = nn.Parameter(torch.full((2, 2), initial_value, device = device))
+    reference = nn.Parameter(param.detach().clone())
+    group = {"params": [param]}
+    if projected:
+        group.update(rank = 2, scale = 1.0, quant = False)
+    optimizer = _adamw_mod.QGaLoreAdamW8bit([group], lr = 0.1, weight_decay = weight_decay)
+    # Unprojected steps delegate to bitsandbytes, whose CUDA kernel decays after the update.
+    reference_cls = torch.optim.AdamW if projected else bnb.optim.AdamW8bit
+    reference_optimizer = reference_cls([reference], lr = 0.1, weight_decay = weight_decay)
+    # A diagonal gradient keeps full-rank projection aligned with AdamW.
+    gradient = torch.diag(torch.tensor([2.0, 1.0], device = device))
+    for weight, opt in [(param, optimizer), (reference, reference_optimizer)]:
+        (weight * gradient).sum().backward()
+        opt.step()
+    torch.testing.assert_close(param, reference)
+
+
+@pytest.mark.skipif(not _adamw_mod._HAS_BNB, reason = "bitsandbytes is required")
+def test_legacy_bitsandbytes_options_are_forwarded_by_name(monkeypatch):
+    original_init = _adamw_mod.Optimizer2State.__init__
+    received = []
+
+    def legacy_init(
+        self,
+        *args,
+        percentile_clipping = 100,
+        block_wise = True,
+        **kwargs,
+    ):
+        received.append((percentile_clipping, block_wise))
+        original_init(self, *args, **kwargs)
+
+    monkeypatch.setattr(_adamw_mod.Optimizer2State, "__init__", legacy_init)
+    _adamw_mod.QGaLoreAdamW8bit(
+        [nn.Parameter(torch.ones(2))],
+        percentile_clipping = 95,
+        block_wise = False,
+    )
+    assert received == [(95, False)]
+
+
+@pytest.mark.skipif(not _adamw_mod._HAS_BNB, reason = "bitsandbytes is required")
+@pytest.mark.parametrize("name,value", [("percentile_clipping", 95), ("block_wise", False)])
+def test_removed_bitsandbytes_options_are_rejected(name, value):
+    import inspect
+    if name in inspect.signature(_adamw_mod.Optimizer2State.__init__).parameters:
+        pytest.skip("This bitsandbytes version still supports the option")
+    with pytest.raises(ValueError, match = name):
+        _adamw_mod.QGaLoreAdamW8bit([nn.Parameter(torch.ones(2))], **{name: value})
+
+
+@pytest.mark.parametrize("out_features,in_features", [(4, 3), (3, 4)])
+def test_projected_step_preserves_full_rank_gradients(out_features, in_features):
+    bnb = pytest.importorskip("bitsandbytes")
+    try:
+        probe = nn.Parameter(torch.ones(2))
+        probe.grad = torch.zeros_like(probe)
+        bnb.optim.AdamW32bit([probe], lr = 0.0).step()
+    except Exception as exc:
+        pytest.skip(
+            reason = f"bitsandbytes build lacks CPU optimizer kernels (older releases): {exc}"
+        )
+    model = nn.Linear(in_features, out_features, bias = False)
+    optimizer = _adamw_mod.QGaLoreAdamW8bit(
+        [{"params": list(model.parameters()), "rank": 1, "quant": False}],
+        lr = 0.01,
+        weight_decay = 0.0,
+    )
+    inputs = torch.arange(2 * in_features, dtype = torch.float32).reshape(2, in_features)
+    for _ in range(2):
+        optimizer.zero_grad(set_to_none = False)
+        model(inputs).square().mean().backward()
+        expected_grad = model.weight.grad.clone()
+        optimizer.step()
+        torch.testing.assert_close(model.weight.grad, expected_grad)
+
+
+@pytest.mark.skipif(not _adamw_mod._HAS_BNB, reason = "bitsandbytes is required")
+@pytest.mark.parametrize("quant", [True, False])
+def test_resume_from_weights_only_checkpoint_matches_uninterrupted(quant):
+    """unslothai/unsloth#729: transformers resumes with torch.load(weights_only=True, map_location="cpu")."""
+    import io
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    requires_bnb_optimizer(device)
+
+    def make(weight, bias):
+        weight = nn.Parameter(weight.clone())
+        bias = nn.Parameter(bias.clone())
+        projected = {"params": [weight], "rank": 4, "update_proj_gap": 2, "quant": quant}
+        projected.update(queue_size = 2, cos_threshold = 0.0)
+        optimizer = _adamw_mod.QGaLoreAdamW8bit([projected, {"params": [bias]}], lr = 1e-2)
+        return weight, bias, optimizer
+
+    def step(weight, bias, optimizer, i):
+        # svd_lowrank draws from the global RNG, so each step reseeds it.
+        torch.manual_seed(i)
+        weight.grad = torch.randn(weight.shape, device = device)
+        bias.grad = torch.randn(bias.shape, device = device)
+        optimizer.step()
+
+    torch.manual_seed(0)
+    weight, bias, optimizer = make(
+        torch.randn(128, 64, device = device), torch.randn(64, device = device)
+    )
+    for i in range(3):
+        step(weight, bias, optimizer, i)
+    buffer = io.BytesIO()
+    torch.save(optimizer.state_dict(), buffer)
+    assert isinstance(optimizer.state[weight]["projector"], GaLoreProjector)
+    buffer.seek(0)
+    saved = torch.load(buffer, map_location = "cpu", weights_only = True)
+
+    weight2, bias2, resumed = make(weight.detach(), bias.detach())
+    resumed.load_state_dict(saved)
+    projector = resumed.state[weight2]["projector"]
+    assert projector.ortho_matrix.device == weight2.device
+    for i in range(3, 7):
+        step(weight, bias, optimizer, i)
+        step(weight2, bias2, resumed, i)
+    assert torch.equal(weight, weight2)
+    assert torch.equal(bias, bias2)
+    # The adaptive schedule widened the gap after resume, so its saved queue was used.
+    assert projector.update_proj_gap == optimizer.state[weight]["projector"].update_proj_gap == 4
+
+
+def _projected_optimizer(weight, quant, weight_decay):
+    group = {"params": [weight], "rank": 4, "update_proj_gap": 2, "quant": quant}
+    group.update(queue_size = 2, cos_threshold = 0.0, weight_decay = weight_decay)
+    return _adamw_mod.QGaLoreAdamW8bit([group], lr = 1e-2)
+
+
+@pytest.mark.skipif(not _adamw_mod._HAS_BNB, reason = "bitsandbytes is required")
+@pytest.mark.parametrize("quant", [True, False])
+def test_projected_step_keeps_the_weight_storage_instead_of_a_copy(quant):
+    """The low-rank swap holds the original weight by reference, not a clone."""
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    requires_bnb_optimizer(device)
+    torch.manual_seed(0)
+    weight = nn.Parameter(torch.randn(128, 64, device = device))
+    optimizer = _projected_optimizer(weight, quant, weight_decay = 0.1)
+    seen = []
+    update_step = optimizer.update_step
+
+    def spy(group, p, gindex, pindex):
+        seen.append((p._saved_data.data_ptr(), p.data.data_ptr()))
+        return update_step(group, p, gindex, pindex)
+
+    optimizer.update_step = spy
+    for i in range(3):
+        torch.manual_seed(i)
+        weight.grad = torch.randn(weight.shape, device = device)
+        before = weight.data.data_ptr()
+        optimizer.step()
+        saved_ptr, zeros_ptr = seen[-1]
+        assert saved_ptr == before != zeros_ptr
+        assert weight.data.data_ptr() == before
+
+
+@pytest.mark.skipif(not _adamw_mod._HAS_BNB, reason = "bitsandbytes is required")
+def test_failed_projected_step_restores_the_untouched_weight_then_retries_exactly():
+    """An OOM in the 8-bit update (auto_find_batch_size) leaves state intact; the retry matches bitwise."""
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    requires_bnb_optimizer(device)
+    torch.manual_seed(0)
+    init = torch.randn(128, 64, device = device)
+    grads = [torch.randn(128, 64, device = device) for _ in range(3)]
+
+    def run(fail_at):
+        weight = nn.Parameter(init.clone())
+        optimizer = _projected_optimizer(weight, False, weight_decay = 0.1)
+        update_step = optimizer.update_step
+        calls = {"n": 0}
+
+        def flaky(group, p, gindex, pindex):
+            calls["n"] += 1
+            if calls["n"] == fail_at:
+                raise torch.OutOfMemoryError("out of memory (simulated)")
+            return update_step(group, p, gindex, pindex)
+
+        optimizer.update_step = flaky
+        for i, grad in enumerate(grads):
+            torch.manual_seed(i)
+            weight.grad = grad.clone()
+            before = weight.detach().clone()
+            try:
+                optimizer.step()
+            except torch.OutOfMemoryError:
+                assert torch.equal(weight, before)
+                assert torch.equal(weight.grad, grad)
+                assert optimizer.param_groups[0]["weight_decay"] == 0.1
+                assert not hasattr(weight, "_saved_data")
+                torch.manual_seed(i)
+                optimizer.step()
+        return weight.detach()
+
+    assert torch.equal(run(fail_at = 2), run(fail_at = 0))
+
 
 # ======================================================================
 # Projector tests
@@ -67,7 +323,7 @@ class TestGaLoreProjector:
     def test_project_and_back_tall(self):
         """Project → project_back preserves shape for tall matrices."""
         proj = GaLoreProjector(rank = 4, update_proj_gap = 1)
-        grad = torch.randn(16, 8)  # tall
+        grad = torch.randn(16, 8)
         low = proj.project(grad, step = 0)
         assert low.shape == (16, 4)
 
@@ -77,7 +333,7 @@ class TestGaLoreProjector:
     def test_project_and_back_wide(self):
         """Project → project_back preserves shape for wide matrices."""
         proj = GaLoreProjector(rank = 4, update_proj_gap = 1)
-        grad = torch.randn(8, 16)  # wide
+        grad = torch.randn(8, 16)
         low = proj.project(grad, step = 0)
         assert low.shape == (4, 16)
 
@@ -92,10 +348,10 @@ class TestGaLoreProjector:
         assert proj.svd_count == 1
 
         proj.project(grad, step = 1)
-        assert proj.svd_count == 1  # No recomputation
+        assert proj.svd_count == 1
 
         proj.project(grad, step = 100)
-        assert proj.svd_count == 2  # Recomputed
+        assert proj.svd_count == 2
 
     def test_quantized_projection(self):
         """Quantized projection matrix stores and restores with bounded error."""
@@ -104,7 +360,6 @@ class TestGaLoreProjector:
         low = proj.project(grad, step = 0)
         assert low.shape == (16, 4)
 
-        # The projection matrix should be stored as uint8
         assert proj.ortho_matrix.dtype == torch.uint8
 
     def test_quantized_projection_int4(self):
@@ -113,26 +368,59 @@ class TestGaLoreProjector:
         grad = torch.randn(16, 8)
         proj.project(grad, step = 0)
         assert proj.ortho_matrix.dtype == torch.uint8
-        # INT4 values should be in range [0, 15]
         assert proj.ortho_matrix.max() <= 15
+
+    @pytest.mark.parametrize("n_bit", [4, 8])
+    def test_quantized_projection_preserves_constant_rank_one_gradient(self, n_bit):
+        grad = torch.ones(8, 4)
+        proj = GaLoreProjector(rank = 1, quant = True, n_bit = n_bit)
+        restored = proj.project_back(proj.project(grad, step = 0))
+        torch.testing.assert_close(restored, grad)
 
     def test_adaptive_scheduling(self):
         """update_proj_gap increases when cosine similarity exceeds threshold."""
         proj = GaLoreProjector(
             rank = 4,
             update_proj_gap = 10,
-            cos_threshold = 0.0,  # Very low threshold → always triggers
+            cos_threshold = 0.9,
             gamma_proj = 2.0,
             queue_size = 2,
         )
-        # Use very similar gradients so cosine similarity is high
         base_grad = torch.randn(16, 8)
         for i in range(5):
             grad = base_grad + torch.randn_like(base_grad) * 0.001
             proj.project(grad, step = i * 10)
 
-        # After several similar SVDs, update_proj_gap should have increased
-        assert proj.update_proj_gap > 10
+        assert proj.update_proj_gap > 10, list(proj.queue)
+
+    @staticmethod
+    def _scheduled_gap(monkeypatch, bases, cos_threshold):
+        """Drive the schedule with a fixed sequence of orthogonal bases, one per SVD."""
+        sequence = iter(bases)
+        monkeypatch.setattr(
+            GaLoreProjector,
+            "_compute_orthogonal",
+            staticmethod(lambda *args, **kwargs: next(sequence)),
+        )
+        proj = GaLoreProjector(
+            rank = 2, update_proj_gap = 1, cos_threshold = cos_threshold, gamma_proj = 2.0, queue_size = 2
+        )
+        grad = torch.zeros(8, 8)
+        for step in range(len(bases)):
+            if step % proj.update_proj_gap == 0:
+                proj.project(grad, step = step)
+        return proj.update_proj_gap
+
+    def test_adaptive_scheduling_ignores_a_sign_flipped_basis(self, monkeypatch):
+        # A negated basis is the same subspace; a raw dot product reads it as -1.
+        basis = torch.eye(8)[:2]
+        assert self._scheduled_gap(monkeypatch, [basis, -basis, basis], cos_threshold = 0.9) == 2
+
+    def test_adaptive_scheduling_still_rejects_a_rotated_basis(self, monkeypatch):
+        eye = torch.eye(8)
+        assert (
+            self._scheduled_gap(monkeypatch, [eye[:2], eye[2:4], eye[4:6]], cos_threshold = 0.4) == 1
+        )
 
     def test_scale_applied(self):
         """project_back applies the scale factor."""
@@ -146,18 +434,34 @@ class TestGaLoreProjector:
         full_half = proj.project_back(low)
         full_one = proj2.project_back(low2)
 
-        # The ratio should be exactly 0.5 (SVD is deterministic on same input)
+        # SVD is deterministic on the same input, so the ratio is exactly 0.5.
         ratio = full_half.norm() / full_one.norm()
         assert abs(ratio - 0.5) < 1e-5, f"Expected ratio ~0.5, got {ratio:.8f}"
 
 
-# ======================================================================
-# Quantization utility tests
-# ======================================================================
-
-
 class TestQuantizationUtils:
     """Tests for _quantize, _dequantize, _quantize_stochastic."""
+
+    @pytest.mark.parametrize("quantize", [_quantize, _quantize_stochastic])
+    @pytest.mark.parametrize("n_bit", [4, 8])
+    @pytest.mark.parametrize("group_size", [-1, 2])
+    def test_roundtrip_single_sign_groups(self, quantize, n_bit, group_size):
+        weights = torch.tensor(
+            [
+                [1.0, 1.5, 2.0, 2.5],
+                [-1.0, -1.5, -2.0, -2.5],
+                [0.5, 0.5, 0.5, 0.5],
+                [-0.5, -0.5, -0.5, -0.5],
+                [0.0, 0.0, 0.0, 0.0],
+                [-1.0, -0.5, 0.5, 1.0],
+            ]
+        )
+        quantized = quantize(weights, q_group_size = group_size, n_bit = n_bit)
+        restored = _dequantize(*quantized)
+        scales = quantized[1]
+        error = (restored - weights).abs().reshape(scales.shape[0], -1)
+        # Stochastic rounding may move one step, but must not clip a group.
+        assert torch.all(error <= scales + 1e-6)
 
     def test_quantize_dequantize_roundtrip(self):
         """Quantize → dequantize has bounded error."""
@@ -165,7 +469,6 @@ class TestQuantizationUtils:
         q, scales, zeros, shape = _quantize(w, n_bit = 8)
         w_hat = _dequantize(q, scales, zeros, shape)
 
-        # Error should be bounded by the quantization step size
         error = (w - w_hat).abs().max()
         assert error < 0.1, f"Max error {error} exceeds threshold"
 
@@ -201,14 +504,7 @@ class TestQuantizationUtils:
             errors.append((w - w_hat).mean().item())
 
         mean_error = sum(errors) / len(errors)
-        assert (
-            abs(mean_error) < 0.01
-        ), f"Mean error {mean_error} suggests biased rounding"
-
-
-# ======================================================================
-# Param group helper tests
-# ======================================================================
+        assert abs(mean_error) < 0.01, f"Mean error {mean_error} suggests biased rounding"
 
 
 class TestParamGroupHelper:
@@ -217,7 +513,6 @@ class TestParamGroupHelper:
     def test_param_group_separation(self):
         """GaLore vs non-GaLore params are correctly separated."""
 
-        # Create a mini-transformer-like model
         model = nn.Module()
         model.q_proj = nn.Linear(64, 64, bias = False)
         model.k_proj = nn.Linear(64, 64, bias = False)
@@ -226,18 +521,13 @@ class TestParamGroupHelper:
 
         groups = make_q_galore_param_groups(model, rank = 8, weight_quant = False)
 
-        # Should have 2 groups: galore and non-galore
         assert len(groups) == 2
 
         galore_group = [g for g in groups if "rank" in g][0]
         non_galore_group = [g for g in groups if "rank" not in g][0]
 
-        # q_proj and k_proj should be in galore group (2 params)
         assert len(galore_group["params"]) == 2
-        # embed and norm should be in non-galore group
-        assert (
-            len(non_galore_group["params"]) == 3
-        )  # embed weight + norm weight + norm bias
+        assert len(non_galore_group["params"]) == 3
 
     def test_custom_target_modules(self):
         """Custom target_modules narrows GaLore scope."""
@@ -256,16 +546,12 @@ class TestParamGroupHelper:
         )
 
         galore_group = [g for g in groups if "rank" in g][0]
-        assert len(galore_group["params"]) == 1  # Only q_proj
+        assert len(galore_group["params"]) == 1
 
     def test_bias_excluded_from_galore(self):
-        """1D bias params matching target names must NOT be in the GaLore group.
-
-        GaLoreProjector.project requires 2-D gradients, so bias vectors
-        (e.g. q_proj.bias) that match a target name must be excluded.
-        """
+        """1-D bias params matching target names must be excluded (project needs 2-D grads)."""
         model = nn.Module()
-        model.q_proj = nn.Linear(64, 64, bias = True)  # has .weight AND .bias
+        model.q_proj = nn.Linear(64, 64, bias = True)
         model.embed = nn.Embedding(100, 64)
 
         groups = make_q_galore_param_groups(model, rank = 8, weight_quant = False)
@@ -273,11 +559,9 @@ class TestParamGroupHelper:
         galore_group = [g for g in groups if "rank" in g][0]
         non_galore_group = [g for g in groups if "rank" not in g][0]
 
-        # Only the 2-D q_proj.weight should be in the GaLore group
         assert len(galore_group["params"]) == 1
         assert galore_group["params"][0].dim() == 2
 
-        # q_proj.bias (1-D) + embed.weight should be in non-GaLore
         assert any(p.dim() == 1 for p in non_galore_group["params"])
 
     def test_empty_target_modules_no_galore(self):
@@ -285,7 +569,7 @@ class TestParamGroupHelper:
         model = nn.Module()
         model.q_proj = nn.Linear(64, 64, bias = False)
 
-        # Pass empty list, should NOT fall back to defaults
+        # Empty list must not fall back to defaults.
         groups = make_q_galore_param_groups(
             model,
             rank = 8,
@@ -294,14 +578,24 @@ class TestParamGroupHelper:
         )
 
         galore_groups = [g for g in groups if "rank" in g]
-        assert (
-            len(galore_groups) == 0
-        ), "Expected no GaLore groups when target_modules=[]"
+        assert len(galore_groups) == 0, "Expected no GaLore groups when target_modules=[]"
 
 
-# ======================================================================
-# Optimizer tests (CPU-only, no bitsandbytes dependency)
-# ======================================================================
+def test_optimizer_bias_correction_matches_adamw():
+    pytest.importorskip("bitsandbytes")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    requires_bnb_optimizer(device)
+
+    param = nn.Parameter(torch.ones(2, device = device))
+    reference = nn.Parameter(param.detach().clone())
+    optimizer = _adamw_mod.QGaLoreAdamW8bit([param], lr = 0.1, weight_decay = 0.0)
+    expected_optimizer = torch.optim.AdamW([reference], lr = 0.1, weight_decay = 0.0)
+    for values in ([0.1, 0.2], [0.4, -0.2], [-0.05, 0.3]):
+        param.grad = torch.tensor(values, device = device)
+        reference.grad = param.grad.clone()
+        optimizer.step()
+        expected_optimizer.step()
+        torch.testing.assert_close(param, reference)
 
 
 class TestQGaLoreIntegration:
@@ -311,7 +605,6 @@ class TestQGaLoreIntegration:
         """A simple training loop using manual GaLore projection converges."""
         torch.manual_seed(42)
 
-        # Tiny model: single linear layer
         model = nn.Linear(32, 16, bias = False)
         target = torch.randn(4, 16)
         x = torch.randn(4, 32)
@@ -327,41 +620,33 @@ class TestQGaLoreIntegration:
             loss.backward()
             losses.append(loss.item())
 
-            # Manual GaLore projection
             for p in model.parameters():
                 if p.grad is not None and p.grad.dim() == 2:
                     low = proj.project(p.grad, step)
                     p._saved = p.data.clone()
                     update = torch.zeros_like(low)
-                    update.add_(low)  # Simplified update
+                    update.add_(low)
                     full_update = proj.project_back(update)
                     p.grad.copy_(full_update)
 
             optimizer.step()
 
-        # Loss should decrease
-        assert (
-            losses[-1] < losses[0]
-        ), f"Loss did not decrease: {losses[0]:.4f} → {losses[-1]:.4f}"
+        assert losses[-1] < losses[0], f"Loss did not decrease: {losses[0]:.4f} → {losses[-1]:.4f}"
 
     def test_full_projector_roundtrip_quality(self):
         """project → project_back captures the dominant gradient directions."""
         torch.manual_seed(42)
-        # Create a gradient with clear low-rank structure
         u = torch.randn(32, 4)
         v = torch.randn(4, 16)
-        grad = u @ v  # rank-4 gradient
+        grad = u @ v
 
         proj = GaLoreProjector(rank = 4, update_proj_gap = 1, scale = 1.0)
         low = proj.project(grad, step = 0)
         reconstructed = proj.project_back(low)
 
-        # For a rank-4 gradient with rank-4 projection, reconstruction
-        # should be very close to original
+        # Rank-4 grad with rank-4 projection reconstructs near-exactly.
         relative_error = (grad - reconstructed).norm() / grad.norm()
-        assert (
-            relative_error < 0.05
-        ), f"Reconstruction error too high: {relative_error:.4f}"
+        assert relative_error < 0.05, f"Reconstruction error too high: {relative_error:.4f}"
 
     def test_weight_quant_activates_on_first_step(self):
         """_has_weight_quant returns True even when _q_scales is None (first step)."""
@@ -369,31 +654,26 @@ class TestQGaLoreIntegration:
         QGaLoreAdamW8bit = _adamw_mod_local.QGaLoreAdamW8bit
 
         p = torch.nn.Parameter(torch.randn(16, 16))
-        # Simulate init_weight_quantization tagging
         p._q_scales = None
         p._q_zeros = None
         p._q_shape = p.data.shape
 
         group = {"weight_quant": True}
 
-        # _has_weight_quant must return True even on first step (_q_scales=None)
+        # Must be True even on the first step, when _q_scales is None.
         assert QGaLoreAdamW8bit._has_weight_quant(p, group) is True
 
-        # Without the tag, it should return False
         p2 = torch.nn.Parameter(torch.randn(16, 16))
         assert QGaLoreAdamW8bit._has_weight_quant(p2, group) is False
 
     def test_embedding_lr_param_group_split(self):
         """Embedding params can be split into a separate group with custom LR."""
-        # This tests the logic that make_q_galore_param_groups produces groups
-        # that can be further split by the trainer for embedding LR.
         model = nn.Module()
         model.q_proj = nn.Linear(64, 64, bias = False)
         model.embed = nn.Embedding(100, 64)
 
         groups = make_q_galore_param_groups(model, rank = 8, weight_quant = False)
 
-        # Simulate splitting non-GaLore group for embedding LR
         embed_lr = 5e-5
         new_groups = []
         for group in groups:
@@ -403,8 +683,7 @@ class TestQGaLoreIntegration:
             embed_params = []
             other_params = []
             for p in group["params"]:
-                # In real usage, we'd check the name; here just split by shape
-                if p.shape[0] == 100:  # embedding
+                if p.shape[0] == 100:
                     embed_params.append(p)
                 else:
                     other_params.append(p)
@@ -418,16 +697,13 @@ class TestQGaLoreIntegration:
                 g["lr"] = embed_lr
                 new_groups.append(g)
 
-        # Should have 3 groups: galore, non-galore non-embed, embed
         embed_groups = [g for g in new_groups if g.get("lr") == embed_lr]
         assert len(embed_groups) == 1
         assert embed_groups[0]["lr"] == embed_lr
 
     def test_optimizer_hyperparams_forwarded(self):
         """QGaLoreAdamW8bit accepts betas and eps keyword arguments."""
-        # Verify the constructor signature accepts these params.
-        # Without bitsandbytes we can't instantiate, but we can check the
-        # function signature.
+        # Cannot instantiate without bitsandbytes; check the signature.
         import inspect
 
         _adamw_mod_local = sys.modules["unsloth.optimizers.q_galore_adamw"]
@@ -437,31 +713,6 @@ class TestQGaLoreIntegration:
         param_names = list(sig.parameters.keys())
         assert "betas" in param_names, "betas not in QGaLoreAdamW8bit.__init__ params"
         assert "eps" in param_names, "eps not in QGaLoreAdamW8bit.__init__ params"
-
-    def test_weight_decay_uses_saved_data(self):
-        """Weight decay should apply standard decoupled AdamW decay on current weights."""
-        _adamw_mod_local = sys.modules["unsloth.optimizers.q_galore_adamw"]
-
-        # Create a mock parameter and group
-        p = torch.nn.Parameter(torch.ones(4, 4))
-        p._saved_data = torch.ones(4, 4) * 2.0  # Pre-update weights
-        # Simulate project-back: p.data = p._saved_data + projected update
-        p.data = p._saved_data.add_(torch.ones(4, 4) * 1.0)  # p.data is now 3.0
-
-        group = {"weight_decay": 0.1, "lr": 1.0, "_wd_saved": 0.1}
-
-        # Replicate the fixed decoupled weight decay logic (uses p.data, not p._saved_data)
-        p.data.add_(
-            p.data,
-            alpha = -group["lr"] * group["_wd_saved"],
-        )
-
-        del p._saved_data  # Clean up after all uses, matching fixed code
-
-        # Decoupled weight decay: 3.0 - (1.0 * 0.1 * 3.0) = 2.7
-        assert torch.allclose(
-            p.data, torch.tensor(2.7)
-        ), "Weight decay didn't use p.data for decoupled decay!"
 
     def test_params_float_after_weight_quant_step(self):
         """After a step with weight_quant=True, parameters must remain floating point."""
@@ -477,13 +728,9 @@ class TestQGaLoreIntegration:
             "weight_group_size": 16,
         }
 
-        # Replicate the re-quantize logic at the end of optimizer step
         float_data = p.data.clone()
-        q, scales, zeros, shape = _quantize(
-            float_data, q_group_size = group["weight_group_size"]
-        )
+        q, scales, zeros, shape = _quantize(float_data, q_group_size = group["weight_group_size"])
 
-        # The key assertion: p.data stays float, _q_data holds uint8
         p._q_data = q.to(p.data.device)
         p._q_scales = scales
         p._q_zeros = zeros
@@ -501,7 +748,6 @@ class TestQGaLoreIntegration:
         linear = nn.Linear(16, 8, bias = False)
         original = linear.weight.data.clone()
 
-        # Quantize the weight and replace with placeholder (simulates post-step)
         q, scales, zeros, shape = _projector_mod_local._quantize(
             linear.weight.data.clone(), q_group_size = 16
         )
@@ -512,17 +758,182 @@ class TestQGaLoreIntegration:
         linear.weight.data = torch.zeros(1, dtype = linear.weight.dtype)
         assert linear.weight.data.numel() == 1, "placeholder should be 1 element"
 
-        # Install hook and run forward -- should restore float weights
         handles = install_hook(linear)
         x = torch.randn(2, 16)
-        out = linear(x)  # triggers pre-hook
+        out = linear(x)
 
         assert linear.weight.data.shape == (8, 16), "weight shape not restored"
         assert linear.weight.data.is_floating_point(), "weight not float after hook"
-        # Check values are close to original (quantization introduces small error)
         assert torch.allclose(
             linear.weight.data, original, atol = 0.15
         ), "dequantized weight too far from original"
 
         for h in handles:
             h.remove()
+
+
+class _TinyBlock(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.q_proj = nn.Linear(32, 32, bias = False)
+        self.down_proj = nn.Parameter(torch.randn(4, 32, 16) * 0.02)
+
+    def forward(self, x):
+        return torch.einsum("bh,eho->bo", self.q_proj(x), self.down_proj)
+
+
+def _q_galore_step(model, device, weight_quant, targets):
+    groups = make_q_galore_param_groups(
+        model,
+        rank = 4,
+        proj_quant = False,
+        weight_quant = weight_quant,
+        stochastic_round = False,
+        weight_group_size = 32,
+        target_modules = targets,
+    )
+    if weight_quant:
+        _adamw_mod.QGaLoreAdamW8bit.init_weight_quantization(model, groups, group_size = 32)
+        _adamw_mod.install_weight_quant_hooks(model)
+    optimizer = _adamw_mod.QGaLoreAdamW8bit(groups, lr = 1e-2)
+    model(torch.randn(2, 32, device = device)).square().sum().backward()
+    optimizer.step()
+    return groups
+
+
+@pytest.mark.skipif(not _adamw_mod._HAS_BNB, reason = "bitsandbytes is required")
+def test_stacked_expert_weights_use_plain_adamw_not_galore():
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    requires_bnb_optimizer(device)
+    torch.manual_seed(0)
+    model = _TinyBlock().to(device)
+    before = model.down_proj.detach().clone()
+    groups = _q_galore_step(model, device, weight_quant = False, targets = ["q_proj", "down_proj"])
+    galore = next(g for g in groups if "rank" in g)["params"]
+    assert [p.dim() for p in galore] == [2]
+    assert not torch.equal(model.down_proj.detach(), before)
+
+
+@pytest.mark.skipif(not _adamw_mod._HAS_BNB, reason = "bitsandbytes is required")
+def test_weight_quant_state_dict_after_step_holds_full_weights():
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    requires_bnb_optimizer(device)
+    torch.manual_seed(0)
+    model = _TinyBlock().to(device)
+    _q_galore_step(model, device, weight_quant = True, targets = ["q_proj"])
+    weight = model.q_proj.weight
+    assert weight.shape == (1,)
+
+    state_dict = {k: v.detach().clone() for k, v in model.state_dict().items()}
+    expected = _dequantize(weight._q_data, weight._q_scales, weight._q_zeros, weight._q_shape)
+    torch.testing.assert_close(state_dict["q_proj.weight"], expected)
+    assert weight.shape == (1,)
+
+    fresh = _TinyBlock().to(device)
+    fresh.load_state_dict(state_dict)
+    x = torch.randn(2, 32, device = device)
+    torch.testing.assert_close(model(x), fresh(x))
+
+    # Loading into the live quantized model must not be overwritten by the stale INT8 copy.
+    target = {k: torch.randn_like(v) for k, v in state_dict.items()}
+    model.load_state_dict(target)
+    fresh.load_state_dict(target)
+    torch.testing.assert_close(model(x), fresh(x))
+
+
+class _HookBypassingBlock(_TinyBlock):
+    # Calls forward directly, like a torch.compile'd parent that never runs submodule pre-hooks.
+    def forward(self, x):
+        return torch.einsum("bh,eho->bo", self.q_proj.forward(x), self.down_proj)
+
+
+@pytest.mark.skipif(not _adamw_mod._HAS_BNB, reason = "bitsandbytes is required")
+def test_weight_quant_root_hook_restores_weights_for_bypassed_submodules():
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    requires_bnb_optimizer(device)
+    torch.manual_seed(0)
+    model = _HookBypassingBlock().to(device)
+    _q_galore_step(model, device, weight_quant = True, targets = ["q_proj"])
+    weight = model.q_proj.weight
+    expected = _dequantize(weight._q_data, weight._q_scales, weight._q_zeros, weight._q_shape)
+    model(torch.randn(2, 32, device = device))
+    torch.testing.assert_close(weight.data, expected)
+    # Already materialized: checkpointing reuses the live tensor instead of a second dense copy.
+    assert model.state_dict()["q_proj.weight"].data_ptr() == weight.data_ptr()
+
+
+class _TwoBranchBlock(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.q_proj = nn.Linear(32, 32, bias = False)
+        self.k_proj = nn.Linear(32, 32, bias = False)
+        self.use_k = True
+
+    def forward(self, x):
+        return (self.k_proj if self.use_k else self.q_proj)(x)
+
+
+@pytest.mark.skipif(not _adamw_mod._HAS_BNB, reason = "bitsandbytes is required")
+def test_weight_quant_unrouted_weights_return_to_placeholders():
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    requires_bnb_optimizer(device)
+    torch.manual_seed(0)
+    model = _TwoBranchBlock().to(device)
+    groups = _q_galore_step(model, device, weight_quant = True, targets = ["q_proj", "k_proj"])
+    weight = model.k_proj.weight
+    assert weight.shape == (1,)
+    optimizer = _adamw_mod.QGaLoreAdamW8bit(groups, lr = 1e-2)
+    weight.grad = None
+    model.use_k = False
+    model(torch.randn(2, 32, device = device)).square().sum().backward()
+    assert weight.shape == (32, 32)
+    q_data = weight._q_data.clone()
+    optimizer.step()
+    assert weight.shape == (1,)
+    assert torch.equal(weight._q_data, q_data)
+
+
+@pytest.mark.skipif(not _adamw_mod._HAS_BNB, reason = "bitsandbytes is required")
+@pytest.mark.parametrize("where", ["update_step", "project_back"])
+def test_failed_projected_step_restores_weight_grad_and_decay(monkeypatch, where):
+    """auto_find_batch_size catches an OOM from optimizer.step() and retries: the retry must see the
+    real weight, the full-rank gradient and the configured weight decay, not the zeroed low-rank swap."""
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    requires_bnb_optimizer(device)
+    param = nn.Parameter(torch.full((2, 2), 1.0, device = device))
+    reference = nn.Parameter(param.detach().clone())
+    group = {"params": [param], "rank": 2, "scale": 1.0, "quant": False}
+    optimizer = _adamw_mod.QGaLoreAdamW8bit([group], lr = 0.1, weight_decay = 0.1)
+    reference_optimizer = torch.optim.AdamW([reference], lr = 0.1, weight_decay = 0.1)
+    gradient = torch.diag(torch.tensor([2.0, 1.0], device = device))
+    (param * gradient).sum().backward()
+    (reference * gradient).sum().backward()
+    weight_before = param.detach().clone()
+    grad_before = param.grad
+
+    if where == "update_step":
+        target, name = optimizer, "update_step"
+    else:
+        # The projector is built lazily inside step(): patch the class.
+        target, name = _projector_mod.GaLoreProjector, "project_back"
+    original = getattr(target, name)
+    calls = []
+
+    def fail_once(*args, **kwargs):
+        calls.append(1)
+        if len(calls) == 1:
+            raise torch.cuda.OutOfMemoryError("CUDA out of memory")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(target, name, fail_once)
+    with pytest.raises(torch.cuda.OutOfMemoryError):
+        optimizer.step()
+    assert torch.equal(param.detach(), weight_before)
+    assert param.grad is grad_before
+    assert optimizer.param_groups[0]["weight_decay"] == 0.1
+    assert "_wd_saved" not in optimizer.param_groups[0]
+    assert not hasattr(param, "_saved_data")
+
+    optimizer.step()
+    reference_optimizer.step()
+    torch.testing.assert_close(param, reference)

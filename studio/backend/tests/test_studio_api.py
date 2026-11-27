@@ -1,49 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
-"""
-End-to-end tests for Unsloth Studio's HTTP API surface.
-
-Covers the OpenAI-compatible and Anthropic-compatible endpoints exposed
-by the server that ``unsloth studio run`` boots, plus API key
-authentication and the CLI's ``--help`` output:
-
-    1. curl -- basic chat completions (non-streaming)
-    2. curl -- streaming chat completions
-    3. Python OpenAI SDK -- streaming completions
-    4. curl -- with tools (web_search + python)
-    5. Anthropic Messages API -- basic non-streaming
-    6. Anthropic Messages API -- streaming SSE
-    7. Anthropic Python SDK -- non-streaming
-    8. Anthropic Messages API -- streaming with tools
-
-Training, export, fine-tuning, and chat-UI concerns are out of scope —
-see the unit suites elsewhere under ``studio/backend/tests/`` for those.
-
-Usage:
-
-    # Script mode — launches its own server via ``unsloth studio run``.
-    python tests/test_studio_api.py
-    python tests/test_studio_api.py --model unsloth/... --gguf-variant ...
-
-    # Pytest mode, external server — start a Studio server yourself,
-    # then point pytest at it. Fastest iteration loop.
-    unsloth studio run --model unsloth/Qwen3-1.7B-GGUF --gguf-variant UD-Q4_K_XL &
-    export UNSLOTH_E2E_BASE_URL=http://127.0.0.1:8080
-    export UNSLOTH_E2E_API_KEY=sk-unsloth-...   # from the server banner
-    pytest tests/test_studio_api.py -v
-
-    # Pytest mode, fixture-managed server — pytest launches and tears
-    # down the server itself. One-shot verification, CI-friendly.
-    pytest tests/test_studio_api.py -v \\
-        --unsloth-model unsloth/Qwen3-1.7B-GGUF \\
-        --unsloth-gguf-variant UD-Q4_K_XL
-
-The ``base_url`` / ``api_key`` parameters on the test functions resolve
-via the ``studio_server`` session fixture in ``conftest.py``.
-
-Requires a GPU and ~2 GB of disk for the GGUF download.
-"""
+"""OpenAI and Anthropic endpoint tests on a live server: need a GPU and a ~2 GB GGUF download."""
 
 from __future__ import annotations
 
@@ -60,21 +18,12 @@ import urllib.request
 from pathlib import Path
 
 
-# ── Configuration ────────────────────────────────────────────────────
-
 DEFAULT_MODEL = "unsloth/Qwen3-1.7B-GGUF"
 DEFAULT_VARIANT = "UD-Q4_K_XL"
 PORT = 18222  # high port unlikely to collide
 HOST = "127.0.0.1"
-STARTUP_TIMEOUT = 120  # seconds to wait for banner
-LOG_FILE = (
-    Path(__file__).resolve().parent.parent.parent.parent
-    / "temp"
-    / "test_studio_api.log"
-)
-
-
-# ── Helpers ──────────────────────────────────────────────────────────
+STARTUP_TIMEOUT = 120
+LOG_FILE = Path(__file__).resolve().parent.parent.parent.parent / "temp" / "test_studio_api.log"
 
 
 def _http(
@@ -124,16 +73,25 @@ def _stream_http(
         return exc.code, []
 
 
-# ── Test functions ───────────────────────────────────────────────────
-
-
 def test_help_output():
     """``unsloth studio run --help`` should show all documented options."""
+    # Rich lays the help out at 80 columns when stdout is not a terminal and cuts the
+    # "--max-seq-length, --context-length" cell to "--max-seq-lengt…". Typer passes an inherited
+    # TERMINAL_WIDTH as an explicit width, and GITHUB_ACTIONS / FORCE_COLOR / PY_COLORS force a
+    # terminal whose colour codes split every flag, so pin both. The child writes UTF-8.
     result = subprocess.run(
         ["unsloth", "studio", "run", "--help"],
         capture_output = True,
         text = True,
+        encoding = "utf-8",
+        errors = "replace",
         timeout = 15,
+        env = {
+            **os.environ,
+            "COLUMNS": "200",
+            "TERMINAL_WIDTH": "200",
+            "_TYPER_FORCE_DISABLE_TERMINAL": "1",
+        },
     )
     out = result.stdout
     assert result.returncode == 0, f"--help exited with {result.returncode}"
@@ -148,6 +106,7 @@ def test_help_output():
         "--host",
         "--frontend",
         "--silent",
+        "--tensor-parallel",
     ]:
         assert flag in out, f"Missing flag {flag!r} in --help output"
     print("  PASS  --help shows all flags")
@@ -214,9 +173,7 @@ def test_openai_sdk(base_url: str, api_key: str):
     client = OpenAI(base_url = f"{base_url}/v1", api_key = api_key)
     response = client.chat.completions.create(
         model = "current",
-        messages = [
-            {"role": "user", "content": "What is 2+2? Answer with just the number."}
-        ],
+        messages = [{"role": "user", "content": "What is 2+2? Answer with just the number."}],
         stream = True,
     )
     content_parts = []
@@ -232,13 +189,7 @@ def test_openai_sdk(base_url: str, api_key: str):
 
 
 def test_curl_with_tools(base_url: str, api_key: str):
-    """Example 4: chat completion with tool calling enabled.
-
-    Note: when ``enable_tools`` is set the server always returns SSE
-    streaming regardless of the ``stream`` flag, so we parse SSE chunks.
-    The model may or may not produce visible content -- tool orchestration
-    can intercept the response -- so we only assert the endpoint succeeds.
-    """
+    """enable_tools always returns SSE; the model may show no content, so only success is asserted."""
     status, chunks = _stream_http(
         f"{base_url}/v1/chat/completions",
         body = {
@@ -251,6 +202,9 @@ def test_curl_with_tools(base_url: str, api_key: str):
             "stream": True,
             "enable_tools": True,
             "enabled_tools": ["python"],
+            # The shape the API keys tab hands out. The confirm gate only asks over the
+            # opt-in X-Unsloth-Events frames, so this says the tools run unprompted.
+            "permission_mode": "off",
             "session_id": "test-session",
         },
         headers = {"Authorization": f"Bearer {api_key}"},
@@ -259,11 +213,215 @@ def test_curl_with_tools(base_url: str, api_key: str):
     assert status == 200, f"Expected 200, got {status}"
     assert len(chunks) > 0, "No SSE chunks received for tools request"
 
-    # Check that at least one chunk has the expected shape
-    has_valid_chunk = any("choices" in c or "type" in c for c in chunks)
+    # The snippet shape has no X-Unsloth-Events, so only `choices` chunks can arrive.
+    has_valid_chunk = any("choices" in c for c in chunks)
     assert has_valid_chunk, "No valid chunks in tools response"
     full = _collect_streamed_content(chunks)
     print(f"  PASS  curl with tools: {len(chunks)} chunks, {len(full)} chars content")
+
+
+# OpenAI tools/tool_choice pass-through to llama-server; needs a tool-capable GGUF.
+
+_WEATHER_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "get_weather",
+        "description": "Look up the current weather for a given city.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "city": {
+                    "type": "string",
+                    "description": "The name of the city, e.g. 'Paris'.",
+                },
+            },
+            "required": ["city"],
+        },
+    },
+}
+
+
+def _collect_streamed_tool_calls(chunks: list[dict]) -> list[dict]:
+    """OpenAI sends each tool call's id and name once, then its arguments as fragments across chunks."""
+    by_index: dict[int, dict] = {}
+    for c in chunks:
+        choices = c.get("choices") or []
+        if not choices:
+            continue
+        delta = choices[0].get("delta") or {}
+        tool_calls = delta.get("tool_calls") or []
+        for tc in tool_calls:
+            idx = tc.get("index", 0)
+            slot = by_index.setdefault(
+                idx,
+                {
+                    "id": None,
+                    "type": "function",
+                    "function": {"name": None, "arguments": ""},
+                },
+            )
+            if tc.get("id"):
+                slot["id"] = tc["id"]
+            fn = tc.get("function") or {}
+            if fn.get("name"):
+                slot["function"]["name"] = fn["name"]
+            if fn.get("arguments"):
+                slot["function"]["arguments"] += fn["arguments"]
+    return [by_index[i] for i in sorted(by_index)]
+
+
+def _final_finish_reason(chunks: list[dict]) -> str | None:
+    for c in reversed(chunks):
+        choices = c.get("choices") or []
+        if not choices:
+            continue
+        fr = choices[0].get("finish_reason")
+        if fr is not None:
+            return fr
+    return None
+
+
+def test_openai_tools_nonstream(base_url: str, api_key: str):
+    """llama-server's tool_calls must be forwarded verbatim, not flattened to plain text."""
+    status, text = _http(
+        "POST",
+        f"{base_url}/v1/chat/completions",
+        body = {
+            "messages": [{"role": "user", "content": "What is the weather in Paris?"}],
+            "tools": [_WEATHER_TOOL],
+            "tool_choice": "required",
+            "stream": False,
+        },
+        headers = {"Authorization": f"Bearer {api_key}"},
+        timeout = 120,
+    )
+    assert status == 200, f"Expected 200, got {status}: {text[:500]}"
+    data = json.loads(text)
+    assert "choices" in data, f"Missing 'choices': {text[:300]}"
+    choice = data["choices"][0]
+    assert (
+        choice["finish_reason"] == "tool_calls"
+    ), f"Expected finish_reason='tool_calls', got {choice['finish_reason']!r}"
+    msg = choice["message"]
+    tool_calls = msg.get("tool_calls") or []
+    assert len(tool_calls) >= 1, f"No tool_calls in response: {msg}"
+    first = tool_calls[0]
+    assert first["type"] == "function"
+    assert (
+        first["function"]["name"] == "get_weather"
+    ), f"Wrong tool name: {first['function']['name']!r}"
+    parsed = json.loads(first["function"]["arguments"])
+    assert "city" in parsed, f"Tool call missing required 'city' arg: {parsed}"
+    usage = data.get("usage") or {}
+    assert usage.get("prompt_tokens", 0) > 0, f"Expected non-zero prompt_tokens; got {usage}"
+    assert data.get("id"), "Missing response id"
+    print(
+        f"  PASS  openai tools non-stream: "
+        f"tool={first['function']['name']}, args={parsed}, "
+        f"prompt_tokens={usage['prompt_tokens']}"
+    )
+
+
+def test_openai_tools_stream(base_url: str, api_key: str):
+    """Standard OpenAI function calling, streaming, tool_choice='required'."""
+    status, chunks = _stream_http(
+        f"{base_url}/v1/chat/completions",
+        body = {
+            "messages": [{"role": "user", "content": "What is the weather in Tokyo?"}],
+            "tools": [_WEATHER_TOOL],
+            "tool_choice": "required",
+            "stream": True,
+        },
+        headers = {"Authorization": f"Bearer {api_key}"},
+        timeout = 120,
+    )
+    assert status == 200, f"Expected 200, got {status}"
+    assert len(chunks) > 0, "No SSE chunks received"
+    assert (
+        _final_finish_reason(chunks) == "tool_calls"
+    ), f"Expected final finish_reason='tool_calls', got {_final_finish_reason(chunks)!r}"
+    assembled = _collect_streamed_tool_calls(chunks)
+    assert len(assembled) >= 1, "No tool_calls reassembled from stream"
+    first = assembled[0]
+    assert first["function"]["name"] == "get_weather"
+    parsed = json.loads(first["function"]["arguments"])
+    assert "city" in parsed
+    print(
+        f"  PASS  openai tools stream: {len(chunks)} chunks, "
+        f"tool={first['function']['name']}, args={parsed}"
+    )
+
+
+def test_openai_tools_multiturn(base_url: str, api_key: str):
+    """The message model must accept role='tool' and assistant tool_calls, beyond system/user/assistant."""
+    status, text = _http(
+        "POST",
+        f"{base_url}/v1/chat/completions",
+        body = {
+            "messages": [
+                {"role": "user", "content": "What is the weather in Paris?"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call_test_1",
+                            "type": "function",
+                            "function": {
+                                "name": "get_weather",
+                                "arguments": '{"city": "Paris"}',
+                            },
+                        }
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_test_1",
+                    "content": '{"temperature_c": 14, "condition": "cloudy"}',
+                },
+            ],
+            "tools": [_WEATHER_TOOL],
+            "stream": False,
+        },
+        headers = {"Authorization": f"Bearer {api_key}"},
+        timeout = 120,
+    )
+    assert status == 200, f"Expected 200, got {status}: {text[:500]}"
+    data = json.loads(text)
+    msg = data["choices"][0]["message"]
+    content = msg.get("content") or ""
+    assert len(content) > 0 or msg.get(
+        "tool_calls"
+    ), f"Expected text or follow-up tool call, got empty message: {msg}"
+    print(f"  PASS  openai tools multiturn: {content[:80]!r}")
+
+
+def test_openai_sdk_tool_calling(base_url: str, api_key: str):
+    """OpenAI Python SDK round trip — the real client shape opencode et al. use."""
+    try:
+        from openai import OpenAI
+    except ImportError:
+        print("  SKIP  openai SDK not installed")
+        return
+
+    client = OpenAI(base_url = f"{base_url}/v1", api_key = api_key)
+    resp = client.chat.completions.create(
+        model = "current",
+        messages = [{"role": "user", "content": "What's the weather in Berlin?"}],
+        tools = [_WEATHER_TOOL],
+        tool_choice = "required",
+        stream = False,
+    )
+    assert (
+        resp.choices[0].finish_reason == "tool_calls"
+    ), f"Expected finish_reason='tool_calls', got {resp.choices[0].finish_reason!r}"
+    tool_calls = resp.choices[0].message.tool_calls
+    assert tool_calls and len(tool_calls) >= 1, "No tool_calls from SDK"
+    tc = tool_calls[0]
+    assert tc.function.name == "get_weather"
+    parsed = json.loads(tc.function.arguments)
+    assert "city" in parsed
+    print(f"  PASS  openai SDK tool calling: tool={tc.function.name}, args={parsed}")
 
 
 def test_invalid_key_rejected(base_url: str):
@@ -295,9 +453,6 @@ def test_no_key_rejected(base_url: str):
     print(f"  PASS  no API key rejected ({status})")
 
 
-# ── Anthropic SSE helper ─────────────────────────────────────────────
-
-
 def _stream_anthropic_http(
     url: str,
     *,
@@ -305,10 +460,6 @@ def _stream_anthropic_http(
     headers: dict,
     timeout: int = 60,
 ) -> tuple[int, list[tuple[str, dict]]]:
-    """POST a streaming request and collect Anthropic SSE events.
-
-    Returns (status, [(event_type, data_dict), ...]).
-    """
     data = json.dumps(body).encode()
     req = urllib.request.Request(url, data = data, headers = headers, method = "POST")
     req.add_header("Content-Type", "application/json")
@@ -341,9 +492,6 @@ def _collect_anthropic_text(events: list[tuple[str, dict]]) -> str:
             if delta.get("type") == "text_delta":
                 parts.append(delta.get("text", ""))
     return "".join(parts)
-
-
-# ── Anthropic /v1/messages test functions ────────────────────────────
 
 
 def test_anthropic_basic(base_url: str, api_key: str):
@@ -406,9 +554,7 @@ def test_anthropic_sdk(base_url: str, api_key: str):
     message = client.messages.create(
         model = "default",
         max_tokens = 100,
-        messages = [
-            {"role": "user", "content": "What is 2+2? Answer with just the number."}
-        ],
+        messages = [{"role": "user", "content": "What is 2+2? Answer with just the number."}],
     )
     assert message.role == "assistant"
     assert len(message.content) > 0, "Empty content"
@@ -459,19 +605,66 @@ def test_anthropic_with_tools(base_url: str, api_key: str):
     assert "message_stop" in event_types, "Missing message_stop"
 
     full = _collect_anthropic_text(events)
+    print(f"  PASS  anthropic with tools: {len(events)} events, {len(full)} chars content")
+
+
+def test_anthropic_tool_choice_any(base_url: str, api_key: str):
+    """tool_choice {type: any} must be forwarded as tool_choice required, not dropped with a warning."""
+    status, events = _stream_anthropic_http(
+        f"{base_url}/v1/messages",
+        body = {
+            "model": "default",
+            "max_tokens": 256,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "What is the weather in London right now?",
+                }
+            ],
+            "tools": [
+                {
+                    "name": "get_weather",
+                    "description": "Look up current weather for a city.",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {
+                            "city": {"type": "string"},
+                        },
+                        "required": ["city"],
+                    },
+                }
+            ],
+            "tool_choice": {"type": "any"},
+            "stream": True,
+        },
+        headers = {"Authorization": f"Bearer {api_key}"},
+        timeout = 120,
+    )
+    assert status == 200, f"Expected 200, got {status}"
+    assert len(events) > 0, "No SSE events received"
+
+    stop_reason = None
+    for etype, data in events:
+        if etype == "message_delta":
+            stop_reason = data.get("delta", {}).get("stop_reason") or stop_reason
+    assert stop_reason == "tool_use", (
+        f"Expected stop_reason='tool_use' with tool_choice=any, got "
+        f"{stop_reason!r} — tool_choice may not be forwarded to llama-server."
+    )
+
+    tool_use_starts = [
+        e
+        for e in events
+        if e[0] == "content_block_start" and e[1].get("content_block", {}).get("type") == "tool_use"
+    ]
+    assert len(tool_use_starts) >= 1, "No tool_use content block emitted"
     print(
-        f"  PASS  anthropic with tools: {len(events)} events, {len(full)} chars content"
+        f"  PASS  anthropic tool_choice=any honored: "
+        f"{len(tool_use_starts)} tool_use blocks, stop_reason={stop_reason}"
     )
 
 
-# ── Server lifecycle ─────────────────────────────────────────────────
-
-
 def _start_server(model: str, variant: str | None) -> tuple[subprocess.Popen, str]:
-    """Launch ``unsloth studio run`` and parse the API key from its banner.
-
-    Returns (process, api_key).
-    """
     cmd = [
         "unsloth",
         "studio",
@@ -489,39 +682,36 @@ def _start_server(model: str, variant: str | None) -> tuple[subprocess.Popen, st
         cmd.extend(["--gguf-variant", variant])
 
     LOG_FILE.parent.mkdir(parents = True, exist_ok = True)
-    log_fh = open(LOG_FILE, "w")
+    log_fh = open(LOG_FILE, "w", encoding = "utf-8")
+    # The child writes this fd itself, so force utf-8 output in the child.
+    child_env = {**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONUTF8": "1"}
     proc = subprocess.Popen(
         cmd,
         stdout = log_fh,
         stderr = subprocess.STDOUT,
         preexec_fn = os.setsid,
+        env = child_env,
     )
 
-    # Wait for the banner containing the API key
     api_key = None
     deadline = time.monotonic() + STARTUP_TIMEOUT
     while time.monotonic() < deadline:
         time.sleep(2)
         if proc.poll() is not None:
             log_fh.flush()
-            log_text = LOG_FILE.read_text()
-            raise RuntimeError(
-                f"Server exited early (code {proc.returncode}):\n{log_text[-2000:]}"
-            )
-        log_text = LOG_FILE.read_text()
+            log_text = LOG_FILE.read_text(encoding = "utf-8")
+            raise RuntimeError(f"Server exited early (code {proc.returncode}):\n{log_text[-2000:]}")
+        log_text = LOG_FILE.read_text(encoding = "utf-8")
         m = re.search(r"API Key:\s+(sk-unsloth-[a-f0-9]+)", log_text)
         if m:
             api_key = m.group(1)
             break
 
     if not api_key:
-        log_text = LOG_FILE.read_text()
+        log_text = LOG_FILE.read_text(encoding = "utf-8")
         _kill_server(proc)
-        raise RuntimeError(
-            f"Timed out waiting for API key in server output:\n{log_text[-2000:]}"
-        )
+        raise RuntimeError(f"Timed out waiting for API key in server output:\n{log_text[-2000:]}")
 
-    # Wait a moment for the model to be fully loaded
     time.sleep(2)
     return proc, api_key
 
@@ -542,13 +732,8 @@ def _kill_server(proc: subprocess.Popen):
         proc.wait(timeout = 5)
 
 
-# ── Main ─────────────────────────────────────────────────────────────
-
-
 def main():
-    parser = argparse.ArgumentParser(
-        description = "End-to-end tests for unsloth studio run"
-    )
+    parser = argparse.ArgumentParser(description = "End-to-end tests for unsloth studio run")
     parser.add_argument(
         "--model",
         default = DEFAULT_MODEL,
@@ -577,60 +762,70 @@ def main():
             failed += 1
             print(f"  ERROR {fn.__name__}: {type(exc).__name__}: {exc}")
 
-    # ── 1. Test --help (no server needed) ────────────────────────────
-    print("\n[1/11] Testing --help output")
+    print("\n[1/16] Testing --help output")
     run_test(test_help_output)
 
-    # ── 2-11. Start server and run API tests ─────────────────────────
-    print(
-        f"\nStarting server: {args.model} (variant={args.gguf_variant}) on port {PORT}..."
-    )
+    print(f"\nStarting server: {args.model} (variant={args.gguf_variant}) on port {PORT}...")
     proc = None
     try:
         proc, api_key = _start_server(args.model, args.gguf_variant)
         base_url = f"http://{HOST}:{PORT}"
         print(f"Server ready.  API Key: {api_key[:20]}...\n")
 
-        print("[2/11] Testing curl basic (non-streaming)")
+        print("[2/16] Testing curl basic (non-streaming)")
         run_test(test_curl_basic, base_url, api_key)
 
-        print("[3/11] Testing curl streaming")
+        print("[3/16] Testing curl streaming")
         run_test(test_curl_streaming, base_url, api_key)
 
-        print("[4/11] Testing OpenAI Python SDK (streaming)")
+        print("[4/16] Testing OpenAI Python SDK (streaming)")
         run_test(test_openai_sdk, base_url, api_key)
 
-        print("[5/11] Testing curl with tools")
+        print("[5/16] Testing curl with tools (server-side enable_tools)")
         run_test(test_curl_with_tools, base_url, api_key)
 
-        print("[6/11] Testing invalid API key rejection")
+        print("[6/16] Testing OpenAI standard tools (non-streaming)")
+        run_test(test_openai_tools_nonstream, base_url, api_key)
+
+        print("[7/16] Testing OpenAI standard tools (streaming)")
+        run_test(test_openai_tools_stream, base_url, api_key)
+
+        print("[8/16] Testing OpenAI standard tools (multi-turn)")
+        run_test(test_openai_tools_multiturn, base_url, api_key)
+
+        print("[9/16] Testing OpenAI SDK tool calling")
+        run_test(test_openai_sdk_tool_calling, base_url, api_key)
+
+        print("[10/16] Testing invalid API key rejection")
         run_test(test_invalid_key_rejected, base_url)
 
-        print("[7/11] Testing no API key rejection")
+        print("[11/16] Testing no API key rejection")
         run_test(test_no_key_rejected, base_url)
 
-        print("[8/11] Testing Anthropic basic (non-streaming)")
+        print("[12/16] Testing Anthropic basic (non-streaming)")
         run_test(test_anthropic_basic, base_url, api_key)
 
-        print("[9/11] Testing Anthropic streaming")
+        print("[13/16] Testing Anthropic streaming")
         run_test(test_anthropic_streaming, base_url, api_key)
 
-        print("[10/11] Testing Anthropic Python SDK")
+        print("[14/16] Testing Anthropic Python SDK")
         run_test(test_anthropic_sdk, base_url, api_key)
 
-        print("[11/11] Testing Anthropic with tools")
+        print("[15/16] Testing Anthropic with tools")
         run_test(test_anthropic_with_tools, base_url, api_key)
+
+        print("[16/16] Testing Anthropic tool_choice=any honored")
+        run_test(test_anthropic_tool_choice_any, base_url, api_key)
 
     except RuntimeError as exc:
         print(f"\nFATAL: Server failed to start: {exc}")
-        failed += 11  # count remaining tests as failed
+        failed += 16
     finally:
         if proc:
             print("\nStopping server...")
             _kill_server(proc)
             print("Server stopped.")
 
-    # ── Summary ──────────────────────────────────────────────────────
     total = passed + failed
     print(f"\n{'=' * 40}")
     print(f"Results: {passed}/{total} passed, {failed} failed")

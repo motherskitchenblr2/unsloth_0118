@@ -1,9 +1,6 @@
-# Model defaults for unsloth/gte-modernbert-base
-# Based on ModernBert.py embedding notebook
-
+# Model defaults for unsloth/gte-modernbert-base, from ModernBert.py embedding notebook
 training:
   max_seq_length: 512
-  # num_epochs: 2
   num_epochs: 0
   learning_rate: 3e-5
   batch_size: 256
@@ -29,6 +26,7 @@ lora:
     - "Wqkv"
   use_rslora: false
   use_loftq: false
+  use_dora: false
 
 logging:
   enable_wandb: false

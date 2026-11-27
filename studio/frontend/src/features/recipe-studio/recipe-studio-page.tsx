@@ -28,7 +28,10 @@ import {
 import { useShallow } from "zustand/react/shallow";
 import "@xyflow/react/dist/style.css";
 import { Button } from "@/components/ui/button";
+import { GuidedTour, useGuidedTourController } from "@/features/tour";
+import { buildRecipeEditorTourSteps } from "./tour";
 import { BlockSheet } from "./components/block-sheet";
+import { CANVAS_DELETE_KEYS } from "./constants";
 import { LayoutControls } from "./components/controls/layout-controls";
 import { RunValidateFloatingControls } from "./components/controls/run-validate-floating-controls";
 import { ViewportControls } from "./components/controls/viewport-controls";
@@ -47,6 +50,7 @@ import { ConfigDialog } from "./dialogs/config-dialog";
 import { ImportDialog } from "./dialogs/import-dialog";
 import { RunDialog } from "./dialogs/preview-dialog";
 import { ProcessorsDialog } from "./dialogs/processors-dialog";
+import { GithubCrawlerEasyView } from "./easy/github-crawler-easy-view";
 import type {
   RecipeExecutionRecord,
   RecipeStudioView,
@@ -76,18 +80,9 @@ const EDGE_TYPES: EdgeTypes = {
 };
 const COMPLETE_ISLAND_VISIBLE_MS = 7_000;
 const TAB_SWITCH_FIT_DELAY_MS = 110;
-/**
- * Maximum RAF iterations to wait for React Flow's ResizeObserver to populate
- * `node.measured` dimensions before calling fitView. ~20 frames ≈ 333 ms at
- * 60 fps — more than enough for the render → layout → ResizeObserver cycle.
- */
+/** Max RAF frames (~333 ms) to wait for ResizeObserver to fill `node.measured` before fitView. */
 const MAX_FIT_VIEW_RETRIES = 20;
-/**
- * After all target nodes appear measured, wait this many extra stable frames
- * before firing fitView. This absorbs `updateNodeInternals` calls from
- * InternalsSync and individual node mount effects that can transiently reset
- * measurements.
- */
+/** Stable frames after measurement, since updateNodeInternals can transiently reset sizes. */
 const FIT_VIEW_STABLE_FRAMES = 3;
 
 export type PersistRecipeInput = {
@@ -201,9 +196,40 @@ export function RecipeStudioPage({
     null,
   );
   const flowContainerRef = useRef<HTMLDivElement | null>(null);
-  const [activeView, setActiveView] = useState<RecipeStudioView>("editor");
+  const supportsEasyMode =
+    initialPayload?.ui?.seed_source_type === "github_repo" ||
+    (initialPayload?.recipe?.seed_config as { source?: { seed_type?: string } } | undefined)
+      ?.source?.seed_type === "github_repo";
+  const viewModeStorageKey = `recipe-studio:view-mode:${recipeId}`;
+  const [activeView, setActiveViewState] = useState<RecipeStudioView>(() => {
+    if (typeof window !== "undefined") {
+      const stored = window.localStorage.getItem(viewModeStorageKey);
+      if (stored === "easy" && supportsEasyMode) return "easy";
+      if (stored === "editor" || stored === "executions") return stored;
+    }
+    return supportsEasyMode ? "easy" : "editor";
+  });
+  const setActiveView = useCallback(
+    (next: RecipeStudioView | ((prev: RecipeStudioView) => RecipeStudioView)) => {
+      setActiveViewState((prev) => {
+        const resolved = typeof next === "function" ? next(prev) : next;
+        if (typeof window !== "undefined") {
+          window.localStorage.setItem(viewModeStorageKey, resolved);
+        }
+        return resolved;
+      });
+    },
+    [viewModeStorageKey],
+  );
+  // Easy mode has no progress island, so show the Runs pane instead of a stuck Run button.
+  const handleExecutionStart = useCallback(() => {
+    setActiveView((currentView) =>
+      currentView === "easy" ? "executions" : currentView,
+    );
+  }, [setActiveView]);
   const [processorsOpen, setProcessorsOpen] = useState(false);
   const [interactive, setInteractive] = useState(true);
+  const [maximized, setMaximized] = useState(false);
   const [runtimeIslandMinimized, setRuntimeIslandMinimized] = useState(false);
   const [recentCompletedExecution, setRecentCompletedExecution] =
     useState<RecipeExecutionRecord | null>(null);
@@ -214,6 +240,10 @@ export function RecipeStudioPage({
   const lastProcessedFitTickRef = useRef(0);
   const previousActiveViewRef = useRef<RecipeStudioView>("editor");
   const previousActiveExecutionIdRef = useRef<string | null>(null);
+  const watchedRunRef = useRef<{
+    id: string;
+    doneSeenAt: number | null;
+  } | null>(null);
   const pendingEditorTabFitRef = useRef(false);
   const forceEditorTabFitRef = useRef(false);
   const viewportMovedSinceAutoFitRef = useRef(true);
@@ -326,6 +356,8 @@ export function RecipeStudioPage({
     validateResult,
     cancelExecution,
     loadExecutionDatasetPage,
+    runPreview,
+    runFull,
     copyRecipe,
     importRecipe,
   } = useRecipeStudioActions({
@@ -338,6 +370,7 @@ export function RecipeStudioPage({
     resetRecipe,
     loadRecipe,
     getCurrentPayloadFromStore,
+    onExecutionStart: handleExecutionStart,
   });
   const {
     activeExecution,
@@ -354,10 +387,34 @@ export function RecipeStudioPage({
     auxNodePositions,
     llmAuxVisibility,
   });
+  const tourSteps = useMemo(
+    () =>
+      buildRecipeEditorTourSteps({
+        // The canvas steps need the loaded recipe, not the placeholder.
+        isGraphView: activeView === "editor" && initialRecipeReady,
+        supportsEasyMode,
+      }),
+    [activeView, initialRecipeReady, supportsEasyMode],
+  );
+  const tour = useGuidedTourController({
+    id: "recipe-editor",
+    steps: tourSteps,
+  });
+
   const executionLocked = runtimeVisualState.executionLocked;
   const canvasInteractive = interactive && !executionLocked;
   const runBusy = previewLoading || fullLoading || executionLocked;
   const islandExecution = activeExecution ?? recentCompletedExecution;
+
+  // runFull needs a non-empty fullRunName and Easy mode has no input for it, so seed a default.
+  useEffect(() => {
+    if (!supportsEasyMode) return;
+    if (activeView !== "easy") return;
+    if (fullRunName.trim()) return;
+    const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 16);
+    const base = workflowName.trim() || "Easy run";
+    setFullRunName(`${base} ${stamp}`);
+  }, [supportsEasyMode, activeView, fullRunName, workflowName, setFullRunName]);
 
   const toggleInteractive = useCallback(() => {
     if (executionLocked) {
@@ -383,6 +440,7 @@ export function RecipeStudioPage({
 
   useEffect(() => {
     if (activeExecution) {
+      watchedRunRef.current = { id: activeExecution.id, doneSeenAt: null };
       setRecentCompletedExecution(null);
       return;
     }
@@ -395,7 +453,14 @@ export function RecipeStudioPage({
       setRecentCompletedExecution(null);
       return;
     }
-    const elapsedMs = Date.now() - latestCompleted.finishedAt;
+    // finishedAt is the server's finish; a run watched here counts from when this page saw it end.
+    const watched = watchedRunRef.current;
+    let doneAt = latestCompleted.finishedAt;
+    if (watched?.id === latestCompleted.id) {
+      watched.doneSeenAt ??= Date.now();
+      doneAt = watched.doneSeenAt;
+    }
+    const elapsedMs = Date.now() - doneAt;
     if (elapsedMs >= COMPLETE_ISLAND_VISIBLE_MS) {
       setRecentCompletedExecution(null);
       return;
@@ -448,14 +513,12 @@ export function RecipeStudioPage({
       let frameId = 0;
       let cancelled = false;
 
-      /** Check whether every primary workflow node has been measured. */
       const allTargetsMeasured = (targets: Node[]): boolean =>
         targets.length > 0 &&
         targets.every(
           (n) => n.measured?.width != null && n.measured?.height != null,
         );
 
-      /** Execute fitView on the current primary workflow nodes. */
       const doFit = () => {
         const targets = getFitViewTargetNodes(reactFlowInstance.getNodes());
         if (targets.length === 0) {
@@ -477,22 +540,17 @@ export function RecipeStudioPage({
           return;
         }
         if (retries >= MAX_FIT_VIEW_RETRIES) {
-          // Timed out waiting — fit with whatever we have (graceful fallback).
           doFit();
           return;
         }
         const targets = getFitViewTargetNodes(reactFlowInstance.getNodes());
         if (allTargetsMeasured(targets)) {
           stableCount++;
-          // Wait a few extra frames after measurements appear to let
-          // updateNodeInternals (InternalsSync, node mount effects) settle.
           if (stableCount >= FIT_VIEW_STABLE_FRAMES) {
             doFit();
             return;
           }
         } else {
-          // Measurements were reset (e.g. by updateNodeInternals) — restart
-          // the stability counter.
           stableCount = 0;
         }
         retries++;
@@ -522,6 +580,12 @@ export function RecipeStudioPage({
     [reactFlowInstance],
   );
 
+  const toggleMaximize = useCallback(() => {
+    // The z-50 overlay already covers the sidebar; its pinned state is persisted, so do not touch it.
+    setMaximized((prev) => !prev);
+    scheduleFitView({ delayMs: TAB_SWITCH_FIT_DELAY_MS });
+  }, [scheduleFitView]);
+
   useEffect(() => {
     if (
       previousActiveViewRef.current !== activeView &&
@@ -539,6 +603,13 @@ export function RecipeStudioPage({
       setReactFlowInstance(null);
     }
   }, [activeView, reactFlowInstance]);
+
+  // The exit control lives in the editor canvas, so leaving the editor must drop full view.
+  useEffect(() => {
+    if (activeView !== "editor" && maximized) {
+      setMaximized(false);
+    }
+  }, [activeView, maximized]);
 
   useEffect(() => {
     if (
@@ -589,6 +660,7 @@ export function RecipeStudioPage({
         onConnect={onConnect}
         onNodeClick={handleNodeClick}
         onNodeDoubleClick={handleNodeDoubleClick}
+        deleteKeyCode={CANVAS_DELETE_KEYS}
         isValidConnection={isValidConnection}
         onMoveEnd={(event) => {
           if (event) {
@@ -599,7 +671,7 @@ export function RecipeStudioPage({
         nodesConnectable={canvasInteractive}
         elementsSelectable={canvasInteractive}
         fitView={false}
-        className="h-full w-full rounded-t-none"
+        className="@container/canvas h-full w-full rounded-t-none"
       >
         <LayoutControls
           direction={layoutDirection}
@@ -616,14 +688,14 @@ export function RecipeStudioPage({
         {nodes.length === 0 && (
           <div className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center p-4">
             <div className="pointer-events-auto w-full max-w-md rounded-2xl border border-dashed border-border/70 bg-background/80 px-6 py-6 text-center shadow-border backdrop-blur-[1px]">
-              <div className="mx-auto flex size-12 items-center justify-center corner-squircle rounded-xl border border-border/70 bg-muted/40">
+              <div className="mx-auto flex size-12 items-center justify-center corner-squircle rounded-md border border-border/70 bg-muted/40">
                 <HugeiconsIcon
                   icon={DocumentAttachmentIcon}
                   className="size-6 text-muted-foreground"
                 />
               </div>
               <div className="mt-4 space-y-2">
-                <p className="text-[11px] font-semibold uppercase tracking-wide text-primary">
+                <p className="text-ui-11 font-semibold uppercase tracking-wide text-primary">
                   Best place to start
                 </p>
                 <p className="text-sm font-semibold text-foreground">
@@ -636,6 +708,7 @@ export function RecipeStudioPage({
               </div>
               <div className="mt-5 flex flex-col justify-center gap-2 sm:flex-row">
                 <Button
+                  variant="dark"
                   type="button"
                   className="corner-squircle"
                   onClick={openSourceBlockSheet}
@@ -659,7 +732,7 @@ export function RecipeStudioPage({
             </div>
           </div>
         )}
-        <Panel position="top-right" className="m-3">
+        <Panel position="top-right" className="m-3" data-tour="recipe-add-step">
           <BlockSheet
             container={sheetContainer}
             sheetView={sheetView}
@@ -685,6 +758,8 @@ export function RecipeStudioPage({
           interactive={canvasInteractive}
           lockDisabled={executionLocked}
           onToggleInteractive={toggleInteractive}
+          maximized={maximized}
+          onToggleMaximize={toggleMaximize}
         />
         {islandExecution &&
           (isExecutionInProgress(islandExecution.status) ||
@@ -726,10 +801,25 @@ export function RecipeStudioPage({
   }
 
   return (
-    <div className="min-h-screen bg-background">
-      <main className="w-full px-6 py-8">
+    <div
+      className={
+        maximized
+          ? "fixed inset-x-0 bottom-0 z-50 flex flex-col bg-background"
+          : "flex h-full min-h-0 flex-1 flex-col bg-background"
+      }
+      style={
+        maximized
+          ? {
+              // Start below the custom/mac titlebar so the header is not hidden or click-blocked.
+              top: "var(--studio-non-chat-content-top-inset, var(--studio-content-top-inset, 0px))",
+            }
+          : undefined
+      }
+    >
+      <main className="flex min-h-0 w-full flex-1 flex-col">
+        <GuidedTour {...tour.tourProps} />
         <div
-          className="relative w-full overflow-hidden rounded-2xl corner-squircle border"
+          className="relative flex min-h-0 w-full flex-1 flex-col overflow-hidden border"
           ref={setSheetContainer}
         >
           <RecipeStudioHeader
@@ -739,6 +829,7 @@ export function RecipeStudioPage({
             savedAtLabel={savedAtLabel}
             workflowName={workflowName}
             warnings={getGraphWarnings(configs, edges)}
+            supportsEasyMode={supportsEasyMode}
             onWorkflowNameChange={setWorkflowName}
             onViewChange={setActiveView}
             onSaveRecipe={() => {
@@ -746,10 +837,24 @@ export function RecipeStudioPage({
             }}
           />
           <div
-            className="h-[75vh] w-full rounded-t-none"
+            data-tour="recipe-canvas"
+            className="flex min-h-0 w-full flex-1 rounded-t-none"
             ref={flowContainerRef}
           >
-            {activeView === "editor" ? (
+            {activeView === "easy" ? (
+              <GithubCrawlerEasyView
+                configs={configs}
+                rows={fullRows}
+                setRows={setFullRows}
+                updateConfig={updateConfig}
+                onRun={() => {
+                  void runFull();
+                }}
+                runLoading={fullLoading || executionLocked}
+                runErrors={runErrors}
+                onSwitchToAdvanced={() => setActiveView("editor")}
+              />
+            ) : activeView === "editor" ? (
               editorContent
             ) : (
               <ExecutionsView

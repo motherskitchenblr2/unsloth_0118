@@ -1,19 +1,30 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
+import { useAppShellReadySignal } from "@/components/app-readiness";
+import { apiUrl, isTauri } from "@/lib/api-base";
+import { formatApiErrorBody } from "@/lib/format-fastapi-error";
+import { normalizeAccountUsername, transitionBrowserAccount } from "@/lib/account-transition";
+import { sessionAccount, useLoginMode } from "../account-session";
+import { fetchAuthStatus, loginFromForm, loginWithPassword, setLoginMode, type TokenResponse } from "../login-client";
 import { Button } from "@/components/ui/button";
+import { MascotImg } from "@/components/mascot-img";
 import { Input } from "@/components/ui/input";
+import { useT } from "@/i18n";
 import { Label } from "@/components/ui/label";
-import { Link, useNavigate } from "@tanstack/react-router";
-import { Eye, EyeOff } from "lucide-react";
-import { useEffect, useState } from "react";
+import { Link, useNavigate, useSearch } from "@tanstack/react-router";
+import { useEffect, useRef, useState } from "react";
 import type { ReactElement } from "react";
 import type { SyntheticEvent } from "react";
-import { usePlatformStore } from "@/config/env";
-import { refreshSession } from "../api";
+import { refreshSession, refreshSessionOutcome } from "../api";
+import { clearDesktopSignedOut, continueAsDesktopOwner } from "../tauri-auto-auth";
+import {
+  deadlineFromStatus,
+  formatCountdown,
+  hasExpired,
+} from "../bootstrap-deadline";
 
-// Bootstrap credentials injected into index.html by the backend
-// (only present while default admin must_change_password is true)
+// Injected into index.html by the backend while the default admin must change its password.
 declare global {
   interface Window {
     __UNSLOTH_BOOTSTRAP__?: { username: string; password: string };
@@ -27,46 +38,13 @@ import {
   hasAuthToken,
   hasRefreshToken,
   mustChangePassword,
-  resetOnboardingDone,
   setMustChangePassword,
   storeAuthTokens,
 } from "../session";
+import { ViewIcon, ViewOffSlashIcon } from "@hugeicons/core-free-icons";
+import { HugeiconsIcon } from "@hugeicons/react";
 
 type AuthMode = "login" | "change-password";
-
-type AuthStatusResponse = {
-  initialized: boolean;
-  requires_password_change: boolean;
-};
-
-type TokenResponse = {
-  access_token: string;
-  refresh_token: string;
-  must_change_password: boolean;
-};
-
-async function loginWithPassword(
-  username: string,
-  password: string,
-): Promise<TokenResponse> {
-  const response = await fetch("/api/auth/login", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      username: username.trim(),
-      password,
-    }),
-  });
-
-  if (!response.ok) {
-    const errorPayload = (await response.json().catch(() => null)) as { detail?: string } | null;
-    throw new Error(errorPayload?.detail ?? "Login failed.");
-  }
-
-  return (await response.json()) as TokenResponse;
-}
 
 type AuthFormProps = {
   mode: AuthMode;
@@ -75,10 +53,16 @@ type AuthFormProps = {
 const HIDDEN_LOGIN_USERNAME = "unsloth";
 
 export function AuthForm({ mode }: AuthFormProps): ReactElement | null {
+  const signalReady = useAppShellReadySignal();
+  const t = useT();
   const navigate = useNavigate();
+  const { q } = useSearch({ strict: false });
   const isLoginMode = mode === "login";
   const [showPassword, setShowPassword] = useState(false);
-  const username = HIDDEN_LOGIN_USERNAME;
+  const [showNewPassword, setShowNewPassword] = useState(false);
+  const loginMode = useLoginMode();
+  const [enteredUsername, setEnteredUsername] = useState("");
+  const username = loginMode === "multi" ? enteredUsername : HIDDEN_LOGIN_USERNAME;
   const [password, setPassword] = useState("");
   const [newPassword, setNewPassword] = useState("");
   const [confirmPassword, setConfirmPassword] = useState("");
@@ -87,53 +71,76 @@ export function AuthForm({ mode }: AuthFormProps): ReactElement | null {
   const [initialized, setInitialized] = useState<boolean | null>(null);
   const [requiresPasswordChange, setRequiresPasswordChange] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [deadlineAt, setDeadlineAt] = useState<number | null>(null);
+  const [nowMs, setNowMs] = useState<number>(() => Date.now());
+  const reloadReadySent = useRef(false);
+  // Keep the issued session so retrying a blocked cleanup does not consume the one-use setup code twice.
+  const pendingLogin = useRef<{
+    username: string;
+    password: string;
+    token: TokenResponse;
+  } | null>(null);
+
+  useEffect(() => {
+    if (deadlineAt === null) {
+      return;
+    }
+    const id = window.setInterval(() => setNowMs(Date.now()), 1000);
+    return () => window.clearInterval(id);
+  }, [deadlineAt]);
 
   useEffect(() => {
     let canceled = false;
 
     async function initializeAuthForm(): Promise<void> {
-      // Always check the server first — localStorage flags can be stale
-      // (e.g. tokens from a previous install attempt).  The server's
-      // /api/auth/status is the source of truth for requires_password_change.
+      // Server first: localStorage flags can be stale (e.g. tokens from a previous install).
       try {
-        const response = await fetch("/api/auth/status");
-        if (!response.ok) throw new Error("Failed to load auth status.");
-        const result = (await response.json()) as AuthStatusResponse;
+        const result = await fetchAuthStatus();
+        const requiresChange = result.login_mode === "multi" || isTauri
+          ? hasAuthToken() && mustChangePassword()
+          : result.requires_password_change;
         if (!canceled) {
           setInitialized(result.initialized);
-          setRequiresPasswordChange(result.requires_password_change);
+          setRequiresPasswordChange(requiresChange);
+          // One clock sample, or the request duration skews the countdown.
+          const sampledNow = Date.now();
+          setNowMs(sampledNow);
+          setDeadlineAt(
+            deadlineFromStatus(result.bootstrap_deadline_seconds, sampledNow),
+          );
 
-          // Redirect between login ↔ change-password based on server state
-          if (mode === "login" && result.requires_password_change) {
-            navigate({ to: "/change-password" });
+          if (requiresChange !== mustChangePassword()) {
+            setMustChangePassword(requiresChange);
+          }
+
+          if (mode === "login" && requiresChange) {
+            navigate({ to: "/change-password", search: { q } });
             return;
           }
-          if (mode === "change-password" && !result.requires_password_change && !mustChangePassword()) {
-            navigate({ to: "/login" });
+          if (mode === "change-password" && !requiresChange) {
+            navigate({ to: "/login", search: { q } });
             return;
           }
 
-          // On login page, if user already has a valid session and no
-          // password change is required, skip straight to the app.
-          if (isLoginMode && !result.requires_password_change) {
+          if (isLoginMode && !requiresChange) {
             if (hasRefreshToken()) {
               const refreshed = await refreshSession();
               if (refreshed) {
                 if (!canceled) setStatusLoading(false);
-                navigate({ to: getPostAuthRoute() });
+                navigate({ to: getPostAuthRoute(), search: { q }, replace: Boolean(q) });
                 return;
               }
             }
             if (hasAuthToken()) {
               if (!canceled) setStatusLoading(false);
-              navigate({ to: getPostAuthRoute() });
+              navigate({ to: getPostAuthRoute(), search: { q }, replace: Boolean(q) });
               return;
             }
           }
         }
       } catch (err: unknown) {
         if (!canceled) {
-          setError(err instanceof Error ? err.message : "Failed to load.");
+          setError(err instanceof Error ? err.message : t("auth.loadFailed"));
         }
       } finally {
         if (!canceled) setStatusLoading(false);
@@ -145,44 +152,62 @@ export function AuthForm({ mode }: AuthFormProps): ReactElement | null {
     return () => {
       canceled = true;
     };
-  }, [navigate]);
+  }, [navigate, q]);
 
-  // Seed password from bootstrap credentials injected into HTML
   useEffect(() => {
-    const bootstrap = window.__UNSLOTH_BOOTSTRAP__;
-    if (bootstrap) {
-      if (!isLoginMode && !password) {
+    if (statusLoading || reloadReadySent.current) return;
+    reloadReadySent.current = true;
+    signalReady();
+  }, [statusLoading, signalReady]);
+
+  useEffect(() => {
+    function loadBootstrap() {
+      const bootstrap = window.__UNSLOTH_BOOTSTRAP__;
+      if (bootstrap && !isLoginMode && !password) {
         setPassword(bootstrap.password);
       }
     }
+    loadBootstrap();
   }, []);
 
   const blockedByState =
     initialized === false ||
     (mode === "login" && requiresPasswordChange) ||
-    (mode === "change-password" && !requiresPasswordChange && !mustChangePassword());
+    (mode === "change-password" && !requiresPasswordChange);
 
   let helperText: string | null = null;
   if (initialized === false) {
-    helperText = "Auth is still bootstrapping the default admin account.";
+    helperText = t("auth.bootstrapping");
   } else if (isLoginMode && requiresPasswordChange) {
-    helperText = "Sign in once with the seeded credentials to change the password.";
-  } else if (!isLoginMode && !requiresPasswordChange && !mustChangePassword()) {
-    helperText = "Password already updated. Use the login screen.";
+    helperText = t("auth.signInToChange");
+  } else if (!isLoginMode && !requiresPasswordChange) {
+    helperText = t("auth.alreadyUpdated");
   }
-  const title = isLoginMode ? "Welcome back" : "Setup your account";
-  const subtitle = isLoginMode  
-    ? "Sign in with your password."
-    : "Choose a new password";
-  const submitLabel = isLoginMode ? "Login" : "Change password";
+  const title = isLoginMode ? t("auth.welcomeBack") : t("auth.setupTitle");
+  const subtitle = isLoginMode ? t("auth.loginSubtitle") : t("auth.setupSubtitle");
+  const submitLabel = isLoginMode ? t("auth.login") : t("auth.changePassword");
   const showSwitchLink = !isLoginMode;
-  const switchText = "Password already setup? ";
+  const switchText = t("auth.alreadySetUp");
   const switchLinkTo = "/login";
-  const switchLinkText = "Back to login";
+  const switchLinkText = t("auth.backToLogin");
   const currentPassword = password || window.__UNSLOTH_BOOTSTRAP__?.password || "";
+  // First boot reuses the injected bootstrap password; the Current password field is only for the
+  // admin-forced change path.
+  const hasBootstrapPassword = Boolean(window.__UNSLOTH_BOOTSTRAP__?.password);
+  const changingFromSetupCode =
+    !isLoginMode && sessionAccount(getAuthToken())?.isOwner === false;
+  const passwordManagerUsername =
+    isLoginMode && loginMode === "multi"
+      ? null
+      : sessionAccount(getAuthToken())?.username || username || null;
   const invalidChangePasswordForm =
     !isLoginMode &&
-    (newPassword.length < 8 || newPassword !== confirmPassword || currentPassword === newPassword);
+    (currentPassword.length < 8 ||
+      newPassword.length < 8 ||
+      /\s/.test(newPassword) ||
+      newPassword !== confirmPassword ||
+      currentPassword === newPassword);
+  const showWhitespaceWarning = !isLoginMode && /\s/.test(newPassword);
   const showPasswordMismatchWarning =
     !isLoginMode &&
     newPassword.length > 0 &&
@@ -194,20 +219,29 @@ export function AuthForm({ mode }: AuthFormProps): ReactElement | null {
     setError(null);
 
     if (!isLoginMode) {
-      if (!currentPassword) {
-        setError("Unable to initialize setup. Reload the page and try again.");
+      // Mirror the disable gate: Enter / autofill can bypass the button.
+      if (currentPassword.length < 8) {
+        setError(
+          currentPassword
+            ? t("auth.currentTooShort")
+            : t("auth.setupInitFailed"),
+        );
         return;
       }
       if (newPassword.length < 8) {
-        setError("New password must be at least 8 characters.");
+        setError(t("auth.newTooShort"));
+        return;
+      }
+      if (/\s/.test(newPassword)) {
+        setError(t("auth.noSpaces"));
         return;
       }
       if (newPassword !== confirmPassword) {
-        setError("Passwords do not match.");
+        setError(t("auth.mismatch"));
         return;
       }
       if (currentPassword === newPassword) {
-        setError("New password must be different from your current password.");
+        setError(t("auth.mustDiffer"));
         return;
       }
     }
@@ -217,14 +251,27 @@ export function AuthForm({ mode }: AuthFormProps): ReactElement | null {
       let token: TokenResponse;
 
       if (isLoginMode) {
-        token = await loginWithPassword(username, password);
+        const normalizedUsername = normalizeAccountUsername(username);
+        const pending = pendingLogin.current;
+        const result = pending?.username === normalizedUsername && pending.password === password
+          ? pending.token
+          : await loginFromForm(loginMode, username, password);
+        if (!result) {
+          setPassword("");
+          return;
+        }
+        pendingLogin.current = { username: normalizedUsername, password, token: result };
+        token = result;
       } else {
         let accessToken = getAuthToken();
 
         if (hasRefreshToken()) {
-          const refreshed = await refreshSession();
+          const outcome = await refreshSessionOutcome();
+          if (outcome === "unavailable") {
+            throw new Error(t("auth.busy"));
+          }
           accessToken = getAuthToken();
-          if (!refreshed) {
+          if (outcome === "rejected") {
             clearAuthTokens();
             accessToken = null;
           }
@@ -232,16 +279,19 @@ export function AuthForm({ mode }: AuthFormProps): ReactElement | null {
 
         if (!accessToken) {
           const bootstrapToken = await loginWithPassword(username, currentPassword);
-          storeAuthTokens(
-            bootstrapToken.access_token,
-            bootstrapToken.refresh_token,
-            bootstrapToken.must_change_password,
+          const replaced = await transitionBrowserAccount(
+            { username, accountId: bootstrapToken.account_id },
+            q ? `/change-password?q=${encodeURIComponent(q)}` : "/change-password",
+            () => {
+              storeAuthTokens(bootstrapToken.access_token, bootstrapToken.refresh_token);
+              setMustChangePassword(bootstrapToken.must_change_password);
+            },
           );
-          setMustChangePassword(bootstrapToken.must_change_password);
+          if (replaced) return;
           accessToken = bootstrapToken.access_token;
         }
 
-        const response = await fetch("/api/auth/change-password", {
+        const response = await fetch(apiUrl("/api/auth/change-password"), {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
@@ -254,39 +304,53 @@ export function AuthForm({ mode }: AuthFormProps): ReactElement | null {
         });
 
         if (!response.ok) {
-          let message = "Password update failed.";
-          const errorPayload = (await response
-            .json()
-            .catch(() => null)) as { detail?: string } | null;
-          if (errorPayload?.detail) message = errorPayload.detail;
-          throw new Error(message);
+          const errorPayload = await response.json().catch(() => null);
+          throw new Error(
+            formatApiErrorBody(errorPayload) ?? t("auth.updateFailed"),
+          );
         }
 
         token = (await response.json()) as TokenResponse;
       }
 
-      if (!isLoginMode) {
-        resetOnboardingDone();
-        setRequiresPasswordChange(false);
-        setMustChangePassword(false);
-      } else {
-        setMustChangePassword(token.must_change_password);
-      }
-      storeAuthTokens(
-        token.access_token,
-        token.refresh_token,
-        token.must_change_password,
+      // A failed clear only shows login on the next launch.
+      if (isTauri) await clearDesktopSignedOut().catch(() => undefined);
+      const finishSession = () => {
+        setLoginMode(loginMode);
+        if (!isLoginMode) setRequiresPasswordChange(false);
+        setMustChangePassword(isLoginMode && token.must_change_password);
+        storeAuthTokens(token.access_token, token.refresh_token);
+      };
+      // The transition keys on the immutable account id: a recreated username must not inherit the old browser data.
+      const signedInUsername = sessionAccount(token.access_token)?.username ?? username;
+      const route = isLoginMode && token.must_change_password ? "/change-password" : "/chat";
+      const replaced = await transitionBrowserAccount(
+        { username: signedInUsername, accountId: token.account_id },
+        q ? `${route}?q=${encodeURIComponent(q)}` : route,
+        finishSession,
       );
-      navigate({ to: getPostAuthRoute() });
+      pendingLogin.current = null;
+      if (replaced) return;
+      navigate({ to: getPostAuthRoute(), search: { q }, replace: Boolean(q) });
     } catch (err: unknown) {
-      let msg = err instanceof Error ? err.message : "Auth failed.";
-      if (msg.includes("unsloth studio reset-password") && usePlatformStore.getState().deviceType === "windows") {
-        msg = msg.replace(
-          "unsloth studio reset-password",
-          ".\\unsloth_studio\\Scripts\\unsloth.exe studio reset-password",
-        );
-      }
+      // Show the backend's PATH-based command as-is; a relative Windows path only resolves in the
+      // Unsloth home dir.
+      const msg = err instanceof Error ? err.message : t("auth.failed");
       setError(msg);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function handleContinueAsOwner() {
+    setError(null);
+    setLoading(true);
+    try {
+      if (await continueAsDesktopOwner()) {
+        navigate({ to: getPostAuthRoute(), search: { q }, replace: Boolean(q) });
+      } else {
+        setError(t("auth.signInWithUsername"));
+      }
     } finally {
       setLoading(false);
     }
@@ -297,23 +361,66 @@ export function AuthForm({ mode }: AuthFormProps): ReactElement | null {
   return (
     <div className="w-full max-w-sm space-y-6">
       <div className="space-y-1.5 text-center">
-        <img
-          src="/Sloth emojis/large sloth wave.png"
-          alt="Unsloth waving mascot"
+        <MascotImg
+          src="Sloth emojis/large sloth wave.png"
           className="mx-auto mb-2 h-20 w-20 object-contain"
         />
-        <h2 className="text-2xl font-semibold text-foreground">{title}</h2>
+        <h2 className="text-[calc(1.5rem*var(--ui-font-scale,1))] font-semibold text-foreground">{title}</h2>
         <p className="text-muted-foreground">{subtitle}</p>
       </div>
+      {/* Not a live region: it re-renders every second, so it would be read aloud on every tick. */}
+      {deadlineAt !== null && (
+        <p className="rounded-lg border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-center text-sm text-amber-600">
+          {hasExpired(deadlineAt - nowMs) ? (
+            t("auth.shuttingDown")
+          ) : (
+            t("auth.shutdownCountdown", { time: formatCountdown(deadlineAt - nowMs) })
+          )}
+        </p>
+      )}
       <form className="space-y-5" onSubmit={handleSubmit}>
+        {passwordManagerUsername && (
+          <input
+            type="text"
+            name="username"
+            autoComplete="username"
+            value={passwordManagerUsername}
+            readOnly
+            tabIndex={-1}
+            aria-hidden="true"
+            className="sr-only"
+          />
+        )}
+        {isLoginMode && loginMode === "multi" && (
+          <div className="space-y-2">
+            <Label htmlFor="username">{t("auth.username")}</Label>
+            <Input
+              id="username"
+              name="username"
+              autoComplete="username"
+              autoCapitalize="none"
+              spellCheck={false}
+              value={enteredUsername}
+              onChange={(event) => setEnteredUsername(event.target.value)}
+              required
+            />
+            <p id="setup-code-hint" className="text-sm text-muted-foreground">
+              {t("auth.setupCodeHint")}
+            </p>
+            <p className="text-sm text-muted-foreground">
+              {t("auth.ownerHint")}
+            </p>
+          </div>
+        )}
         {isLoginMode && (
           <div className="space-y-2">
-            <Label htmlFor="password">Password</Label>
+            <Label htmlFor="password">{t("auth.password")}</Label>
             <div className="relative">
               <Input
                 id="password"
+                aria-describedby={loginMode === "multi" ? "setup-code-hint" : undefined}
                 type={showPassword ? "text" : "password"}
-                className="pr-10"
+                className="pr-10 tracking-[0.02em]"
                 autoComplete="current-password"
                 value={password}
                 onChange={(event) => setPassword(event.target.value)}
@@ -328,9 +435,9 @@ export function AuthForm({ mode }: AuthFormProps): ReactElement | null {
                 onClick={() => setShowPassword((prev) => !prev)}
               >
                 {showPassword ? (
-                  <EyeOff className="h-4 w-4" />
+                  <HugeiconsIcon icon={ViewOffSlashIcon} className="h-4 w-4" />
                 ) : (
-                  <Eye className="h-4 w-4" />
+                  <HugeiconsIcon icon={ViewIcon} className="h-4 w-4" />
                 )}
               </Button>
             </div>
@@ -339,13 +446,54 @@ export function AuthForm({ mode }: AuthFormProps): ReactElement | null {
 
         {!isLoginMode && (
           <>
+            {!hasBootstrapPassword && (
+              <div className="space-y-2">
+                <Label htmlFor="current-password">{t("auth.currentPassword")}</Label>
+                <div className="relative">
+                  <Input
+                    id="current-password"
+                    aria-describedby={
+                      changingFromSetupCode ? "current-setup-code-hint" : undefined
+                    }
+                    type={showPassword ? "text" : "password"}
+                    className="pr-10 tracking-[0.02em]"
+                    autoComplete="current-password"
+                    value={password}
+                    onChange={(event) => setPassword(event.target.value)}
+                    minLength={8}
+                    required
+                  />
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="icon"
+                    className="absolute right-0 top-0 h-full px-3 text-muted-foreground hover:bg-transparent"
+                    onClick={() => setShowPassword((prev) => !prev)}
+                  >
+                    {showPassword ? (
+                      <HugeiconsIcon icon={ViewOffSlashIcon} className="h-4 w-4" />
+                    ) : (
+                      <HugeiconsIcon icon={ViewIcon} className="h-4 w-4" />
+                    )}
+                  </Button>
+                </div>
+                {changingFromSetupCode && (
+                  <p
+                    id="current-setup-code-hint"
+                    className="text-sm text-muted-foreground"
+                  >
+                    {t("auth.currentSetupCodeHint")}
+                  </p>
+                )}
+              </div>
+            )}
             <div className="space-y-2">
-              <Label htmlFor="new-password">New password</Label>
+              <Label htmlFor="new-password">{t("auth.newPassword")}</Label>
               <div className="relative">
                 <Input
                   id="new-password"
-                  type={showPassword ? "text" : "password"}
-                  className="pr-10"
+                  type={showNewPassword ? "text" : "password"}
+                  className="pr-10 tracking-[0.02em]"
                   autoComplete="new-password"
                   value={newPassword}
                   onChange={(event) => setNewPassword(event.target.value)}
@@ -357,21 +505,22 @@ export function AuthForm({ mode }: AuthFormProps): ReactElement | null {
                   variant="ghost"
                   size="icon"
                   className="absolute right-0 top-0 h-full px-3 text-muted-foreground hover:bg-transparent"
-                  onClick={() => setShowPassword((prev) => !prev)}
+                  onClick={() => setShowNewPassword((prev) => !prev)}
                 >
-                  {showPassword ? (
-                    <EyeOff className="h-4 w-4" />
+                  {showNewPassword ? (
+                    <HugeiconsIcon icon={ViewOffSlashIcon} className="h-4 w-4" />
                   ) : (
-                    <Eye className="h-4 w-4" />
+                    <HugeiconsIcon icon={ViewIcon} className="h-4 w-4" />
                   )}
                 </Button>
               </div>
             </div>
             <div className="space-y-2">
-              <Label htmlFor="confirm-password">Confirm password</Label>
+              <Label htmlFor="confirm-password">{t("auth.confirmPassword")}</Label>
               <Input
                 id="confirm-password"
                 type="password"
+                className="tracking-[0.02em]"
                 autoComplete="new-password"
                 value={confirmPassword}
                 onChange={(event) => setConfirmPassword(event.target.value)}
@@ -381,13 +530,17 @@ export function AuthForm({ mode }: AuthFormProps): ReactElement | null {
             </div>
             <p
               className={`min-h-4 text-xs ${
-                showPasswordMismatchWarning ? "text-destructive" : "text-muted-foreground"
+                showWhitespaceWarning || showPasswordMismatchWarning
+                  ? "text-destructive"
+                  : "text-muted-foreground"
               }`}
               aria-live="polite"
             >
-              {showPasswordMismatchWarning
-                ? "Please ensure passwords match."
-                : "Must be at least 8 characters."}
+              {showWhitespaceWarning
+                ? t("auth.noSpaces")
+                : showPasswordMismatchWarning
+                  ? t("auth.ensureMatch")
+                  : t("auth.minLength")}
             </p>
           </>
         )}
@@ -395,27 +548,45 @@ export function AuthForm({ mode }: AuthFormProps): ReactElement | null {
         {helperText && (
           <p className="text-center text-sm text-amber-600">{helperText}</p>
         )}
-        {error && <p className="text-center text-sm text-destructive">{error}</p>}
+        {error && (
+          <p className="text-center text-xs text-destructive [overflow-wrap:anywhere]">
+            {error}
+          </p>
+        )}
 
         <Button
+          variant="primary"
           type="submit"
-          className="w-full"
+          size="hero"
+          className="mx-auto flex h-[2.967em] w-fit bg-control-accent px-[1.56em] pt-0 pb-[0.07em] [font-family:var(--font-heading)] text-[0.875rem] font-semibold tracking-[0.02em] text-control-accent-foreground hover:bg-control-accent/85"
           disabled={
             loading ||
             statusLoading ||
             blockedByState ||
-            (isLoginMode && password.length < 8) ||
+            (isLoginMode && (password.length < 8 || (loginMode === "multi" && !username.trim()))) ||
             invalidChangePasswordForm
           }
         >
-          {loading ? "Please wait..." : submitLabel}
+          {loading ? t("auth.pleaseWait") : submitLabel}
         </Button>
+        {/* Single mode only: there the shell secret proves the owner, who may never have set a password. */}
+        {isTauri && isLoginMode && loginMode === "single" && (
+          <Button
+            type="button"
+            variant="ghost"
+            className="mx-auto flex w-fit"
+            disabled={loading || statusLoading}
+            onClick={() => void handleContinueAsOwner()}
+          >
+            {t("auth.continueAsOwner")}
+          </Button>
+        )}
       </form>
 
       {showSwitchLink && (
         <p className="text-center text-sm text-muted-foreground">
           {switchText}
-          <Link to={switchLinkTo} className="text-primary hover:underline">
+          <Link to={switchLinkTo} search={{ q }} className="text-primary hover:underline">
             {switchLinkText}
           </Link>
         </p>

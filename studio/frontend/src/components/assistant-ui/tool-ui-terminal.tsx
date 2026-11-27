@@ -3,105 +3,114 @@
 
 "use client";
 
-import { copyToClipboard } from "@/lib/copy-to-clipboard";
 import type { ToolCallMessagePartComponent } from "@assistant-ui/react";
-import { CheckIcon, CopyIcon, LoaderIcon, TerminalIcon } from "lucide-react";
-import { memo, useCallback, useEffect, useRef, useState } from "react";
+import { useToolArgsStatus } from "@assistant-ui/react";
+import { TerminalIcon } from "lucide-react";
+import { Spinner } from "@/components/ui/spinner";
+import { memo, useMemo } from "react";
 import {
   ToolFallbackContent,
   ToolFallbackRoot,
   ToolFallbackTrigger,
 } from "./tool-fallback";
+import { isToolCallRunning, toolArgText } from "./tool-arg-text";
+import { CopyBtn, ToolCodeCell } from "./tool-code-cell";
+import { ToolLiveOutput } from "./tool-live-output";
+import { ToolResultOutput } from "./tool-result-output";
+import { SandboxFiles } from "./sandbox-files-view";
+import { isSandboxToolResult, type SandboxFile } from "./sandbox-files";
 
-const MAX_DISPLAY = 10_000;
-const COPY_RESET_MS = 2000;
-
-function truncate(text: string): string {
-  return text.length <= MAX_DISPLAY
-    ? text
-    : `${text.slice(0, MAX_DISPLAY)}\n... (truncated)`;
-}
-
-function CopyBtn({ text }: { text: string }) {
-  const [copied, setCopied] = useState(false);
-  const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
-
-  useEffect(() => {
-    return () => {
-      if (timer.current) {
-        clearTimeout(timer.current);
-      }
-    };
-  }, []);
-
-  const copy = useCallback(() => {
-    if (copyToClipboard(text)) {
-      setCopied(true);
-      if (timer.current) {
-        clearTimeout(timer.current);
-      }
-      timer.current = setTimeout(() => setCopied(false), COPY_RESET_MS);
-    }
-  }, [text]);
-
-  return (
-    <button
-      type="button"
-      onClick={copy}
-      className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-xs text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
-      aria-label="Copy to clipboard"
-    >
-      {copied ? (
-        <CheckIcon className="size-3" />
-      ) : (
-        <CopyIcon className="size-3" />
-      )}
-      {copied ? "Copied" : "Copy"}
-    </button>
-  );
-}
+import {
+  preferSanitizedFullToolOutput,
+  toolResultText,
+  useToolAwaitingApproval,
+  useToolOutput,
+} from "@/features/chat";
 
 const TerminalToolUIImpl: ToolCallMessagePartComponent = ({
+  toolCallId,
   args,
   result,
   status,
 }) => {
-  const command = (args as { command?: string })?.command ?? "";
-  const isRunning = status?.type === "running";
+  const command = toolArgText((args as { command?: unknown })?.command);
+  const isRunning = isToolCallRunning(status);
+  // Args still streaming = the model is WRITING the command, not running it yet.
+  const { propStatus } = useToolArgsStatus();
+  const isWritingCommand = isRunning && propStatus.command === "streaming";
+  // Same test the adapter applies; a foreign result with only text would otherwise render alone.
+  const structured = isSandboxToolResult(result)
+    ? (result as unknown as { text: string; sessionId?: string; files?: SandboxFile[] })
+    : null;
+  const files = structured?.files ?? [];
+  const sessionId = structured?.sessionId ?? "";
   const output =
-    typeof result === "string"
-      ? result
-      : result
-        ? JSON.stringify(result, null, 2)
-        : "";
+    structured !== null
+      ? toolResultText(structured.text)
+      : result == null
+        ? ""
+        : toolResultText(result);
+
+  // Prefer the fuller live stream over a truncated result; after a reload only the result remains.
+  const fullOutput = useToolOutput("toolFullOutput", toolCallId);
+  // Compare sanitized text on both sides or the reconciliation appends a duplicate prefix.
+  const displayOutput = useMemo(
+    () => preferSanitizedFullToolOutput(fullOutput, output),
+    [fullOutput, output],
+  );
+  // The gate opens only once the call parsed, so pending approval means the command is written.
+  const awaitingApproval = useToolAwaitingApproval(toolCallId);
+  const isWriting = isWritingCommand && !awaitingApproval;
 
   return (
-    <ToolFallbackRoot>
+    // awaitingApproval overrides the preference: the trigger shows only 60 characters.
+    <ToolFallbackRoot
+      defaultOpen={isRunning}
+      awaitingApproval={awaitingApproval}
+    >
       <ToolFallbackTrigger
         toolName={command ? `$ ${command.slice(0, 60)}` : "Terminal"}
         status={status}
         icon={TerminalIcon}
       />
       <ToolFallbackContent>
+        {command && (
+          <ToolCodeCell
+            label="command"
+            code={command}
+            language="bash"
+            downloadName="command.sh"
+            streaming={isWriting}
+          />
+        )}
         <div className="border-l-2 border-muted-foreground/20 pl-2">
           {isRunning ? (
-            <div className="flex items-center gap-2 text-sm text-muted-foreground">
-              <LoaderIcon className="size-3.5 animate-spin" />
-              <span>Running&hellip;</span>
-            </div>
-          ) : output ? (
+            <>
+              <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                <Spinner className="size-3.5" />
+                <span>
+                  {awaitingApproval
+                    ? "Waiting for approval…"
+                    : isWriting
+                      ? "Writing command…"
+                      : "Running…"}
+                </span>
+              </div>
+              <ToolLiveOutput toolCallId={toolCallId} />
+            </>
+          ) : displayOutput ? (
             <div>
               <div className="flex items-center justify-between">
                 <span className="text-xs font-medium text-muted-foreground">output</span>
-                <CopyBtn text={output} />
+                <CopyBtn text={displayOutput} />
               </div>
-              <pre className="mt-1 max-h-60 overflow-auto whitespace-pre-wrap break-words font-mono text-xs">
-                {truncate(output)}
-              </pre>
+              <ToolResultOutput text={displayOutput} />
             </div>
           ) : null}
         </div>
       </ToolFallbackContent>
+      {/* Files stay outside even when the card is collapsed (#10425) */}
+      <SandboxFiles className="ml-5" sessionId={sessionId} files={files} />
     </ToolFallbackRoot>
   );
 };

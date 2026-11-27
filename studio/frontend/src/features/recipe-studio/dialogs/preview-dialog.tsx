@@ -10,17 +10,16 @@ import {
 } from "@/components/ui/collapsible";
 import {
   Dialog,
-  DialogContent,
   DialogFooter,
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
+import { ChevronDownStandardIcon } from "@/lib/chevron-icons";
 import { cn } from "@/lib/utils";
 import {
-  AlertCircleIcon,
-  ArrowDown01Icon,
+  Alert02Icon,
   CheckmarkCircle02Icon,
   CookBookIcon,
   TestTube01Icon,
@@ -30,6 +29,7 @@ import { type ReactElement, type ReactNode, useState } from "react";
 import type { RecipeExecutionKind } from "../execution-types";
 import type { RecipeRunSettings } from "../stores/recipe-executions";
 import { FieldLabel } from "./shared/field-label";
+import { RecipeDialogContent } from "./shared/recipe-dialog-content";
 
 type RunDialogProps = {
   open: boolean;
@@ -182,7 +182,7 @@ function AdvancedSettingsSection({
   children: ReactNode;
 }): ReactElement {
   return (
-    <div className="space-y-3 rounded-2xl border border-border/70 bg-card/60 p-4">
+    <div className="space-y-3 rounded-xl border border-border/70 bg-card/60 p-4">
       <div className="space-y-0.5">
         <p className="text-sm font-semibold text-foreground">{title}</p>
         <p className="text-xs text-muted-foreground">{description}</p>
@@ -204,7 +204,7 @@ function ValidationResultPanel({
   return (
     <div
       className={cn(
-        "space-y-3 rounded-2xl border p-4 shadow-border backdrop-blur-sm",
+        "space-y-3 rounded-xl border p-4 shadow-border backdrop-blur-sm",
         validateResult.valid
           ? "border-emerald-300/70 bg-emerald-50/80 dark:border-emerald-900/60 dark:bg-emerald-950/30"
           : "border-destructive/30 bg-destructive/5",
@@ -221,7 +221,7 @@ function ValidationResultPanel({
         >
           <HugeiconsIcon
             icon={
-              validateResult.valid ? CheckmarkCircle02Icon : AlertCircleIcon
+              validateResult.valid ? CheckmarkCircle02Icon : Alert02Icon
             }
             className="size-4"
           />
@@ -253,8 +253,13 @@ function ValidationResultPanel({
           ))}
         </div>
       )}
-      {!validateResult.valid && validateResult.rawDetail && (
-        <p className="break-words text-xs text-destructive">
+      {validateResult.rawDetail && (
+        <p
+          className={cn(
+            "break-words text-xs",
+            validateResult.valid ? "text-muted-foreground" : "text-destructive",
+          )}
+        >
           {validateResult.rawDetail}
         </p>
       )}
@@ -338,7 +343,7 @@ function RunDialogBody({
         <div className="grid grid-cols-2 gap-2">
           <Button
             type="button"
-            variant={kind === "preview" ? "default" : "outline"}
+            variant={kind === "preview" ? "dark" : "outline"}
             className="corner-squircle min-h-10 justify-center whitespace-normal px-3 text-center"
             aria-pressed={kind === "preview"}
             onClick={() => onKindChange("preview")}
@@ -347,7 +352,7 @@ function RunDialogBody({
           </Button>
           <Button
             type="button"
-            variant={kind === "full" ? "default" : "outline"}
+            variant={kind === "full" ? "dark" : "outline"}
             className="corner-squircle min-h-10 justify-center whitespace-normal px-3 text-center"
             aria-pressed={kind === "full"}
             onClick={() => onKindChange("full")}
@@ -408,7 +413,7 @@ function RunDialogBody({
             className="flex items-center gap-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground hover:text-foreground"
           >
             <HugeiconsIcon
-              icon={ArrowDown01Icon}
+              icon={ChevronDownStandardIcon}
               className={cn(
                 "size-3.5 transition-transform",
                 advancedOpen && "rotate-180",
@@ -425,7 +430,7 @@ function RunDialogBody({
               title="Batching"
               description="Use batches when you want to split a larger run into smaller pieces."
             >
-              <div className="flex items-center justify-between gap-3 text-sm">
+              <div className="flex items-start justify-between gap-3 text-sm">
                 <div className="space-y-0.5">
                   <span className="font-medium">Enable batching</span>
                   <p className="text-xs text-muted-foreground">
@@ -433,6 +438,7 @@ function RunDialogBody({
                   </p>
                 </div>
                 <Switch
+                  className="mt-[var(--ui-title-cap-inset)]"
                   checked={settings.batchEnabled}
                   onCheckedChange={(checked) =>
                     onSettingsChange({ batchEnabled: Boolean(checked) })
@@ -518,7 +524,7 @@ function RunDialogBody({
                       )
                     }
                   />
-                  <div className="flex items-center justify-between gap-3 rounded-xl border border-border/60 bg-background/60 px-3 py-2 text-sm text-foreground">
+                  <div className="flex items-start justify-between gap-3 rounded-lg border border-border/60 bg-background/60 px-3 py-2 text-sm text-foreground">
                     <div className="space-y-0.5">
                       <p className="font-medium">Merge batches into one file</p>
                       <p className="text-xs text-muted-foreground">
@@ -526,6 +532,7 @@ function RunDialogBody({
                       </p>
                     </div>
                     <Switch
+                      className="mt-[var(--ui-title-cap-inset)]"
                       checked={settings.mergeBatches}
                       onCheckedChange={(checked) =>
                         onSettingsChange({ mergeBatches: Boolean(checked) })
@@ -610,19 +617,23 @@ function RunDialogBody({
                     0,
                     MAX_RETRY_STEPS,
                     (value) =>
-                      onSettingsChange({ maxConversationCorrectionSteps: value }),
+                      onSettingsChange({
+                        maxConversationCorrectionSteps: value,
+                      }),
                     setCorrectionsDraft,
                   )
                 }
               />
-              <div className="flex items-center justify-between gap-3 rounded-xl border border-border/60 bg-background/60 px-3 py-2 text-sm text-foreground md:col-span-2">
+              <div className="flex items-start justify-between gap-3 rounded-lg border border-border/60 bg-background/60 px-3 py-2 text-sm text-foreground md:col-span-2">
                 <div className="space-y-0.5">
                   <p className="font-medium">Keep running through failures</p>
                   <p className="text-xs text-muted-foreground">
-                    Useful for longer runs when you want as many rows as possible.
+                    Useful for longer runs when you want as many rows as
+                    possible.
                   </p>
                 </div>
                 <Switch
+                  className="mt-[var(--ui-title-cap-inset)]"
                   checked={settings.disableEarlyShutdown}
                   onCheckedChange={(checked) =>
                     onSettingsChange({
@@ -637,24 +648,28 @@ function RunDialogBody({
       </Collapsible>
 
       {errors.length > 0 && (
-        <div className="max-h-44 space-y-2 overflow-y-auto rounded-2xl border border-destructive/30 bg-destructive/5 p-4 shadow-border">
-          <div className="flex items-center gap-2">
-            <HugeiconsIcon
-              icon={AlertCircleIcon}
-              className="size-4 text-destructive"
-            />
-            <Badge
-              variant="outline"
-              className="rounded-full text-[10px] text-destructive"
-            >
-              Before you run
-            </Badge>
+        // Scrolls an inner viewport: the shadow would not survive the clip .scroll-rounded takes in
+        // Firefox. The surface padding keeps the scrollbar clear of the curve. 11rem in all, as before.
+        <div className="overflow-hidden rounded-lg border border-destructive/30 bg-destructive/5 py-3 shadow-border">
+          <div className="max-h-38 space-y-2 overflow-y-auto px-4 py-1">
+            <div className="flex items-center gap-2">
+              <HugeiconsIcon
+                icon={Alert02Icon}
+                className="size-4 text-destructive"
+              />
+              <Badge
+                variant="outline"
+                className="rounded-full text-ui-10 text-destructive"
+              >
+                Before you run
+              </Badge>
+            </div>
+            {errors.map((error) => (
+              <p key={error} className="break-words text-xs text-destructive">
+                {error}
+              </p>
+            ))}
           </div>
-          {errors.map((error) => (
-            <p key={error} className="break-words text-xs text-destructive">
-              {error}
-            </p>
-          ))}
         </div>
       )}
 
@@ -666,7 +681,7 @@ function RunDialogBody({
           variant="outline"
           onClick={onClose}
           disabled={loading}
-          className="corner-squircle border-border/70 bg-card/70"
+          className="corner-squircle"
         >
           Cancel
         </Button>
@@ -675,12 +690,13 @@ function RunDialogBody({
           variant="outline"
           onClick={onValidate}
           disabled={loading || validateLoading}
-          className="corner-squircle border-border/70 bg-card/70"
+          className="corner-squircle"
         >
           <HugeiconsIcon icon={TestTube01Icon} className="size-3.5" />
           {validateLoading ? "Checking..." : "Check recipe"}
         </Button>
         <Button
+          variant="dark"
           type="button"
           onClick={onRun}
           disabled={loading || isFullRunNameMissing}
@@ -704,19 +720,16 @@ export function RunDialog({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent
+      <RecipeDialogContent
         container={container}
-        position="absolute"
-        overlayPosition="absolute"
-        overlayClassName="bg-transparent"
-        className="corner-squircle max-h-[650px] overflow-y-auto overflow-x-hidden border-border/70 bg-background/95 sm:max-w-2xl shadow-border backdrop-blur-xl"
+        className="border-border/70 bg-background/95 backdrop-blur-xl"
       >
         <RunDialogBody
           key={draftKey}
           {...contentProps}
           onClose={() => onOpenChange(false)}
         />
-      </DialogContent>
+      </RecipeDialogContent>
     </Dialog>
   );
 }

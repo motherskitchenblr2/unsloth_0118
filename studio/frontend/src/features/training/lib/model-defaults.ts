@@ -1,50 +1,18 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
+import { usePlatformStore } from "@/config/env";
 import type { BackendModelConfig } from "../api/models-api";
 import type { TrainingConfigState } from "../types/config";
-
-type ModelDefaultsPatch = Partial<
-  Pick<
-    TrainingConfigState,
-    | "epochs"
-    | "contextLength"
-    | "learningRate"
-    | "optimizerType"
-    | "lrSchedulerType"
-    | "loraRank"
-    | "loraAlpha"
-    | "loraDropout"
-    | "loraVariant"
-    | "batchSize"
-    | "gradientAccumulation"
-    | "weightDecay"
-    | "warmupSteps"
-    | "maxSteps"
-    | "saveSteps"
-    | "evalSteps"
-    | "packing"
-    | "trainOnCompletions"
-    | "gradientCheckpointing"
-    | "randomSeed"
-    | "enableWandb"
-    | "wandbProject"
-    | "enableTensorboard"
-    | "tensorboardDir"
-    | "logFrequency"
-    | "finetuneVisionLayers"
-    | "trustRemoteCode"
-    | "finetuneLanguageLayers"
-    | "finetuneAttentionModules"
-    | "finetuneMLPModules"
-    | "targetModules"
-  >
->;
+import type { ModelDefaultsPatch } from "./model-defaults-edit-policy";
 
 function toNumber(value: unknown): number | undefined {
   if (typeof value === "number" && Number.isFinite(value)) return value;
   if (typeof value === "string") {
-    const parsed = Number(value);
+    // Do not coerce blank strings to 0.
+    const trimmed = value.trim();
+    if (trimmed === "") return undefined;
+    const parsed = Number(trimmed);
     if (Number.isFinite(parsed)) return parsed;
   }
   return undefined;
@@ -62,15 +30,50 @@ function toStringValue(value: unknown): string | undefined {
 
 function toStringArray(value: unknown): string[] | undefined {
   if (!Array.isArray(value)) return undefined;
-  const result = value.filter((item): item is string => typeof item === "string");
+  const result = [
+    ...new Set(
+      value.filter((item): item is string => typeof item === "string"),
+    ),
+  ];
   return result.length > 0 ? result : undefined;
 }
+
+// The spellings studio/backend/core/training/trainer.py accepts; a quoted "false" must mean no
+// checkpointing.
+const GRADIENT_CHECKPOINTING_ALIASES = new Map<
+  string,
+  TrainingConfigState["gradientCheckpointing"]
+>([
+  ["true", "true"],
+  ["1", "true"],
+  ["yes", "true"],
+  ["false", "none"],
+  ["0", "none"],
+  ["no", "none"],
+  ["none", "none"],
+  ["off", "none"],
+  ["unsloth", "unsloth"],
+  ["mlx", "mlx"],
+]);
 
 function toGradientCheckpointing(
   value: unknown,
 ): TrainingConfigState["gradientCheckpointing"] | undefined {
-  if (value === "none" || value === "true" || value === "unsloth") return value;
-  return undefined;
+  // Shipped YAML may decode this value as a boolean.
+  if (typeof value === "boolean") return value ? "true" : "none";
+  if (typeof value !== "string") return undefined;
+  const resolved = GRADIENT_CHECKPOINTING_ALIASES.get(
+    value.trim().toLowerCase(),
+  );
+  if (resolved === undefined) return undefined;
+  // On Mac, map "unsloth" to "mlx" since Unsloth GC is GPU-only.
+  if (
+    resolved === "unsloth" &&
+    usePlatformStore.getState().deviceType === "mac"
+  ) {
+    return "mlx";
+  }
+  return resolved;
 }
 
 export function mapBackendModelConfigToTrainingPatch(
@@ -92,6 +95,19 @@ export function mapBackendModelConfigToTrainingPatch(
   const learningRate = toNumber(training?.learning_rate);
   if (learningRate !== undefined) patch.learningRate = learningRate;
 
+  // Preserve explicit null ("derive it") versus an absent or invalid value.
+  if (Object.hasOwn(training ?? {}, "embedding_learning_rate")) {
+    const raw = training?.embedding_learning_rate;
+    if (raw === null) {
+      patch.embeddingLearningRate = null;
+    } else {
+      const embeddingLearningRate = toNumber(raw);
+      if (embeddingLearningRate !== undefined) {
+        patch.embeddingLearningRate = embeddingLearningRate;
+      }
+    }
+  }
+
   const optim = toStringValue(training?.optim);
   if (optim !== undefined) patch.optimizerType = optim;
 
@@ -104,11 +120,20 @@ export function mapBackendModelConfigToTrainingPatch(
   const gradAccum = toNumber(training?.gradient_accumulation_steps);
   if (gradAccum !== undefined) patch.gradientAccumulation = gradAccum;
 
-  const warmupSteps = toNumber(training?.warmup_steps);
-  if (warmupSteps !== undefined) patch.warmupSteps = warmupSteps;
-
   const maxSteps = toNumber(training?.max_steps);
   if (maxSteps !== undefined) patch.maxSteps = maxSteps;
+
+  const warmupSteps = toNumber(training?.warmup_steps);
+  if (warmupSteps !== undefined) {
+    patch.warmupSteps = warmupSteps;
+  } else {
+    // Shipped defaults (default.yaml among them) set warmup_ratio, not warmup_steps; ceil like
+    // TrainingArguments.get_warmup_steps so a small ratio still warms up.
+    const warmupRatio = toNumber(training?.warmup_ratio);
+    if (warmupRatio !== undefined && maxSteps !== undefined && maxSteps > 0) {
+      patch.warmupSteps = Math.ceil(warmupRatio * maxSteps);
+    }
+  }
 
   const saveSteps = toNumber(training?.save_steps);
   if (saveSteps !== undefined) patch.saveSteps = saveSteps;
@@ -121,6 +146,47 @@ export function mapBackendModelConfigToTrainingPatch(
 
   const randomSeed = toNumber(training?.random_seed);
   if (randomSeed !== undefined) patch.randomSeed = randomSeed;
+
+  if (training?.offload_layers === "auto") patch.offloadLayers = "auto";
+  else {
+    const offloadLayers = toNumber(training?.offload_layers);
+    if (offloadLayers !== undefined) patch.offloadLayers = offloadLayers;
+  }
+  if (Object.hasOwn(training ?? {}, "offload_vram_gb")) {
+    const budget = toNumber(training?.offload_vram_gb);
+    patch.offloadVramGb = budget !== undefined && budget > 0 ? budget : null;
+  }
+  if (Object.hasOwn(training ?? {}, "offload_vram_gb_per_device")) {
+    // Exported keyed by GPU index; the request's list form is indexed the same way.
+    const raw = training?.offload_vram_gb_per_device;
+    const perDevice: Record<string, number | null> = {};
+    for (const [index, value] of Object.entries(raw ?? {})) {
+      const gb = toNumber(value);
+      if (/^\d+$/.test(index) && gb !== undefined && gb > 0 && gb <= 4096) perDevice[index] = gb;
+    }
+    patch.offloadVramGbPerDevice = perDevice;
+  }
+  if (training?.prefetch_depth === "auto") patch.prefetchDepth = "auto";
+  else {
+    const depth = toNumber(training?.prefetch_depth);
+    if (depth !== undefined && depth >= 1) patch.prefetchDepth = Math.min(8, Math.floor(depth));
+  }
+
+  // Only patch when the config carries the key; model-switch reset lives in setSelectedModel.
+  if (Object.hasOwn(training ?? {}, "vision_image_size")) {
+    const raw = training?.vision_image_size;
+    if (raw == null) {
+      patch.visionImageSize = null;
+    } else {
+      // Mirrors studio/backend/models/training.py:_check_vision_image_size bounds.
+      const n = toNumber(raw);
+      if (n !== undefined && Number.isInteger(n) && n >= 256 && n <= 2048) {
+        patch.visionImageSize = n;
+      } else {
+        patch.visionImageSize = null;
+      }
+    }
+  }
 
   const packing = toBoolean(training?.packing);
   if (packing !== undefined) patch.packing = packing;
@@ -154,6 +220,7 @@ export function mapBackendModelConfigToTrainingPatch(
 
   if (lora?.use_loftq === true) patch.loraVariant = "loftq";
   else if (lora?.use_rslora === true) patch.loraVariant = "rslora";
+  else if (lora?.use_dora === true) patch.loraVariant = "dora";
   else if (lora) patch.loraVariant = "lora";
 
   const finetuneVisionLayers = toBoolean(lora?.finetune_vision_layers);
@@ -183,7 +250,8 @@ export function mapBackendModelConfigToTrainingPatch(
   if (wandbProject !== undefined) patch.wandbProject = wandbProject;
 
   const enableTensorboard = toBoolean(logging?.enable_tensorboard);
-  if (enableTensorboard !== undefined) patch.enableTensorboard = enableTensorboard;
+  if (enableTensorboard !== undefined)
+    patch.enableTensorboard = enableTensorboard;
 
   const tensorboardDir = toStringValue(logging?.tensorboard_dir);
   if (tensorboardDir !== undefined) patch.tensorboardDir = tensorboardDir;

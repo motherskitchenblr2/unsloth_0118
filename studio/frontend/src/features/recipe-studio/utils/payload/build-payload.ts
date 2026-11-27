@@ -193,7 +193,7 @@ export function buildRecipePayload(
       continue;
     }
     if (config.kind === "seed") {
-      // SeedConfig is global config (seed_config); seed-dataset columns are added by DataDesigner.
+      // seed-dataset columns are added by DataDesigner.
       continue;
     }
     if (config.kind === "markdown_note") {
@@ -430,6 +430,9 @@ export function buildRecipePayload(
         ...(firstSeed && {
           seed_preview_rows: firstSeed.seed_preview_rows ?? [],
         }),
+        ...(firstSeed?.seed_total_rows !== undefined && {
+          seed_total_rows: firstSeed.seed_total_rows,
+        }),
         ...(firstSeed &&
           firstSeed.local_file_name !== undefined && {
             local_file_name: firstSeed.local_file_name,
@@ -440,6 +443,9 @@ export function buildRecipePayload(
             unstructured_file_names: firstSeed.unstructured_file_names,
             unstructured_file_sizes: firstSeed.unstructured_file_sizes,
           }),
+        ...(firstSeed?.unstructured_upload_uid?.trim() && {
+          unstructured_upload_uid: firstSeed.unstructured_upload_uid,
+        }),
         ...(firstSeed &&
           firstSeed.unstructured_chunk_size !== undefined && {
             unstructured_chunk_size: firstSeed.unstructured_chunk_size,

@@ -1,12 +1,7 @@
-# Model defaults for unsloth/ERNIE-4.5-VL-28B-A3B-PT
-# Based on ERNIE_4_5_VL_28B_A3B_PT_Vision.ipynb
 # Also applies to: unsloth/ERNIE-4.5-VL-28B-A3B-PT
-# added inference parameters from unsloth notebook
 
 training:
-  trust_remote_code: true
   max_seq_length: 2048
-  # num_epochs: 4
   num_epochs: 0
   learning_rate: 2e-4
   batch_size: 2
@@ -36,6 +31,7 @@ lora:
     - "down_proj"
   use_rslora: false
   use_loftq: false
+  use_dora: false
   finetune_vision_layers: true
   finetune_language_layers: true
   finetune_attention_modules: true
@@ -49,7 +45,6 @@ logging:
   log_frequency: 10
 
 inference:
-  trust_remote_code: true
   temperature: 1.5
   min_p: 0.1
 

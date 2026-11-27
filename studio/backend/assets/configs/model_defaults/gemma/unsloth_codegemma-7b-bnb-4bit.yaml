@@ -1,12 +1,7 @@
-# Model defaults for unsloth/codegemma-7b-bnb-4bit
-# Based on CodeGemma_(7B)-Conversational.ipynb
 # Also applies to: unsloth/codegemma-7b, google/codegemma-7b
-# added inference parameters from Ollama
 
 training:
-  trust_remote_code: false
   max_seq_length: 4096
-  # num_epochs: 4
   num_epochs: 0
   learning_rate: 2e-4
   batch_size: 1
@@ -36,6 +31,7 @@ lora:
     - "down_proj"
   use_rslora: false
   use_loftq: false
+  use_dora: false
 
 logging:
   enable_wandb: false
@@ -45,6 +41,5 @@ logging:
   log_frequency: 10
 
 inference:
-  trust_remote_code: false
   temperature: 0
   top_p: 0.9

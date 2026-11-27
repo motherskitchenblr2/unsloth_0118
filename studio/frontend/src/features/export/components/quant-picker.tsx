@@ -8,9 +8,9 @@ import {
 } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
 import {
-  CheckmarkCircle01Icon,
   InformationCircleIcon,
   LayersIcon,
+  CheckmarkCircle02Icon,
 } from "@hugeicons/core-free-icons";
 import { HugeiconsIcon } from "@hugeicons/react";
 import { QUANT_OPTIONS } from "../constants";
@@ -18,9 +18,17 @@ import { QUANT_OPTIONS } from "../constants";
 interface QuantPickerProps {
   value: string[];
   onChange: (v: string[]) => void;
+  sizes?: Record<string, string>;
+  /** Choices to offer; defaults to every GGUF quant. */
+  options?: { value: string; label: string; recommended?: boolean }[];
 }
 
-export function QuantPicker({ value, onChange }: QuantPickerProps) {
+export function QuantPicker({
+  value,
+  onChange,
+  sizes,
+  options = QUANT_OPTIONS,
+}: QuantPickerProps) {
   const toggle = (qv: string) => {
     onChange(
       value.includes(qv) ? value.filter((q) => q !== qv) : [...value, qv],
@@ -37,7 +45,7 @@ export function QuantPicker({ value, onChange }: QuantPickerProps) {
         <span className="text-xs font-medium text-muted-foreground">
           Quantization Levels
         </span>
-        <Tooltip>
+        <Tooltip disableHoverableContent={false}>
           <TooltipTrigger asChild={true}>
             <button
               type="button"
@@ -59,35 +67,39 @@ export function QuantPicker({ value, onChange }: QuantPickerProps) {
             </a>
           </TooltipContent>
         </Tooltip>
-        <span className="text-[11px] text-muted-foreground/70">
+        <span className="text-ui-11 text-muted-foreground/70">
           — select one or more
         </span>
       </div>
       <div className="flex flex-wrap gap-2 py-1 pl-1">
-        {QUANT_OPTIONS.map((q) => {
+        {options.map((q) => {
           const active = value.includes(q.value);
+          const sizeLabel = sizes?.[q.value] ?? "";
           return (
             <button
               key={q.value}
               type="button"
+              aria-pressed={active}
               onClick={() => toggle(q.value)}
               className={cn(
-                "inline-flex items-center gap-1.5 rounded-full px-3 py-1.5 text-xs font-medium ring-1 transition-all",
+                "inline-flex items-center gap-1.5 rounded-full px-3 py-1.5 text-xs font-medium ring-1 transition-colors",
                 active
-                  ? "ring-primary bg-primary/10 text-foreground"
-                  : "ring-border text-muted-foreground hover:text-foreground hover:ring-foreground/20",
+                  ? "ring-ring-strong bg-wash-10 text-foreground"
+                  : "ring-border text-muted-foreground hover:text-foreground hover:ring-[color-mix(in_oklab,var(--foreground)_calc(20%*var(--contrast-edge-gain,1)),transparent)]",
               )}
             >
               {active && (
                 <HugeiconsIcon
-                  icon={CheckmarkCircle01Icon}
+                  icon={CheckmarkCircle02Icon}
                   className="size-3 text-primary"
                 />
               )}
               {q.label}
-              <span className="text-[10px] opacity-60">{q.size}</span>
+              {sizeLabel && (
+                <span className="text-ui-10 opacity-60">{sizeLabel}</span>
+              )}
               {q.recommended && !active && (
-                <span className="rounded-full bg-emerald-100 px-1.5 py-0 text-[9px] font-semibold text-emerald-700 dark:bg-emerald-900 dark:text-emerald-300">
+                <span className="rounded-full bg-emerald-100 px-1.5 py-0 text-ui-9 font-semibold text-emerald-700 dark:bg-emerald-900 dark:text-emerald-300">
                   rec
                 </span>
               )}
@@ -97,13 +109,13 @@ export function QuantPicker({ value, onChange }: QuantPickerProps) {
       </div>
       {value.length > 0 && (
         <div className="flex items-center gap-3">
-          <span className="text-[11px] text-muted-foreground">
+          <span className="text-ui-11 text-muted-foreground">
             {value.length} selected
           </span>
           <button
             type="button"
             onClick={() => onChange([])}
-            className="text-[11px] text-muted-foreground/70 hover:text-foreground transition-colors"
+            className="text-ui-11 text-muted-foreground/70 hover:text-foreground transition-colors"
           >
             Clear all
           </button>

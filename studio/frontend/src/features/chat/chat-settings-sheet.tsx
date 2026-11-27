@@ -1,12 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
-import {
-  Alert,
-  AlertDescription,
-  AlertTitle,
-} from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
 import {
   Dialog,
   DialogContent,
@@ -19,13 +15,14 @@ import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
+  DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
-import { Input } from "@/components/ui/input";
+import { InfoHint } from "@/components/ui/info-hint";
+import { PanelResizeHandle } from "@/components/ui/panel-resize-handle";
 import {
   InputGroup,
   InputGroupAddon,
-  InputGroupButton,
   InputGroupInput,
 } from "@/components/ui/input-group";
 import {
@@ -45,310 +42,151 @@ import {
 import { Slider } from "@/components/ui/slider";
 import { Switch } from "@/components/ui/switch";
 import { Textarea } from "@/components/ui/textarea";
-import { useIsMobile } from "@/hooks/use-mobile";
-import { cn } from "@/lib/utils";
+import { Tooltip, TooltipContent } from "@/components/ui/tooltip";
+import { usePlatformStore } from "@/config/env";
 import {
-  ArrowDown01Icon,
-  CodeIcon,
-  Delete02Icon,
-  FloppyDiskIcon,
-  PencilEdit01Icon,
-  Settings02Icon,
-  SlidersHorizontalIcon,
-  Wrench01Icon,
-} from "@hugeicons/core-free-icons";
+  NumericValueInput,
+  isServedByLlamaCpp,
+  presetLoadSettingNames,
+  snapToStep,
+} from "@/features/model-picker";
+import { RetrievalSettingsSection } from "@/features/rag";
+import { useLlamaUpdateCheck } from "@/hooks/use-llama-update-check";
+import { useScrollFades } from "@/hooks/use-scroll-fades";
+import { useSliderDraft } from "@/hooks/use-slider-draft";
+import { useUiSpaceScale } from "@/hooks/use-ui-space-scale";
+import {
+  CHAT_SETTINGS_WIDTH_MIN,
+  clampChatSettingsWidth,
+  useChatSettingsWidth,
+} from "@/hooks/use-chat-settings-width";
+import { useIsCompact } from "@/hooks/use-mobile";
+import { useT } from "@/i18n";
+import { ChevronDownStandardIcon } from "@/lib/chevron-icons";
+import { toast } from "@/lib/toast";
+import { cornerInsets, watchChatSettingsInset } from "@/lib/toast-offset";
+import { cn } from "@/lib/utils";
+import { BracesIcon, Edit03Icon, LinkSquare02Icon, PanelRightIcon } from "@hugeicons/core-free-icons";
 import { HugeiconsIcon } from "@hugeicons/react";
-import { AnimatePresence, motion } from "motion/react";
-import type { ReactNode } from "react";
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import { toast } from "sonner";
-import { useChatRuntimeStore } from "./stores/chat-runtime-store";
+import { Tooltip as TooltipPrimitive } from "radix-ui";
+import { type CSSProperties, Fragment, type ReactNode } from "react";
+import {
+  lazy,
+  Suspense,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  useSyncExternalStore,
+} from "react";
+import { OpenAICodeExecSection } from "./components/openai-code-exec-section";
+import { PermissionModeDropdown } from "./permission-mode-select";
+import { resyncInferenceStatusAfterServerModelChange } from "./hooks/use-chat-model-runtime";
+import {
+  type ExternalProviderConfig,
+  getExternalProviderApiKey,
+  parseExternalModelId,
+  promptCacheTtlAppliesToModel,
+  promptCachingAppliesToModel,
+  providerModelSupportsStudioTools,
+} from "./external-providers";
+import {
+  BUILTIN_PRESETS,
+  BUILTIN_PRESET_NAMES,
+  type Preset,
+  applyPresetForProvider,
+  getBuiltinVariantName,
+  getOrderedPresets,
+  getPresetSaveState,
+  getPresetSource,
+  editedSamplingKey,
+  isSamePresetConfig,
+  MAX_TOKENS_MIN,
+  localMaxTokensCeiling,
+  toPresetParams,
+} from "./presets/preset-policy";
+import {
+  applyPresetLoadConfig,
+  capturePresetLoadConfig,
+  formatPresetLoadConfigSummary,
+  isSamePresetLoadConfig,
+} from "./presets/preset-load-config";
+import {
+  type ProviderCapabilities,
+  externalMaxTokensUnboundedAtMax,
+  getExternalMaxOutputTokens,
+  getExternalMinOutputTokens,
+  modelCatalogVersion,
+  providerSupportsBuiltinCodeExecution,
+  providerSupportsFastMode,
+  resolveExternalMaxTokensClamp,
+  subscribeModelCatalog,
+} from "./provider-capabilities";
+import {
+  isLocalModelPath,
+  UNLIMITED_TOOL_CALLS,
+  useChatRuntimeStore,
+} from "./stores/chat-runtime-store";
 import {
   DEFAULT_INFERENCE_PARAMS,
+  MAX_SAMPLING_SEED,
+  modelReadsSamplingSeed,
   type InferenceParams,
 } from "./types/runtime";
 
-export const defaultInferenceParams = DEFAULT_INFERENCE_PARAMS;
+import { effectiveMinPMode, isMinPMode } from "./lib/min-p-policy";
+import { mlxSpecFallbackMessage } from "./lib/mlx-spec-fallback";
+import { resolveQwenThinkingParams } from "./utils/qwen-sampling-table";
+
+const SamplingFooter = lazy(() => import("./components/sampling-footer"));
+const CHAT_SETTINGS_TOP =
+  "var(--chat-settings-top, var(--studio-custom-titlebar-height, 0px))";
+const CHAT_SETTINGS_DOCKED_WIDTH_VAR = "--studio-chat-settings-docked-width";
+
+export { defaultInferenceParams, type Preset } from "./presets/preset-policy";
 export type { InferenceParams } from "./types/runtime";
 
-export interface Preset {
-  name: string;
-  params: InferenceParams;
-}
-
-interface LegacySystemPromptTemplate {
-  name: string;
-  content: string;
-}
-
-const BUILTIN_PRESETS: Preset[] = [
-  { name: "Default", params: { ...defaultInferenceParams } },
-  {
-    name: "Creative",
-    params: {
-      ...defaultInferenceParams,
-      temperature: 1.5,
-      topP: 1.0,
-      topK: 0,
-      minP: 0.1,
-      repetitionPenalty: 1.0,
-    },
-  },
-  {
-    name: "Precise",
-    params: {
-      ...defaultInferenceParams,
-      temperature: 0.1,
-      topP: 0.95,
-      topK: 80,
-      minP: 0.01,
-      repetitionPenalty: 1.0,
-    },
-  },
-];
-
-const CHAT_PRESETS_KEY = "unsloth_chat_custom_presets";
-const CHAT_ACTIVE_PRESET_KEY = "unsloth_chat_active_preset";
-const LEGACY_CHAT_SYSTEM_PROMPTS_KEY = "unsloth_chat_system_prompts";
-const LEGACY_CHAT_SYSTEM_PROMPTS_MIGRATED_KEY =
-  "unsloth_chat_system_prompts_migrated";
+const PROMPT_VARIABLE_PATTERN = /{{\s*[a-zA-Z_$][a-zA-Z0-9_$.-]*\s*}}/;
 
 function canUseStorage(): boolean {
   return typeof window !== "undefined";
 }
 
-function getUniquePresetName(baseName: string, usedNames: Set<string>): string {
-  const normalizedBase = baseName.trim() || "Imported Prompt";
-  let nextName = normalizedBase;
-  let suffix = 2;
-  while (usedNames.has(nextName)) {
-    nextName = `${normalizedBase} ${suffix}`;
-    suffix += 1;
+function getPromptVariablesError(raw: string): string | null {
+  const trimmed = raw.trim();
+  if (!trimmed) {
+    return null;
   }
-  usedNames.add(nextName);
-  return nextName;
-}
-
-function migrateLegacySystemPromptTemplates(presets: Preset[]): Preset[] {
-  if (!canUseStorage()) return presets;
   try {
-    const raw = localStorage.getItem(LEGACY_CHAT_SYSTEM_PROMPTS_KEY);
-    if (!raw) return presets;
-    if (localStorage.getItem(LEGACY_CHAT_SYSTEM_PROMPTS_MIGRATED_KEY) === raw) {
-      return presets;
+    const parsed = JSON.parse(trimmed) as unknown;
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      return null;
     }
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(raw) as unknown;
-    } catch {
-      localStorage.removeItem(LEGACY_CHAT_SYSTEM_PROMPTS_KEY);
-      localStorage.setItem(LEGACY_CHAT_SYSTEM_PROMPTS_MIGRATED_KEY, raw);
-      return presets;
-    }
-    if (!Array.isArray(parsed)) {
-      localStorage.removeItem(LEGACY_CHAT_SYSTEM_PROMPTS_KEY);
-      localStorage.setItem(LEGACY_CHAT_SYSTEM_PROMPTS_MIGRATED_KEY, raw);
-      return presets;
-    }
-    const usedNames = new Set([
-      ...BUILTIN_PRESETS.map((preset) => preset.name),
-      ...presets.map((preset) => preset.name),
-    ]);
-    const seenImportedConfigKeys = new Set(
-      [...BUILTIN_PRESETS, ...presets].map((preset) =>
-        JSON.stringify({
-          temperature: preset.params.temperature,
-          topP: preset.params.topP,
-          topK: preset.params.topK,
-          minP: preset.params.minP,
-          repetitionPenalty: preset.params.repetitionPenalty,
-          presencePenalty: preset.params.presencePenalty,
-          maxSeqLength: preset.params.maxSeqLength,
-          maxTokens: preset.params.maxTokens,
-          systemPrompt: preset.params.systemPrompt,
-          trustRemoteCode: preset.params.trustRemoteCode ?? false,
-        }),
-      ),
-    );
-    const importedPresets = parsed
-      .filter((item): item is LegacySystemPromptTemplate => {
-        if (!item || typeof item !== "object") return false;
-        const maybe = item as Partial<LegacySystemPromptTemplate>;
-        return (
-          typeof maybe.name === "string" && typeof maybe.content === "string"
-        );
-      })
-      .map((template) => ({
-        template,
-        importedParams: {
-          ...defaultInferenceParams,
-          systemPrompt: template.content,
-        },
-      }))
-      .filter(({ importedParams }) => {
-        const configKey = JSON.stringify({
-          temperature: importedParams.temperature,
-          topP: importedParams.topP,
-          topK: importedParams.topK,
-          minP: importedParams.minP,
-          repetitionPenalty: importedParams.repetitionPenalty,
-          presencePenalty: importedParams.presencePenalty,
-          maxSeqLength: importedParams.maxSeqLength,
-          maxTokens: importedParams.maxTokens,
-          systemPrompt: importedParams.systemPrompt,
-          trustRemoteCode: importedParams.trustRemoteCode ?? false,
-        });
-        if (seenImportedConfigKeys.has(configKey)) return false;
-        seenImportedConfigKeys.add(configKey);
-        return true;
-      })
-      .map(({ template, importedParams }) => ({
-        name: getUniquePresetName(`${template.name} Prompt`, usedNames),
-        params: importedParams,
-      }));
-    if (importedPresets.length === 0) {
-      localStorage.removeItem(LEGACY_CHAT_SYSTEM_PROMPTS_KEY);
-      localStorage.setItem(LEGACY_CHAT_SYSTEM_PROMPTS_MIGRATED_KEY, raw);
-      return presets;
-    }
-    const mergedPresets = [...presets, ...importedPresets];
-    localStorage.setItem(CHAT_PRESETS_KEY, JSON.stringify(mergedPresets));
-    try {
-      localStorage.setItem(LEGACY_CHAT_SYSTEM_PROMPTS_MIGRATED_KEY, raw);
-      localStorage.removeItem(LEGACY_CHAT_SYSTEM_PROMPTS_KEY);
-    } catch {
-      // ignore cleanup failure after successful import write
-    }
-    return mergedPresets;
   } catch {
-    return presets;
+    return 'Use valid JSON, for example { "env": "staging" }.';
   }
+  return "Variables must be a JSON object.";
 }
 
-function loadSavedCustomPresets(): Preset[] {
-  if (!canUseStorage()) return [];
-  try {
-    const raw = localStorage.getItem(CHAT_PRESETS_KEY);
-    if (!raw) {
-      return migrateLegacySystemPromptTemplates([]);
-    }
-    const parsed = JSON.parse(raw) as unknown;
-    if (!Array.isArray(parsed)) {
-      return migrateLegacySystemPromptTemplates([]);
-    }
-    const presets = parsed
-      .filter((item): item is Preset => {
-        if (!item || typeof item !== "object") return false;
-        const maybe = item as Partial<Preset>;
-        return typeof maybe.name === "string" && !!maybe.params;
-      })
-      .map((preset) => ({
-        name: preset.name.trim(),
-        params: {
-          ...defaultInferenceParams,
-          ...preset.params,
-        },
-      }))
-      .filter((preset) => preset.name.length > 0);
-    return migrateLegacySystemPromptTemplates(presets);
-  } catch {
-    return migrateLegacySystemPromptTemplates([]);
-  }
+function hasPromptVariableSyntax(prompt: string): boolean {
+  return PROMPT_VARIABLE_PATTERN.test(prompt);
 }
 
-function loadSavedActivePreset(): string {
-  if (!canUseStorage()) return "Default";
-  try {
-    return localStorage.getItem(CHAT_ACTIVE_PRESET_KEY) ?? "Default";
-  } catch {
-    return "Default";
-  }
-}
-
-type PresetSaveMode =
-  | "disabled"
-  | "overwrite-active"
-  | "overwrite-other"
-  | "create";
-
-interface PresetSaveState {
-  mode: PresetSaveMode;
-  canSubmit: boolean;
-  isSaveReady: boolean;
-  buttonLabel: string;
-  title: string;
-}
-
-function isSamePresetConfig(a: InferenceParams, b: InferenceParams): boolean {
-  return (
-    a.temperature === b.temperature &&
-    a.topP === b.topP &&
-    a.topK === b.topK &&
-    a.minP === b.minP &&
-    a.repetitionPenalty === b.repetitionPenalty &&
-    a.presencePenalty === b.presencePenalty &&
-    a.maxSeqLength === b.maxSeqLength &&
-    a.maxTokens === b.maxTokens &&
-    a.systemPrompt === b.systemPrompt &&
-    (a.trustRemoteCode ?? false) === (b.trustRemoteCode ?? false)
-  );
-}
-
-function getPresetSaveState({
-  rawName,
-  activePreset,
-  presets,
-  activePresetDirty,
-}: {
-  rawName: string;
-  activePreset: string;
-  presets: Preset[];
-  activePresetDirty: boolean;
-}): PresetSaveState {
-  const trimmedName = rawName.trim();
-  if (!trimmedName) {
-    return {
-      mode: "disabled",
-      canSubmit: false,
-      isSaveReady: false,
-      buttonLabel: "Save",
-      title: "Enter a preset name",
-    };
-  }
-
-  const matchingPreset = presets.find((preset) => preset.name === trimmedName);
-  if (matchingPreset) {
-    const isActiveMatch = matchingPreset.name === activePreset;
-    return {
-      mode: isActiveMatch ? "overwrite-active" : "overwrite-other",
-      canSubmit: !isActiveMatch || activePresetDirty,
-      isSaveReady: !isActiveMatch || activePresetDirty,
-      buttonLabel: isActiveMatch && !activePresetDirty ? "Saved" : "Overwrite",
-      title: isActiveMatch
-        ? activePresetDirty
-          ? "Save current settings to this preset"
-          : "No unsaved changes"
-        : `Overwrite preset "${trimmedName}"`,
-    };
-  }
-
-  return {
-    mode: "create",
-    canSubmit: true,
-    isSaveReady: true,
-    buttonLabel: "Save as New",
-    title: `Save current settings as "${trimmedName}"`,
-  };
-}
-
-function ParamSlider({
+export function ParamSlider({
   label,
   value,
   min,
   max,
   step,
   onChange,
-  displayValue,
+  onDraft,
+  format,
+  info,
+  valueSize,
+  disabled,
+  inline,
+  commitWhileDragging = false,
 }: {
   label: string;
   value: number;
@@ -356,22 +194,84 @@ function ParamSlider({
   max: number;
   step: number;
   onChange: (v: number) => void;
-  displayValue?: string;
+  onDraft?: (value: number | null) => void;
+  format?: (value: number) => string | undefined;
+  info?: ReactNode;
+  valueSize?: number;
+  disabled?: boolean;
+  inline?: boolean;
+  commitWhileDragging?: boolean;
 }) {
+  const commit = (v: number) => onChange(snapToStep(v, step, min, max));
+  const { draft, sliderProps: draftProps } = useSliderDraft(
+    value,
+    commit,
+    onDraft,
+  );
+  const sliderProps = commitWhileDragging
+    ? { value: [value], onValueChange: ([v]: number[]) => commit(v) }
+    : draftProps;
+  const shown = draft ?? value;
+  if (inline) {
+    return (
+      <div className="flex items-center gap-3">
+        <div className="flex min-w-[calc(104px*var(--ui-space-scale,1))] shrink-0 items-center gap-1.5">
+          <span className="text-ui-13 font-medium leading-[1.25] tracking-nav text-nav-fg">
+            {label}
+          </span>
+          {info && <InfoHint>{info}</InfoHint>}
+        </div>
+        <Slider
+          min={min}
+          max={max}
+          step={step}
+          {...sliderProps}
+          className="min-w-0 flex-1"
+          disabled={disabled}
+        />
+        <NumericValueInput
+          value={shown}
+          min={min}
+          max={max}
+          step={step}
+          onChange={onChange}
+          displayValue={format?.(shown)}
+          ariaLabel={label}
+          size={valueSize ?? 4}
+          className="panel-number-input"
+          disabled={disabled}
+        />
+      </div>
+    );
+  }
   return (
     <div className="space-y-2">
-      <div className="flex items-center justify-between">
-        <span className="text-xs font-medium">{label}</span>
-        <span className="text-xs tabular-nums text-muted-foreground">
-          {displayValue ?? value}
-        </span>
+      <div className="flex min-h-8 items-center justify-between gap-3">
+        <div className="flex min-w-0 items-center gap-1.5">
+          <span className="min-w-0 text-ui-13 font-medium leading-[1.25] tracking-nav text-nav-fg">
+            {label}
+          </span>
+          {info && <InfoHint>{info}</InfoHint>}
+        </div>
+        <NumericValueInput
+          value={shown}
+          min={min}
+          max={max}
+          step={step}
+          onChange={onChange}
+          displayValue={format?.(shown)}
+          ariaLabel={label}
+          size={valueSize ?? 4}
+          className="panel-number-input"
+          disabled={disabled}
+        />
       </div>
       <Slider
         min={min}
         max={max}
         step={step}
-        value={[value]}
-        onValueChange={([v]) => onChange(v)}
+        {...sliderProps}
+        disabled={disabled}
       />
     </div>
   );
@@ -415,57 +315,109 @@ function saveCollapsibleOpen(label: string, open: boolean) {
 }
 
 function CollapsibleSection({
-  icon,
   label,
+  labelHref,
+  headerAction,
+  onLabelClick,
   children,
   defaultOpen = false,
+  first = false,
 }: {
-  icon: Parameters<typeof HugeiconsIcon>[0]["icon"];
   label: string;
+  /** Makes the label an external link; link and chevron are siblings, not <a> in <button>. */
+  labelHref?: string;
+  headerAction?: ReactNode;
+  onLabelClick?: () => void;
   children?: ReactNode;
   defaultOpen?: boolean;
+  first?: boolean;
 }) {
   const [open, setOpen] = useState(() => {
     const saved = loadCollapsibleState();
     return Object.hasOwn(saved, label) ? saved[label] : defaultOpen;
   });
 
+  const toggle = () => {
+    const next = !open;
+    setOpen(next);
+    saveCollapsibleOpen(label, next);
+  };
+
+  const headerClasses = cn(
+    "flex w-full items-center justify-between text-ui-12 font-medium normal-case tracking-[0.04em] text-nav-fg-muted transition-colors focus-visible:outline-none focus-visible:ring-0",
+    // pt-2 centers the first label on the sidebar's New chat row.
+    first ? "pt-2 pb-5" : "py-5",
+  );
+
   return (
-    <div>
-      <button
-        type="button"
-        onClick={() => {
-          const next = !open;
-          setOpen(next);
-          saveCollapsibleOpen(label, next);
-        }}
-        className="flex w-full items-center corner-squircle gap-2.5 rounded-md px-2 py-2 text-sm transition-colors hover:bg-accent"
-      >
-        <HugeiconsIcon icon={icon} className="size-4 text-muted-foreground" />
-        <span className="flex-1 text-left font-medium">{label}</span>
-        <motion.div
-          animate={{ rotate: open ? 180 : 0 }}
-          transition={{ duration: 0.15 }}
-        >
-          <HugeiconsIcon
-            icon={ArrowDown01Icon}
-            className="size-3.5 text-muted-foreground"
-          />
-        </motion.div>
-      </button>
-      <AnimatePresence initial={false}>
-        {open && (
-          <motion.div
-            initial={{ height: 0, opacity: 0 }}
-            animate={{ height: "auto", opacity: 1 }}
-            exit={{ height: 0, opacity: 0 }}
-            transition={{ duration: 0.2, ease: "easeInOut" }}
-            className="overflow-hidden"
+    <div
+      className={cn(
+        !first && "border-t border-[rgb(0_0_0_/_calc(0.13*var(--contrast-edge-gain,1)))] dark:border-[rgb(255_255_255_/_calc(0.09*var(--contrast-edge-gain,1)))]",
+      )}
+    >
+      {labelHref ? (
+        <div className={headerClasses}>
+          <a
+            href={labelHref}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="inline-flex cursor-pointer items-center gap-1 leading-none transition-colors hover:text-nav-fg"
           >
-            <div className="px-2 pb-3 pt-1">{children}</div>
-          </motion.div>
-        )}
-      </AnimatePresence>
+            <span>{label}</span>
+            <HugeiconsIcon icon={LinkSquare02Icon} className="size-3" />
+          </a>
+          <button
+            type="button"
+            onClick={toggle}
+            aria-label={open ? `Collapse ${label}` : `Expand ${label}`}
+            className="flex shrink-0 cursor-pointer items-center leading-none transition-colors hover:text-nav-fg"
+          >
+            <HugeiconsIcon
+              icon={ChevronDownStandardIcon}
+              className={cn("size-3.5", open ? "rotate-0" : "-rotate-90")}
+            />
+          </button>
+        </div>
+      ) : headerAction ? (
+        <div className={headerClasses}>
+          <button
+            type="button"
+            onClick={onLabelClick ?? toggle}
+            className="flex min-w-0 flex-1 cursor-pointer items-center text-left leading-none transition-colors hover:text-nav-fg"
+          >
+            <span className="leading-none">{label}</span>
+          </button>
+          <span className="flex shrink-0 items-center gap-1">
+            {headerAction}
+            <button
+              type="button"
+              onClick={toggle}
+              aria-label={open ? `Collapse ${label}` : `Expand ${label}`}
+              className="flex shrink-0 cursor-pointer items-center leading-none transition-colors hover:text-nav-fg"
+            >
+              <HugeiconsIcon
+                icon={ChevronDownStandardIcon}
+                className={cn("size-3.5", open ? "rotate-0" : "-rotate-90")}
+              />
+            </button>
+          </span>
+        </div>
+      ) : (
+        <button
+          type="button"
+          onClick={toggle}
+          className={cn("cursor-pointer hover:text-nav-fg", headerClasses)}
+        >
+          <span className="leading-none">{label}</span>
+          <span className="flex shrink-0 items-center leading-none">
+            <HugeiconsIcon
+              icon={ChevronDownStandardIcon}
+              className={cn("size-3.5", open ? "rotate-0" : "-rotate-90")}
+            />
+          </span>
+        </button>
+      )}
+      {open && <div className="pb-5">{children}</div>}
     </div>
   );
 }
@@ -473,74 +425,325 @@ function CollapsibleSection({
 interface ChatSettingsPanelProps {
   open: boolean;
   onOpenChange?: (open: boolean) => void;
-  params: InferenceParams;
-  onParamsChange: (params: InferenceParams) => void;
-  onReloadModel?: () => void;
+  modelConfig?: ReactNode;
+  /** Rendered last, collapsed by default. */
+  modelInfo?: ReactNode;
+  isExternalModel?: boolean;
+  providerCapabilities?: ProviderCapabilities | null;
+  activeExternalProvider?: ExternalProviderConfig | null;
+  onExternalProviderChange?: (provider: ExternalProviderConfig) => void;
+  externalProviderType?: string | null;
+}
+
+function specFallbackMessage({
+  reason,
+  drafter,
+  isLocalGguf,
+  updateAvailable,
+}: {
+  reason: string;
+  drafter: "MTP" | "DSpark" | "DFlash" | "ngram-mod";
+  isLocalGguf: boolean;
+  updateAvailable: boolean;
+}): string {
+  switch (reason) {
+    case "mla_mtp_disabled":
+      return "MTP is disabled by default for this model architecture because it currently runs slower than standard decoding. Choose MTP in the model picker to force it.";
+    case "mtp_partial_offload":
+      // Not the default copy: this build supports MTP, and a Manual layer count is the user's choice.
+      return "With MTP on, part of this model would have to run on the CPU, where MTP's extra state costs more than the drafting wins back, so Auto turned it off for this load. Give the GPU room for every layer to get it back, or choose MTP in Settings to force it.";
+    case "drafter_no_vram":
+      // Only the drafter is off: the backend substitutes zero-VRAM ngram-mod where available.
+      return `This model fits in VRAM but its ${drafter} drafter does not, so Auto kept your context window and turned ${drafter} off for this load. Choose ${drafter} in Settings to force it, at a smaller context.`;
+    case "runtime_error":
+      return `${drafter} could not start for this model, so it is running without speculative decoding. Lowering the context length or Parallel Slots can give it room.`;
+    case "drafter_unloadable":
+      // The file is present but unloadable as a draft, so neither placement nor network is the remedy.
+      return "This model's MTP drafter file cannot be loaded as a draft model, so it is running without MTP. The sidecar beside the model is a head-only file that llama.cpp cannot open on its own. Replace it with a self-contained mtp-*.gguf, then reload the model.";
+    case "drafter_not_found":
+      if (drafter === "DSpark") {
+        return isLocalGguf
+          ? "No matching DSpark sidecar was found. Place its dspark-*.gguf beside the model or in its dspark folder, then reload the model."
+          : "The DSpark sidecar could not be downloaded, so this model is running without speculative decoding. Check network or Hugging Face access, then reload it.";
+      }
+      if (drafter === "DFlash") {
+        return isLocalGguf
+          ? "No matching DFlash sidecar was found. Place its dflash-*.gguf beside the model, then reload the model."
+          : "The DFlash sidecar could not be downloaded, so this model is running without speculative decoding. Check network or Hugging Face access, then reload it.";
+      }
+      return isLocalGguf
+        ? "This local model supports MTP, but no matching drafter file was found. Place its mtp-*.gguf beside the model or in its MTP folder, then reload the model."
+        : "This model supports MTP, but its drafter file could not be downloaded, so MTP is off and it falls back to n-gram speculative decoding where the llama.cpp build supports it. Check your network connection or Hugging Face access, then reload the model to retry the drafter.";
+    default:
+      return `${drafter} is not available in the installed llama.cpp build, so this model is running without it.${
+        updateAvailable ? " Update llama.cpp to enable it." : ""
+      }`;
+  }
 }
 
 export function ChatSettingsPanel({
   open,
   onOpenChange,
-  params,
-  onParamsChange,
-  onReloadModel,
+  modelConfig = null,
+  modelInfo = null,
+  isExternalModel = false,
+  providerCapabilities = null,
+  activeExternalProvider = null,
+  onExternalProviderChange,
+  externalProviderType = null,
 }: ChatSettingsPanelProps) {
-  const isMobile = useIsMobile();
-  const isGguf = useChatRuntimeStore((s) => s.activeGgufVariant) != null;
+  const asideRef = useRef<HTMLElement>(null);
+  const t = useT();
+  const params = useChatRuntimeStore((s) => s.params);
+  const setParams = useChatRuntimeStore((s) => s.setParams);
+  const {
+    width: settingsWidth,
+    max: settingsMax,
+    scale: settingsScale,
+    stored: settingsStored,
+    setWidth: setSettingsWidth,
+    resetWidth: resetSettingsWidth,
+  } = useChatSettingsWidth();
+  // Unknown providers use the OpenAI-compat shape, so these flags never undercount.
+  const showTemperature =
+    !isExternalModel || Boolean(providerCapabilities?.temperature);
+  const showTopP = !isExternalModel || Boolean(providerCapabilities?.topP);
+  const showTopK = !isExternalModel || Boolean(providerCapabilities?.topK);
+  const isVllm = isExternalModel && externalProviderType === "vllm";
+  const showMinP = !isExternalModel || Boolean(providerCapabilities?.minP);
+  const showRepetitionPenalty =
+    !isExternalModel || Boolean(providerCapabilities?.repetitionPenalty);
+  const showPresencePenalty =
+    !isExternalModel || Boolean(providerCapabilities?.presencePenalty);
+  const isCompact = useIsCompact();
+  const uiSpaceScale = useUiSpaceScale();
+  const activeGgufVariant = useChatRuntimeStore((s) => s.activeGgufVariant);
+  const loadedIsGguf = useChatRuntimeStore((s) => s.loadedIsGguf);
+  const activeNativePathToken = useChatRuntimeStore(
+    (s) => s.activeNativePathToken,
+  );
+  useEffect(() => {
+    if (!open || isCompact) return;
+    return watchChatSettingsInset(
+      cornerInsets,
+      asideRef.current,
+      settingsWidth * settingsScale,
+      uiSpaceScale,
+    );
+  }, [open, isCompact, settingsWidth, settingsScale, uiSpaceScale]);
+  useEffect(() => {
+    const panel = asideRef.current;
+    if (!open || isCompact || !panel) return;
+    // On the strip, not <html>: an inherited root var restyles the thread every drag frame.
+    let frame: HTMLElement | null = null;
+    const apply = () => {
+      const next = document.querySelector<HTMLElement>(
+        '[data-slot="sidebar-container"][data-windows-glass-frame]',
+      );
+      if (frame && frame !== next) {
+        frame.style.removeProperty(CHAT_SETTINGS_DOCKED_WIDTH_VAR);
+      }
+      frame = next;
+      // Unrounded: offsetWidth leaves a sub-pixel seam.
+      frame?.style.setProperty(
+        CHAT_SETTINGS_DOCKED_WIDTH_VAR,
+        `${panel.getBoundingClientRect().width}px`,
+      );
+    };
+    apply();
+    const observer = new ResizeObserver(apply);
+    observer.observe(panel);
+    const pinObserver = new MutationObserver(apply);
+    pinObserver.observe(document.documentElement, {
+      attributeFilter: ["data-sidebar-glass-frame"],
+    });
+    return () => {
+      observer.disconnect();
+      pinObserver.disconnect();
+      frame?.style.removeProperty(CHAT_SETTINGS_DOCKED_WIDTH_VAR);
+    };
+  }, [open, isCompact]);
+  const currentCheckpoint = params.checkpoint;
+  const activeModelIsLocal = useChatRuntimeStore(
+    (s) => s.activeModelIsLocal,
+  );
+  const loadedContextLength = useChatRuntimeStore((s) => s.loadedContextLength);
+  const isGguf = isServedByLlamaCpp({
+    loadedIsGguf,
+    activeGgufVariant,
+    activeNativePathToken,
+    checkpoint: currentCheckpoint,
+  });
+  const activeModel = useChatRuntimeStore(
+    (s) => s.models.find((m) => m.id === currentCheckpoint) ?? null,
+  );
+  const loadedEngine = useChatRuntimeStore((s) => s.loadedEngine);
+  // Same call the request body makes, so the panel cannot offer a seed the body drops.
+  const showSeed = modelReadsSamplingSeed(activeModel, loadedEngine);
+  const platformDeviceType = usePlatformStore((s) => s.deviceType);
+  // Unified memory, not just Darwin: an Intel Mac spills to system RAM like a PC.
+  const isUnifiedMemory = usePlatformStore((s) => s.appleSilicon);
+  const platformChatOnlyReason = usePlatformStore((s) => s.chatOnlyReason);
+  const platformMlxInference = usePlatformStore((s) => s.mlxInference);
+  const loadSettingNames = presetLoadSettingNames(
+    isGguf,
+    platformDeviceType,
+    platformChatOnlyReason,
+    platformMlxInference,
+  );
+  // The backend's own classification: the native token survives a switch to a remote GGUF, and
+  // org/name.gguf is a repo id, not a file.
+  const isLocalGguf =
+    isGguf && (activeModelIsLocal || isLocalModelPath(currentCheckpoint ?? ""));
+  const maxContextLength = useChatRuntimeStore(
+    (s) => s.maxContextLength,
+  );
+  const customContextLength = useChatRuntimeStore((s) => s.customContextLength);
+  const kvCacheDtype = useChatRuntimeStore((s) => s.kvCacheDtype);
+  const mlxKvQuant = useChatRuntimeStore((s) => s.mlxKvQuant);
+  const gpuMemoryMode = useChatRuntimeStore((s) => s.gpuMemoryMode);
+  const gpuLayers = useChatRuntimeStore((s) => s.gpuLayers);
+  const nCpuMoe = useChatRuntimeStore((s) => s.nCpuMoe);
+  const tensorParallel = useChatRuntimeStore((s) => s.tensorParallel);
+  const disableVision = useChatRuntimeStore((s) => s.disableVision);
+  const specDraftNMax = useChatRuntimeStore((s) => s.specDraftNMax);
+  const nParallel = useChatRuntimeStore((s) => s.nParallel);
+  const reasoningBudget = useChatRuntimeStore((s) =>
+    s.reasoningBudget === s.loadedReasoningBudget
+      ? (s.loadedReasoningBudgetRequested ?? s.reasoningBudget)
+      : s.reasoningBudget,
+  );
+  const reasoningBudgetMessage = useChatRuntimeStore(
+    (s) =>
+      s.reasoningBudgetMessage === s.loadedReasoningBudgetMessage
+        ? (s.loadedReasoningBudgetMessageRequested ?? s.reasoningBudgetMessage)
+        : s.reasoningBudgetMessage,
+  );
+  const nBatch = useChatRuntimeStore((s) => s.nBatch);
+  const nUbatch = useChatRuntimeStore((s) => s.nUbatch);
   const speculativeType = useChatRuntimeStore((s) => s.speculativeType);
-  const setSpeculativeType = useChatRuntimeStore((s) => s.setSpeculativeType);
+  const specFallbackReason = useChatRuntimeStore((s) => s.specFallbackReason);
+  const specDrafterKind = useChatRuntimeStore((s) => s.specDrafterKind);
   const loadedSpeculativeType = useChatRuntimeStore(
     (s) => s.loadedSpeculativeType,
   );
-  const currentModels = useChatRuntimeStore((s) => s.models);
-  const modelRequiresTrustRemoteCode = useChatRuntimeStore(
-    (s) => s.modelRequiresTrustRemoteCode,
+  // The loaded kind, not the pending control: the notice explains a fallback that already happened.
+  const speculativeDrafterLabel: "MTP" | "DSpark" | "DFlash" | "ngram-mod" =
+    // Before the drafter kind: ngram-mod opens none, so spec_drafter_kind still holds MTP's.
+    loadedSpeculativeType === "ngram"
+      ? "ngram-mod"
+      : (specDrafterKind ?? speculativeType) === "dspark"
+        ? "DSpark"
+        : (specDrafterKind ?? speculativeType) === "dflash"
+          ? "DFlash"
+          : "MTP";
+  const mtpUpdatable =
+    specFallbackReason === "binary_no_mtp" ||
+    specFallbackReason === "binary_outdated";
+  const {
+    status: llamaUpdateStatus,
+    applying: llamaUpdating,
+    apply: applyLlamaUpdate,
+  } = useLlamaUpdateCheck({
+    enabled: mtpUpdatable,
+    onReloadRequired: resyncInferenceStatusAfterServerModelChange,
+  });
+  const handleMtpUpdate = useCallback(async () => {
+    const result = await applyLlamaUpdate();
+    if (result.ok) {
+      const reloadHint = result.reloadRequired
+        ? ` Reload your model to enable ${speculativeDrafterLabel}.`
+        : "";
+      toast.success(
+        `llama.cpp updated to ${result.tag ?? "the latest build"}.${reloadHint}`,
+      );
+    } else {
+      toast.error(`Update failed: ${result.error ?? "unknown error"}`);
+    }
+  }, [applyLlamaUpdate, speculativeDrafterLabel]);
+  const loadedEffectiveContext = customContextLength ?? loadedContextLength;
+  const showSpecFallback =
+    !isExternalModel &&
+    isGguf &&
+    specFallbackReason != null &&
+    (speculativeType === "auto" ||
+      speculativeType === "mtp" ||
+      speculativeType === "mtp+ngram" ||
+      speculativeType === "dspark" ||
+      speculativeType === "dflash" ||
+      // ngram-mod runs no drafter, so only the binary stand-down reaches it.
+      speculativeType === "ngram");
+  const loadedIsMlx = useChatRuntimeStore((s) => s.loadedIsMlx);
+  const mlxSpecFallback =
+    !isExternalModel && loadedIsMlx && specFallbackReason != null
+      ? mlxSpecFallbackMessage(specFallbackReason, specDrafterKind)
+      : null;
+  const showContextVramWarning =
+    !isExternalModel &&
+    isGguf &&
+    maxContextLength != null &&
+    loadedEffectiveContext != null &&
+    loadedEffectiveContext > maxContextLength;
+  const showLoadedDiagnostics =
+    showSpecFallback || mlxSpecFallback != null || showContextVramWarning;
+  const hasModelContent = showLoadedDiagnostics;
+  const setActivePresetSource = useChatRuntimeStore(
+    (s) => s.setActivePresetSource,
   );
-  const currentCheckpoint = params.checkpoint;
-  const currentModelIsVision =
-    currentModels.find((m) => m.id === currentCheckpoint)?.isVision ?? false;
-  const ggufContextLength = useChatRuntimeStore((s) => s.ggufContextLength);
-  const ggufMaxContextLength = useChatRuntimeStore(
-    (s) => s.ggufMaxContextLength,
-  );
-  const ggufNativeContextLength = useChatRuntimeStore(
-    (s) => s.ggufNativeContextLength,
-  );
-  const kvCacheDtype = useChatRuntimeStore((s) => s.kvCacheDtype);
-  const setKvCacheDtype = useChatRuntimeStore((s) => s.setKvCacheDtype);
-  const loadedKvCacheDtype = useChatRuntimeStore((s) => s.loadedKvCacheDtype);
-  const customContextLength = useChatRuntimeStore((s) => s.customContextLength);
-  const setCustomContextLength = useChatRuntimeStore(
-    (s) => s.setCustomContextLength,
-  );
+  const activePresetSource = useChatRuntimeStore((s) => s.activePresetSource);
+  const customPresets = useChatRuntimeStore((s) => s.customPresets);
+  const setCustomPresets = useChatRuntimeStore((s) => s.setCustomPresets);
+  const activePreset = useChatRuntimeStore((s) => s.activePreset);
+  const setActivePreset = useChatRuntimeStore((s) => s.setActivePreset);
+  const settingsHydrated = useChatRuntimeStore((s) => s.settingsHydrated);
 
-  const ctxDisplayValue = customContextLength ?? ggufContextLength ?? "";
-  const ctxMaxValue = ggufNativeContextLength ?? ggufContextLength ?? null;
-  const kvDirty = kvCacheDtype !== loadedKvCacheDtype;
-  const ctxDirty = customContextLength !== null;
-  const specDirty = speculativeType !== loadedSpeculativeType;
-  const modelSettingsDirty = kvDirty || ctxDirty || specDirty;
-  const [customPresets, setCustomPresets] = useState<Preset[]>(() =>
-    loadSavedCustomPresets(),
-  );
-  const [activePreset, setActivePreset] = useState(() =>
-    loadSavedActivePreset(),
-  );
-  const [presetNameInput, setPresetNameInput] = useState(() =>
-    loadSavedActivePreset(),
-  );
-  const presetControlRowRef = useRef<HTMLDivElement>(null);
-  const [presetMenuWidthPx, setPresetMenuWidthPx] = useState<
-    number | undefined
-  >(undefined);
+  const baseContext = loadedContextLength;
+  const [presetNameInput, setPresetNameInput] = useState(activePreset);
   const [systemPromptEditorOpen, setSystemPromptEditorOpen] = useState(false);
   const [systemPromptDraft, setSystemPromptDraft] = useState("");
+  const [systemVariablesDraft, setSystemVariablesDraft] = useState("");
+  const [systemVariablesOpen, setSystemVariablesOpen] = useState(false);
+  // Raw draft until blur: clamping mid-entry would rewrite the box.
+  const [seedDraft, setSeedDraft] = useState<string | null>(null);
+  // Save's mousedown blurs before React re-renders, so onClick needs this pre-blur commit value.
+  const committedSeed = useMemo<number | null>(() => {
+    if (seedDraft === null) return params.seed ?? null;
+    const digits = seedDraft.replace(/^0+(?=\d)/, "");
+    if (digits === "") return null;
+    return digits.length > 10
+      ? MAX_SAMPLING_SEED
+      : Math.min(Number(digits), MAX_SAMPLING_SEED);
+  }, [params.seed, seedDraft]);
+  const paramsWithCommittedSeed = useMemo(
+    () =>
+      committedSeed === (params.seed ?? null)
+        ? params
+        : { ...params, seed: committedSeed },
+    [committedSeed, params],
+  );
+  // Removing a focused element fires no blur, so drop the draft here.
+  useEffect(() => {
+    setSeedDraft(null);
+  }, [currentCheckpoint, showSeed]);
+  const systemPromptBoxRef = useRef<HTMLTextAreaElement>(null);
+  const [systemPromptOverflows, setSystemPromptOverflows] = useState(false);
+  const promptObserverRef = useRef<ResizeObserver | null>(null);
+  const measurePromptRef = useRef<() => void>(() => {});
+  // Callback ref: the textarea remounts when the section reopens.
+  const attachPromptBox = useCallback((node: HTMLTextAreaElement | null) => {
+    systemPromptBoxRef.current = node;
+    promptObserverRef.current?.disconnect();
+    promptObserverRef.current = null;
+    if (!node || typeof ResizeObserver === "undefined") return;
+    // A drag resizes via a custom property without re-rendering.
+    const observer = new ResizeObserver(() => measurePromptRef.current());
+    observer.observe(node);
+    promptObserverRef.current = observer;
+    measurePromptRef.current();
+  }, []);
+  const [activePresetBaseline, setActivePresetBaseline] = useState(params);
   const presets = useMemo(() => {
-    const overrides = new Set(customPresets.map((preset) => preset.name));
-    return [
-      ...BUILTIN_PRESETS.filter((preset) => !overrides.has(preset.name)),
-      ...customPresets,
-    ];
+    return getOrderedPresets(customPresets);
   }, [customPresets]);
   const activePresetDefinition = useMemo(
     () => presets.find((preset) => preset.name === activePreset) ?? null,
@@ -555,12 +758,73 @@ export function ChatSettingsPanel({
       BUILTIN_PRESETS.find((preset) => preset.name === activePreset) ?? null,
     [activePreset],
   );
-  const activePresetDirty = useMemo(
-    () =>
-      activePresetDefinition == null
-        ? false
-        : !isSamePresetConfig(activePresetDefinition.params, params),
-    [activePresetDefinition, params],
+  const hasUnsavedPresetChanges = useMemo(() => {
+      if (activePresetDefinition == null) {
+        return false;
+      }
+      const samplingChanged =
+        activePresetDefinition.name === "Default"
+          ? activePresetSource === "modified" ||
+            committedSeed !== (params.seed ?? null)
+          : !isSamePresetConfig(
+              activePresetDefinition.params,
+              paramsWithCommittedSeed,
+            );
+      const currentLoadConfig = capturePresetLoadConfig();
+      const loadChanged = !isSamePresetLoadConfig(
+        activePresetDefinition.loadConfig,
+        currentLoadConfig,
+      );
+      return samplingChanged || loadChanged;
+  }, [
+    activePresetDefinition,
+    activePresetSource,
+    params,
+    committedSeed,
+    paramsWithCommittedSeed,
+    customContextLength,
+    loadedContextLength,
+    kvCacheDtype,
+    mlxKvQuant,
+    gpuMemoryMode,
+    gpuLayers,
+    nCpuMoe,
+    tensorParallel,
+    disableVision,
+    speculativeType,
+    specDraftNMax,
+    nParallel,
+    reasoningBudget,
+    reasoningBudgetMessage,
+    nBatch,
+    nUbatch,
+    params.maxSeqLength,
+  ]);
+  const activePresetLoadSummary = useMemo(
+    () => formatPresetLoadConfigSummary(activePresetDefinition?.loadConfig),
+    [activePresetDefinition],
+  );
+  const currentLoadSummary = useMemo(
+    () => formatPresetLoadConfigSummary(capturePresetLoadConfig()),
+    [
+      customContextLength,
+      loadedContextLength,
+      kvCacheDtype,
+      mlxKvQuant,
+      gpuMemoryMode,
+      gpuLayers,
+      nCpuMoe,
+      tensorParallel,
+      disableVision,
+      speculativeType,
+      specDraftNMax,
+      nParallel,
+      reasoningBudget,
+      reasoningBudgetMessage,
+      nBatch,
+      nUbatch,
+      params.maxSeqLength,
+    ],
   );
   const presetSaveState = useMemo(
     () =>
@@ -568,151 +832,287 @@ export function ChatSettingsPanel({
         rawName: presetNameInput,
         activePreset,
         presets,
-        activePresetDirty,
+        hasUnsavedPresetChanges,
       }),
-    [activePreset, activePresetDirty, presetNameInput, presets],
+    [activePreset, hasUnsavedPresetChanges, presetNameInput, presets],
   );
-  const systemPromptEditorDirty = systemPromptDraft !== params.systemPrompt;
-  const trustRemoteCodeMissing =
-    Boolean(currentCheckpoint) &&
-    modelRequiresTrustRemoteCode &&
-    !(params.trustRemoteCode ?? false);
+  const systemVariablesError = getPromptVariablesError(systemVariablesDraft);
+  const currentSystemPrompt = params.systemPrompt ?? "";
+  const currentSystemVariables = params.systemVariables ?? "";
+  const systemPromptEditorDirty =
+    systemPromptDraft !== currentSystemPrompt ||
+    systemVariablesDraft !== currentSystemVariables;
+  const externalSelection = currentCheckpoint
+    ? parseExternalModelId(currentCheckpoint)
+    : null;
+  // Budget, duration and dedupe are knobs of Unsloth's own tool loop, which external turns run
+  // only when the provider supports Unsloth tools (`=== true`, the same test the request uses).
+  const showStudioToolLoopControls =
+    !isExternalModel ||
+    providerModelSupportsStudioTools(
+      externalProviderType,
+      externalSelection?.modelId,
+    ) === true;
+
+  const showPromptCacheTtlControl = Boolean(
+    activeExternalProvider &&
+      promptCacheTtlAppliesToModel(
+        activeExternalProvider.providerType,
+        externalSelection?.modelId,
+      ),
+  );
+  const showPromptCachingControl =
+    activeExternalProvider != null &&
+    promptCachingAppliesToModel(
+      activeExternalProvider.providerType,
+      externalSelection?.modelId,
+    );
+  const promptCachingEnabled =
+    activeExternalProvider?.enablePromptCaching !== false;
+  // The OpenRouter cap comes from the live catalog, which can land after this panel renders.
+  useSyncExternalStore(subscribeModelCatalog, modelCatalogVersion);
+  const maxTokensMax = isExternalModel
+    ? getExternalMaxOutputTokens(
+        externalProviderType,
+        externalSelection?.modelId,
+        activeExternalProvider?.maxOutputTokens,
+      )
+    : localMaxTokensCeiling(baseContext, params.maxSeqLength);
+  const maxTokensUnboundedAtMax =
+    isExternalModel &&
+    externalMaxTokensUnboundedAtMax(
+      externalProviderType,
+      externalSelection?.modelId,
+      activeExternalProvider?.maxOutputTokens,
+    );
+  const showOpenAICodeExecSection =
+    activeExternalProvider != null &&
+    providerSupportsBuiltinCodeExecution(
+      activeExternalProvider.providerType,
+      externalSelection?.modelId,
+      activeExternalProvider.baseUrl,
+    ) &&
+    activeExternalProvider.providerType === "openai";
+  const showFastModeControl =
+    activeExternalProvider != null &&
+    providerSupportsFastMode(
+      activeExternalProvider.providerType,
+      externalSelection?.modelId,
+    );
+  const activeThreadId = useChatRuntimeStore((s) => s.activeThreadId);
+  const openAiApiKeyForSection =
+    activeExternalProvider && !activeExternalProvider.hasApiKey
+      ? getExternalProviderApiKey(activeExternalProvider.id) || null
+      : null;
 
   function set<K extends keyof InferenceParams>(key: K) {
-    return (v: InferenceParams[K]) => onParamsChange({ ...params, [key]: v });
+    return (v: InferenceParams[K]) => {
+      const nextParams = {
+        ...useChatRuntimeStore.getState().params,
+        [key]: v,
+        ...(key === "minP" ? { minPMode: "custom" as const } : {}),
+      };
+      const nextSource = isSamePresetConfig(activePresetBaseline, nextParams)
+        ? getPresetSource(activePreset)
+        : "modified";
+      setActivePresetSource(nextSource, editedSamplingKey(key));
+      setParams(nextParams, {
+        minPChoiceEdited: key === "minP" || key === "minPMode",
+      });
+    };
+  }
+
+  const setSeed = set("seed");
+
+  useEffect(() => {
+    const clampedMaxTokens = resolveExternalMaxTokensClamp({
+      settingsHydrated,
+      hasActiveExternalProvider: activeExternalProvider != null,
+      isExternalModel,
+      maxTokens: params.maxTokens,
+      maxTokensMax,
+    });
+    if (clampedMaxTokens == null) {
+      return;
+    }
+    const nextParams = { ...params, maxTokens: clampedMaxTokens };
+    const nextSource = isSamePresetConfig(activePresetBaseline, nextParams)
+      ? getPresetSource(activePreset)
+      : "modified";
+    setActivePresetSource(nextSource);
+    setParams(nextParams);
+  }, [
+    activeExternalProvider,
+    activePreset,
+    activePresetBaseline,
+    isExternalModel,
+    maxTokensMax,
+    setParams,
+    params,
+    settingsHydrated,
+    setActivePresetSource,
+  ]);
+
+  function applyPresetParamsWithinCurrentLimits(
+    preset: Preset,
+  ): InferenceParams {
+    const nextParams = applyPresetForProvider(params, preset, isVllm ? "vllm" : null);
+    // Without a provider maxTokensMax is the fallback, so applying here would lower it for good.
+    if (!isExternalModel || activeExternalProvider == null) return nextParams;
+    return {
+      ...nextParams,
+      maxTokens: Math.min(nextParams.maxTokens, maxTokensMax),
+    };
   }
 
   function applyPreset(name: string) {
+    if (!settingsHydrated) {
+      return;
+    }
     const p = presets.find((pr) => pr.name === name);
     if (p) {
-      if (
-        modelRequiresTrustRemoteCode &&
-        !(p.params.trustRemoteCode ?? false)
-      ) {
-        toast.warning("This configuration turns custom code off", {
-          description:
-            "The current model needs custom code enabled to load. Keep it on for this model.",
-        });
-        return;
-      }
-      onParamsChange({
-        ...p.params,
-        checkpoint: params.checkpoint,
+      setParams(applyPresetParamsWithinCurrentLimits(p), {
+        minPChoiceEdited: true,
+        fromPreset: true,
+        pinsSampling: getPresetSource(name) === "custom",
       });
+      if (p.loadConfig) {
+        applyPresetLoadConfig(p.loadConfig);
+      }
       setActivePreset(name);
-      if (canUseStorage()) {
-        try {
-          localStorage.setItem(CHAT_ACTIVE_PRESET_KEY, name);
-        } catch {
-          // ignore
-        }
+      setActivePresetSource(getPresetSource(name));
+      if (p.loadConfig && params.checkpoint) {
+        toast.info("Reload the model to apply load settings from this preset.");
       }
     }
   }
 
   function savePresetWithName(rawName: string) {
+    if (!settingsHydrated) {
+      return;
+    }
     const trimmed = rawName.trim();
     if (!trimmed) {
       toast.error("Enter a preset name");
       return;
     }
-    setCustomPresets((prev) => {
-      const next = prev.filter((p) => p.name !== trimmed);
-      const merged = [...next, { name: trimmed, params: { ...params } }];
-      if (canUseStorage()) {
-        try {
-          localStorage.setItem(CHAT_PRESETS_KEY, JSON.stringify(merged));
-        } catch {
-          // ignore
-        }
-      }
-      return merged;
-    });
-    if (canUseStorage()) {
-      try {
-        localStorage.setItem(CHAT_ACTIVE_PRESET_KEY, trimmed);
-      } catch {
-        // ignore
-      }
-    }
-    setActivePreset(trimmed);
-    setPresetNameInput(trimmed);
+    const usedNames = new Set([
+      ...BUILTIN_PRESET_NAMES,
+      ...customPresets.map((preset) => preset.name),
+    ]);
+    const saveName = BUILTIN_PRESET_NAMES.has(trimmed)
+      ? getBuiltinVariantName(trimmed, usedNames)
+      : trimmed;
+    const next = customPresets.filter((p) => p.name !== saveName);
+    const loadConfig = capturePresetLoadConfig();
+    // Live, as set() does: a number box this click blurred is not in this render's `params` yet.
+    const live = useChatRuntimeStore.getState().params;
+    const saved = seedDraft === null ? live : { ...live, seed: committedSeed };
+    const merged = [
+      ...next,
+      {
+        name: saveName,
+        params: toPresetParams(saved),
+        ...(loadConfig ? { loadConfig } : {}),
+      },
+    ];
+    setCustomPresets(merged);
+    // As a pick does: drop the hand edits filed under the loaded model, or Default replays them.
+    setParams(saved, { fromPreset: true, pinsSampling: true });
+    setActivePreset(saveName);
+    setActivePresetSource("custom");
+    setPresetNameInput(saveName);
   }
 
   function deletePreset(name: string) {
+    if (!settingsHydrated) {
+      return;
+    }
     const hasCustomPreset = customPresets.some(
       (preset) => preset.name === name,
     );
     if (!hasCustomPreset) {
       return;
     }
-    const builtinPreset = BUILTIN_PRESETS.find((preset) => preset.name === name);
     const fallbackPreset =
-      builtinPreset ??
-      BUILTIN_PRESETS.find((preset) => preset.name === "Default") ??
-      null;
-    if (
-      activePreset === name &&
-      fallbackPreset &&
-      modelRequiresTrustRemoteCode &&
-      !(fallbackPreset.params.trustRemoteCode ?? false)
-    ) {
-      toast.warning("Reset would turn custom code off", {
-        description:
-          "The current model needs custom code enabled to load. Keep it on for this model.",
-      });
-      return;
-    }
-    setCustomPresets((prev) => {
-      const next = prev.filter((preset) => preset.name !== name);
-      if (canUseStorage()) {
-        try {
-          localStorage.setItem(CHAT_PRESETS_KEY, JSON.stringify(next));
-        } catch {
-          // ignore
-        }
-      }
-      return next;
-    });
+      BUILTIN_PRESETS.find((preset) => preset.name === "Default") ?? null;
+    const next = customPresets.filter((preset) => preset.name !== name);
+    setCustomPresets(next);
     if (activePreset === name) {
       if (fallbackPreset) {
-        onParamsChange({
-          ...fallbackPreset.params,
-          checkpoint: params.checkpoint,
-        });
-        setActivePreset(fallbackPreset.name);
-        if (canUseStorage()) {
-          try {
-            localStorage.setItem(CHAT_ACTIVE_PRESET_KEY, fallbackPreset.name);
-          } catch {
-            // ignore
-          }
+        setParams(
+          applyPresetParamsWithinCurrentLimits(fallbackPreset),
+          { minPChoiceEdited: true, fromPreset: true },
+        );
+        if (fallbackPreset.loadConfig) {
+          applyPresetLoadConfig(fallbackPreset.loadConfig);
         }
+        setActivePreset(fallbackPreset.name);
+        setActivePresetSource("builtin-default");
       }
     }
   }
 
   function openSystemPromptEditor() {
-    setSystemPromptDraft(params.systemPrompt);
+    setSystemPromptDraft(currentSystemPrompt);
+    setSystemVariablesDraft(currentSystemVariables);
+    setSystemVariablesOpen(
+      currentSystemVariables.trim().length > 0 ||
+        hasPromptVariableSyntax(currentSystemPrompt),
+    );
     setSystemPromptEditorOpen(true);
   }
 
   function saveSystemPromptEditor() {
-    set("systemPrompt")(systemPromptDraft);
+    if (systemVariablesError) {
+      toast.error("Fix prompt variables before saving", {
+        description: systemVariablesError,
+      });
+      return;
+    }
+    const nextParams = {
+      ...params,
+      systemPrompt: systemPromptDraft,
+      systemVariables: systemVariablesDraft.trim(),
+    };
+    const nextSource = isSamePresetConfig(activePresetBaseline, nextParams)
+      ? getPresetSource(activePreset)
+      : "modified";
+    setActivePresetSource(nextSource);
+    setParams(nextParams);
     setSystemPromptEditorOpen(false);
   }
 
   useEffect(() => {
-    if (presets.some((preset) => preset.name === activePreset)) return;
-    setActivePreset("Default");
-    if (canUseStorage()) {
-      try {
-        localStorage.setItem(CHAT_ACTIVE_PRESET_KEY, "Default");
-      } catch {
-        // ignore
-      }
+    if (activePresetSource !== "modified") {
+      setActivePresetBaseline(params);
     }
-  }, [activePreset, presets]);
+  }, [activePresetSource, params]);
+
+  useEffect(() => {
+    if (!settingsHydrated) {
+      return;
+    }
+    if (presets.some((preset) => preset.name === activePreset)) {
+      const expectedSource = getPresetSource(activePreset);
+      if (
+        activePresetSource !== "modified" &&
+        activePresetSource !== expectedSource
+      ) {
+        setActivePresetSource(expectedSource);
+      }
+      return;
+    }
+    setActivePreset("Default");
+    setActivePresetSource("builtin-default");
+  }, [
+    activePreset,
+    activePresetSource,
+    presets,
+    setActivePreset,
+    setActivePresetSource,
+    settingsHydrated,
+  ]);
 
   useEffect(() => {
     setPresetNameInput(activePreset);
@@ -724,130 +1124,256 @@ export function ChatSettingsPanel({
     }
   }, [open]);
 
-  useLayoutEffect(() => {
-    const el = presetControlRowRef.current;
-    if (!el || !open) return;
-    const measure = () => {
-      setPresetMenuWidthPx(el.getBoundingClientRect().width);
+  useEffect(() => {
+    measurePromptRef.current = () => {
+      const el = systemPromptBoxRef.current;
+      setSystemPromptOverflows(
+        currentSystemPrompt.length > 0 &&
+          el != null &&
+          el.clientHeight > 0 &&
+          el.scrollHeight > el.clientHeight + 1,
+      );
     };
-    measure();
-    const ro = new ResizeObserver(measure);
-    ro.observe(el);
-    return () => ro.disconnect();
-  }, [open]);
+    measurePromptRef.current();
+  }, [currentSystemPrompt, open]);
+
+  useEffect(() => () => promptObserverRef.current?.disconnect(), []);
+
+  const {
+    attach: attachSettingsScroll,
+    onScroll: onSettingsScroll,
+    className: settingsFadeClass,
+  } = useScrollFades();
 
   const settingsContent = (
     <>
-      <div className="aui-thread-viewport relative h-full overflow-y-auto bg-muted/70">
-      <div className="sticky top-0 z-10 flex items-center gap-2 bg-muted/70 px-4 py-3 backdrop-blur">
-        <HugeiconsIcon
-          icon={PencilEdit01Icon}
-          className="size-4 text-muted-foreground/70"
-        />
-        <span className="flex-1 text-base font-semibold tracking-tight">
-          Configuration
-        </span>
+      <div className="hint-on-hover flex h-full min-h-0 flex-col">
+      {/* Header outside the scroll area so the scrollbar never shifts the close button. */}
+      <div className="flex h-[var(--studio-chat-header-height,48px)] shrink-0 items-start gap-2 bg-panel-surface pl-[calc(18px*var(--ui-space-scale,1))] pr-[calc(18px*var(--ui-space-scale,1))] pt-[var(--studio-chat-header-padding-top,11px)]">
+        {isCompact ? (
+          <span className="flex h-[var(--studio-chat-control-height,34px)] flex-1 items-center text-ui-16 font-semibold tracking-[0em] dark:tracking-[0.015em] text-nav-fg">
+            Run settings
+          </span>
+        ) : (
+          <>
+            <span className="flex h-[var(--studio-chat-control-height,34px)] flex-1 items-center text-ui-16 font-semibold tracking-[0em] dark:tracking-[0.015em] text-nav-fg">
+              Run settings
+            </span>
+            <Tooltip key={open ? "open" : "closed"}>
+                <TooltipPrimitive.Trigger asChild={true}>
+                <button
+                  type="button"
+                  onClick={() => onOpenChange?.(false)}
+                  className="mt-[calc((var(--studio-chat-control-height,33px)-30px*var(--ui-space-scale,1))/2)] flex size-[calc(30px*var(--ui-space-scale,1))] cursor-pointer items-center justify-center rounded-[10px] text-nav-icon-idle dark:text-nav-fg-muted transition-colors hover:bg-nav-surface-hover hover:text-black dark:hover:text-white focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                  aria-label="Close run settings"
+                >
+                  <HugeiconsIcon
+                    icon={PanelRightIcon}
+                    strokeWidth={1.75}
+                    className="size-icon"
+                  />
+                </button>
+              </TooltipPrimitive.Trigger>
+              <TooltipContent
+                side="bottom"
+                sideOffset={6}
+                className="tooltip-compact"
+              >
+                Close run settings
+              </TooltipContent>
+            </Tooltip>
+          </>
+        )}
       </div>
 
-      <div className="px-1.5">
-        {/* mt-4 matches the Playground sidebar gap (SidebarHeader py-3 + SidebarGroup pt-1) */}
-        <div className="mt-4 px-2 pb-3">
-          <div className="space-y-1.5">
-            <div ref={presetControlRowRef} className="w-full min-w-0">
-              <DropdownMenu>
-                <InputGroup className="!h-8 min-h-8 min-w-0 items-stretch gap-0 rounded-2xl pr-0 focus-within:border-input focus-within:ring-0 focus-within:shadow-none has-[[data-slot=input-group-control]:focus-visible]:border-input has-[[data-slot=input-group-control]:focus-visible]:ring-0 has-[[data-slot=input-group-control]:focus-visible]:shadow-none">
-                  <InputGroupInput
-                    id="inference-preset-name"
-                    value={presetNameInput}
-                    onChange={(e) => setPresetNameInput(e.target.value)}
-                    onKeyDown={(e) => {
-                      if (e.key === "Enter" && presetSaveState.canSubmit) {
-                        e.preventDefault();
-                        savePresetWithName(presetNameInput);
-                      }
-                    }}
-                    placeholder="Preset name"
-                    maxLength={80}
-                    autoComplete="off"
-                    className={cn(
-                      "!h-8 min-h-0 min-w-0 self-stretch !pl-2.5 !pr-2 pt-1 pb-1 text-sm leading-10 md:text-sm",
-                      presetSaveState.isSaveReady &&
-                        "text-foreground placeholder:text-primary/45",
-                    )}
-                    aria-label="Inference preset name"
-                  />
-                  <InputGroupAddon
-                    align="inline-end"
-                    className="min-h-0 shrink-0 gap-0 self-stretch border-0 py-0 pl-0 !pr-0 has-[>button]:mr-0"
-                  >
-                    <DropdownMenuTrigger asChild={true}>
-                      <InputGroupButton
-                        type="button"
-                        variant="ghost"
-                        size="icon-sm"
-                        className="!h-8 min-h-8 !w-7 min-w-7 shrink-0 rounded-none rounded-r-2xl border-l border-border px-0 text-muted-foreground transition-colors hover:bg-primary/15 hover:text-primary data-[state=open]:bg-primary/20 data-[state=open]:text-primary"
-                        title="Choose a preset"
-                        aria-label="Open preset list"
+      <div
+        ref={attachSettingsScroll}
+        onScroll={onSettingsScroll}
+        className={cn(
+          "run-settings-scroll panel-scroll-fade relative min-h-0 flex-1 overflow-y-auto",
+          settingsFadeClass,
+        )}
+      >
+      <div className="px-[calc(18px*var(--ui-space-scale,1))] pt-3">
+        {(hasModelContent || modelConfig) && (
+              <CollapsibleSection label="Model" defaultOpen={true} first={true}>
+            <div className="flex flex-col gap-5">
+              {modelConfig}
+              {showSpecFallback && (
+                <div className="rounded-lg bg-amber-500/[0.08] px-3 py-2 text-ui-12 leading-[1.4] text-nav-fg/80">
+                  <p>
+                    {specFallbackMessage({
+                      reason: specFallbackReason,
+                      drafter: speculativeDrafterLabel,
+                      isLocalGguf,
+                      updateAvailable: Boolean(llamaUpdateStatus?.llama.update_available),
+                    })}
+                  </p>
+                  {mtpUpdatable && llamaUpdateStatus?.llama.update_available && (
+                    <Button
+                      size="sm"
+                      className="corner-squircle mt-2 text-ui-12"
+                      onClick={handleMtpUpdate}
+                      disabled={llamaUpdating}
+                      data-test-id="mtp-update-button"
+                    >
+                      {llamaUpdating ? "Updating..." : "Update llama.cpp"}
+                    </Button>
+                  )}
+                </div>
+              )}
+              {mlxSpecFallback && (
+                <div className="rounded-lg bg-amber-500/[0.08] px-3 py-2 text-ui-12 leading-[1.4] text-nav-fg/80">
+                  <p>{mlxSpecFallback}</p>
+                </div>
+              )}
+              {showContextVramWarning && (
+                <p className="text-ui-11 text-amber-500">
+                  {isUnifiedMemory ? (
+                    <>
+                      Context window is above Unsloth&apos;s free-memory estimate
+                      ({maxContextLength?.toLocaleString()} tokens). It may
+                      still load, but macOS may have to compress or swap other
+                      apps and generation may slow down. Lower the context,
+                      leave it on Auto, or set the KV cache to q8_0.
+                    </>
+                  ) : (
+                    <>
+                      Context window exceeds the estimated VRAM capacity (
+                      {maxContextLength?.toLocaleString()} tokens). The
+                      model may use system RAM.
+                    </>
+                  )}
+                </p>
+              )}
+            </div>
+          </CollapsibleSection>
+        )}
+
+        <CollapsibleSection
+          label="Preset"
+          headerAction={
+            <InfoHint>
+              Saving a preset also stores current load settings (
+              {loadSettingNames}).
+              {currentLoadSummary ? (
+                <>
+                  {" "}
+                  Active now: {currentLoadSummary}.
+                </>
+              ) : null}
+              {activePresetLoadSummary &&
+              activePresetLoadSummary !== currentLoadSummary ? (
+                <>
+                  {" "}
+                  Saved in preset: {activePresetLoadSummary}.
+                </>
+              ) : null}
+            </InfoHint>
+          }
+          defaultOpen={true}
+          first={!hasModelContent && !modelConfig}
+        >
+          <div className="flex flex-col gap-2">
+            <DropdownMenu>
+                  <DropdownMenuTrigger asChild={true}>
+                <div
+                  className="w-full min-w-0 cursor-pointer outline-none focus-visible:outline-none"
+                  aria-label="Open preset list"
+                >
+                  <InputGroup className="panel-input-group">
+                    <InputGroupInput
+                      id="inference-preset-name"
+                      value={presetNameInput}
+                      onChange={(e) => setPresetNameInput(e.target.value)}
+                      onPointerDown={(e) => e.stopPropagation()}
+                      onClick={(e) => e.stopPropagation()}
+                      onKeyDown={(e) => {
+                        if (
+                          e.key === "Enter" &&
+                          settingsHydrated &&
+                          presetSaveState.canSubmit
+                        ) {
+                          e.preventDefault();
+                          savePresetWithName(presetNameInput);
+                        }
+                        e.stopPropagation();
+                      }}
+                      placeholder="Preset name"
+                      maxLength={80}
+                      autoComplete="off"
+                      className={cn(
+                        "!h-9 min-h-0 min-w-0 self-stretch !pl-3.5 !pr-2 py-0 text-ui-13 font-medium leading-9 text-nav-fg md:text-ui-13",
+                        presetSaveState.isSaveReady &&
+                          "placeholder:text-foreground/50",
+                      )}
+                      aria-label="Inference preset name"
+                    />
+                    <InputGroupAddon
+                      align="inline-end"
+                      className="min-h-0 shrink-0 gap-0 self-stretch border-0 py-0 pl-0 !pr-1 has-[>button]:mr-0 !cursor-pointer"
+                    >
+                      <span
+                        className="!h-7 min-h-7 !w-7 min-w-7 shrink-0 self-center inline-flex items-center justify-center rounded-full border-0 px-0 text-[#a0a097] dark:text-nav-fg pointer-events-none"
+                        aria-hidden="true"
                       >
                         <HugeiconsIcon
-                          icon={ArrowDown01Icon}
+                          icon={ChevronDownStandardIcon}
                           className="size-3.5"
                           strokeWidth={2}
                         />
-                      </InputGroupButton>
-                    </DropdownMenuTrigger>
-                  </InputGroupAddon>
-                </InputGroup>
-                <DropdownMenuContent
-                  align="end"
-                  className="min-w-40 max-w-none"
-                  style={
-                    presetMenuWidthPx != null
-                      ? {
-                          width: presetMenuWidthPx,
-                          minWidth: presetMenuWidthPx,
-                        }
-                      : undefined
-                  }
-                >
-                  {presets.map((p) => (
+                      </span>
+                    </InputGroupAddon>
+                  </InputGroup>
+                </div>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent
+                align="start"
+                sideOffset={0}
+                className="menu-soft-surface ring-0 border-0 rounded-lg p-1"
+              >
+                {presets.map((p, index) => (
+                  <Fragment key={p.name}>
                     <DropdownMenuItem
-                      key={p.name}
-                      onSelect={() => applyPreset(p.name)}
+                      disabled={!settingsHydrated}
+                      onSelect={(event) => {
+                        if (!settingsHydrated) {
+                          event.preventDefault();
+                          return;
+                        }
+                        applyPreset(p.name);
+                      }}
+                      className="flex min-h-9 items-center px-3 py-0 text-ui-13 font-medium leading-[1.4] tracking-nav"
                     >
                       {p.name}
                     </DropdownMenuItem>
-                  ))}
-                </DropdownMenuContent>
-              </DropdownMenu>
-            </div>
-            <div className="grid grid-cols-2 gap-1.5">
+                    {index === BUILTIN_PRESETS.length - 1 &&
+                      presets.length > BUILTIN_PRESETS.length && (
+                        <DropdownMenuSeparator className="mx-3 my-1.5 h-px bg-[rgb(0_0_0_/_calc(0.08*var(--contrast-wash-gain,1)))] dark:bg-[rgb(255_255_255_/_calc(0.08*var(--contrast-wash-gain,1)))]" />
+                      )}
+                  </Fragment>
+                ))}
+              </DropdownMenuContent>
+            </DropdownMenu>
+            <div className="flex flex-wrap items-center gap-2">
               <Button
                 type="button"
                 onClick={() => savePresetWithName(presetNameInput)}
-                disabled={!presetSaveState.canSubmit}
+                disabled={!(settingsHydrated && presetSaveState.canSubmit)}
                 variant={presetSaveState.isSaveReady ? "default" : "outline"}
                 size="sm"
-                className={cn(
-                  "h-8 w-full text-xs",
-                  presetSaveState.isSaveReady &&
-                    "bg-primary/92 text-primary-foreground hover:bg-primary",
-                )}
                 title={presetSaveState.title}
                 aria-label={presetSaveState.title}
               >
-                <span className="inline-flex shrink-0 items-center pr-1.5">
-                  <HugeiconsIcon icon={FloppyDiskIcon} className="size-3.5" />
-                </span>
                 {presetSaveState.buttonLabel}
               </Button>
               <Button
                 type="button"
                 onClick={() => deletePreset(activePreset)}
-                disabled={!activeCustomPreset}
-                variant="outline"
+                disabled={!(settingsHydrated && activeCustomPreset)}
+                variant="ghost"
                 size="sm"
-                className="h-8 w-full text-xs text-muted-foreground"
+                className="text-muted-foreground hover:text-destructive"
                 title={
                   activeCustomPreset
                     ? activeBuiltinPreset
@@ -856,321 +1382,386 @@ export function ChatSettingsPanel({
                     : "No saved override to delete"
                 }
               >
-                <span className="inline-flex shrink-0 items-center pr-1.5">
-                  <HugeiconsIcon icon={Delete02Icon} className="size-3.5" />
-                </span>
                 Delete
               </Button>
             </div>
           </div>
-        </div>
+        </CollapsibleSection>
 
-        <div className="px-2 pb-4">
-          <div className="mb-1.5 flex items-center justify-between gap-2">
-            <label
-              htmlFor="system-prompt"
-              className="block text-xs font-medium"
-            >
-              System Prompt
-            </label>
-            <Button
-              type="button"
-              variant="outline"
-              size="sm"
-              className="h-6 px-2 text-[11px]"
-              onClick={openSystemPromptEditor}
-              title="Open the full system prompt editor"
-            >
-              Edit
-            </Button>
-          </div>
-          <Textarea
-            id="system-prompt"
-            value={params.systemPrompt}
-            onChange={(e) => set("systemPrompt")(e.target.value)}
-            placeholder="You are a helpful assistant..."
-            className="min-h-20 max-h-48 overflow-y-auto text-xs corner-squircle"
-            rows={3}
-          />
-        </div>
+        {showPromptCachingControl && activeExternalProvider ? (
+          <CollapsibleSection label="Provider" defaultOpen={true}>
+            <div className="flex min-h-8 items-center justify-between gap-3">
+              <div className="flex min-w-0 items-center gap-1.5">
+                <span className="min-w-0 text-ui-13 font-medium leading-[1.25] tracking-nav text-nav-fg">
+                  Prompt caching
+                </span>
+                <InfoHint>
+                      Reuse compatible prompt prefixes for lower latency and
+                      cost.
+                </InfoHint>
+              </div>
+              <Switch
+                className="shrink-0"
+                checked={promptCachingEnabled}
+                onCheckedChange={(checked) => {
+                  onExternalProviderChange?.({
+                    ...activeExternalProvider,
+                    enablePromptCaching: checked,
+                  });
+                }}
+                aria-label="Enable prompt caching"
+              />
+            </div>
+            {showPromptCacheTtlControl && promptCachingEnabled ? (
+              <div className="flex min-h-8 items-center justify-between gap-3 pt-5">
+                <div className="flex min-w-0 items-center gap-1.5">
+                  <span className="min-w-0 text-ui-13 font-medium leading-[1.25] tracking-nav text-nav-fg">
+                    Cache TTL
+                  </span>
+                  <InfoHint>
+                    Anthropic exposes a 5 minute and a 1 hour ephemeral
+                        cache pool. The 1 hour pool costs 2x base input on write
+                        vs 1.25x for 5 minute, but reads stay 0.1x for both, so
+                        a single read landing more than 5 minutes after the
+                        write pays off the premium.
+                  </InfoHint>
+                </div>
+                <Select
+                  value={activeExternalProvider.promptCacheTtl ?? "5m"}
+                  onValueChange={(value) => {
+                    if (value !== "5m" && value !== "1h") return;
+                    onExternalProviderChange?.({
+                      ...activeExternalProvider,
+                      promptCacheTtl: value,
+                    });
+                  }}
+                >
+                  <SelectTrigger
+                    size="sm"
+                    icon={ChevronDownStandardIcon}
+                    iconClassName="size-3.5"
+                    className="panel-select-trigger shrink-0"
+                    aria-label="Prompt cache TTL"
+                  >
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="5m">5 minutes</SelectItem>
+                    <SelectItem value="1h">1 hour</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+            ) : null}
+            {showFastModeControl ? (
+              <div className="flex min-h-8 items-center justify-between gap-3 pt-5">
+                <div className="flex min-w-0 items-center gap-1.5">
+                  <span className="min-w-0 text-ui-13 font-medium leading-[1.25] tracking-nav text-nav-fg">
+                    Fast mode
+                  </span>
+                  <InfoHint>
+                    Research preview. Up to 2.5x higher output tokens per
+                    second on Claude Opus 5 and 4.8 at 2x standard Opus
+                    pricing.
+                    Switching between fast and standard invalidates the
+                    prompt cache and is incompatible with the Priority
+                    service tier.
+                  </InfoHint>
+                </div>
+                <Switch
+                  className="shrink-0"
+                  checked={Boolean(params.fastMode)}
+                  onCheckedChange={set("fastMode")}
+                  aria-label="Fast mode"
+                />
+              </div>
+            ) : null}
+          </CollapsibleSection>
+        ) : null}
+
+        {showOpenAICodeExecSection && activeExternalProvider ? (
+          <CollapsibleSection label="Code Execution" defaultOpen={false}>
+            <OpenAICodeExecSection
+              provider={activeExternalProvider}
+              apiKey={openAiApiKeyForSection}
+              activeThreadId={activeThreadId}
+              onProviderChange={(p) => onExternalProviderChange?.(p)}
+            />
+          </CollapsibleSection>
+        ) : null}
 
         <CollapsibleSection
-          icon={Settings02Icon}
-          label="Model"
+          label="System Prompt"
           defaultOpen={true}
-        >
-          <div className="flex flex-col gap-3 py-1">
-            {isGguf && (
-              <>
-                <div className="space-y-2">
-                  <div className="flex items-center justify-between">
-                    <span className="text-xs font-medium">Context Length</span>
-                    <Input
-                      type="number"
-                      value={
-                        typeof ctxDisplayValue === "number"
-                          ? ctxDisplayValue
-                          : (ggufContextLength ?? "")
-                      }
-                      placeholder="..."
-                      min={128}
-                      max={ctxMaxValue ?? undefined}
-                      step={1024}
-                      className="h-6 w-[100px] text-right text-xs tabular-nums"
-                      onChange={(e) => {
-                        const raw = e.target.value;
-                        if (raw === "") {
-                          setCustomContextLength(null);
-                          return;
-                        }
-                        const v = Number.parseInt(raw, 10);
-                        if (!Number.isNaN(v) && v >= 0) {
-                          const maxCtx =
-                            ctxMaxValue ?? Number.POSITIVE_INFINITY;
-                          const clamped = Math.min(v, maxCtx);
-                          setCustomContextLength(
-                            clamped === (ggufContextLength ?? 0)
-                              ? null
-                              : clamped,
-                          );
-                        }
-                      }}
-                    />
-                  </div>
-                  <Slider
-                    min={1024}
-                    max={ctxMaxValue ?? 4096}
-                    step={1024}
-                    value={[
-                      Math.min(
-                        typeof ctxDisplayValue === "number"
-                          ? ctxDisplayValue
-                          : (ggufContextLength ?? 4096),
-                        ctxMaxValue ?? 4096,
-                      ),
-                    ]}
-                    onValueChange={([v]) => {
-                      setCustomContextLength(
-                        v === (ggufContextLength ?? 0) ? null : v,
-                      );
-                    }}
+          onLabelClick={openSystemPromptEditor}
+          headerAction={
+            <Tooltip>
+                  <TooltipPrimitive.Trigger asChild={true}>
+                <button
+                  type="button"
+                  onClick={openSystemPromptEditor}
+                  // 28px target laid out at the chevron's 14px.
+                  className="nav-icon-btn -my-1.75 text-nav-icon-idle hover:bg-panel-surface-hover hover:text-black dark:hover:text-white"
+                  aria-label="Edit system prompt"
+                >
+                  <HugeiconsIcon
+                    icon={Edit03Icon}
+                    strokeWidth={1.75}
+                    className="size-3"
                   />
-                  {ggufMaxContextLength != null &&
-                    typeof ctxDisplayValue === "number" &&
-                    ctxDisplayValue > ggufMaxContextLength && (
-                      <p className="text-[11px] text-amber-500">
-                        Exceeds estimated VRAM capacity (
-                        {ggufMaxContextLength.toLocaleString()} tokens). The
-                        model may use system RAM.
-                      </p>
-                    )}
-                </div>
-                <div className="grid grid-cols-[minmax(0,1fr)_65px] items-center gap-x-3">
-                  <div className="min-w-0">
-                    <div className="text-xs font-medium">KV Cache Dtype</div>
-                    <div className="text-[11px] text-muted-foreground">
-                      Quantize KV cache to reduce VRAM.
-                    </div>
-                  </div>
-                  <div className="w-full min-w-0">
+                </button>
+              </TooltipPrimitive.Trigger>
+              <TooltipContent
+                side="top"
+                sideOffset={6}
+                className="tooltip-compact"
+              >
+                Edit prompt
+              </TooltipContent>
+            </Tooltip>
+          }
+        >
+          <div
+            className={cn(
+              "panel-text-surface h-20 w-full overflow-hidden corner-squircle",
+              systemPromptOverflows && "cursor-pointer",
+            )}
+          >
+            <textarea
+              ref={attachPromptBox}
+              value={currentSystemPrompt}
+              onChange={(e) => set("systemPrompt")(e.target.value)}
+              onMouseDown={(e) => {
+                if (
+                  systemPromptOverflows &&
+                  document.activeElement !== e.currentTarget
+                ) {
+                  e.preventDefault();
+                  openSystemPromptEditor();
+                }
+              }}
+              placeholder="Example: You are a helpful assistant..."
+              aria-label="System prompt"
+              className={cn(
+                "block size-full resize-none bg-transparent px-3.5 py-2.5 text-left text-ui-13 font-medium leading-relaxed text-nav-fg outline-none placeholder:text-muted-foreground",
+                systemPromptOverflows && "cursor-pointer",
+              )}
+            />
+          </div>
+        </CollapsibleSection>
+
+        <CollapsibleSection label="Sampling" defaultOpen={true}>
+          <div className="flex flex-col gap-5">
+            {showTemperature ? (
+              <ParamSlider
+                label="Temperature"
+                value={params.temperature}
+                min={0}
+                max={2}
+                step={0.01}
+                onChange={set("temperature")}
+                info="Controls randomness. Lower values make output focused and deterministic; higher values increase variety and creativity."
+              />
+            ) : null}
+            {showTopP ? (
+              <ParamSlider
+                label="Top P"
+                value={params.topP}
+                min={0}
+                max={1}
+                step={0.05}
+                onChange={set("topP")}
+                format={(v) => (v === 1 ? "Off" : undefined)}
+                info="Nucleus sampling. Restricts choices to the smallest set of tokens whose cumulative probability reaches this threshold. 1.0 = off."
+              />
+            ) : null}
+            {showTopK ? (
+              <ParamSlider
+                label="Top K"
+                value={params.topK}
+                min={0}
+                max={100}
+                step={1}
+                onChange={set("topK")}
+                format={(v) => (v === 0 ? "Off" : undefined)}
+                info="Limits sampling to the K most likely tokens at each step. 0 = off."
+              />
+            ) : null}
+            {showMinP ? (
+              <div className="space-y-5">
+                {isVllm ? (
+                  <div className="space-y-1">
                     <Select
-                      value={kvCacheDtype ?? "f16"}
-                      onValueChange={(v) => {
-                        setKvCacheDtype(v === "f16" ? null : v);
+                      value={effectiveMinPMode(params)}
+                      onValueChange={(value) => {
+                        if (isMinPMode(value)) set("minPMode")(value);
                       }}
                     >
-                      <SelectTrigger className="grid h-7 w-full min-w-0 grid-cols-[minmax(0,1fr)_auto] items-center gap-1 px-2 py-0 text-xs [&_[data-slot=select-value]]:min-w-0 [&_[data-slot=select-value]]:truncate [&>svg]:shrink-0">
+                      <SelectTrigger aria-label="Min P mode" className="w-full">
                         <SelectValue />
                       </SelectTrigger>
                       <SelectContent>
-                        <SelectItem value="f16">f16</SelectItem>
-                        <SelectItem value="bf16">bf16</SelectItem>
-                        <SelectItem value="q8_0">q8_0</SelectItem>
-                        <SelectItem value="q5_1">q5_1</SelectItem>
-                        <SelectItem value="q4_1">q4_1</SelectItem>
+                        <SelectItem value="server-default">
+                          Server default
+                        </SelectItem>
+                        <SelectItem value="custom">Custom</SelectItem>
                       </SelectContent>
                     </Select>
+                    {effectiveMinPMode(params) === "server-default" ? (
+                      <p className="text-ui-11 text-muted-foreground">
+                        Uses the server’s sampling settings.
+                      </p>
+                    ) : null}
                   </div>
-                </div>
-                {!currentModelIsVision && (
-                  <div className="grid grid-cols-[minmax(0,1fr)_65px] items-center gap-x-3">
-                    <div className="min-w-0">
-                      <div className="text-xs font-medium">
-                        Speculative Decoding
-                      </div>
-                      <div className="text-[11px] text-muted-foreground">
-                        Speed up generation with no VRAM cost.
-                      </div>
-                    </div>
-                    <div className="w-full min-w-0">
-                      <Select
-                        value={speculativeType ?? "off"}
-                        onValueChange={(v) => {
-                          setSpeculativeType(v === "off" ? null : v);
-                        }}
-                      >
-                        <SelectTrigger className="grid h-7 w-full min-w-0 grid-cols-[minmax(0,1fr)_auto] items-center gap-1 px-2 py-0 text-xs [&_[data-slot=select-value]]:min-w-0 [&_[data-slot=select-value]]:truncate [&>svg]:shrink-0">
-                          <SelectValue />
-                        </SelectTrigger>
-                        <SelectContent>
-                          <SelectItem value="ngram-mod">On</SelectItem>
-                          <SelectItem value="off">Off</SelectItem>
-                        </SelectContent>
-                      </Select>
-                    </div>
-                  </div>
-                )}
-                {modelSettingsDirty && (
-                  <div className="flex flex-wrap gap-1.5 pt-1">
-                    <button
-                      type="button"
-                      onClick={() => onReloadModel?.()}
-                      className="rounded-md bg-primary px-2.5 py-1 text-[11px] font-medium text-primary-foreground transition-colors hover:bg-primary/90"
-                    >
-                      Apply
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => {
-                        setCustomContextLength(null);
-                        setKvCacheDtype(loadedKvCacheDtype);
-                        setSpeculativeType(loadedSpeculativeType);
-                      }}
-                      className="rounded-md border px-2.5 py-1 text-[11px] font-medium text-muted-foreground transition-colors hover:bg-accent"
-                    >
-                      Reset
-                    </button>
-                  </div>
-                )}
-              </>
-            )}
-            {!isGguf && params.checkpoint && (
-              <>
-                <div className="flex items-center justify-between gap-3">
-                  <div className="min-w-0">
-                    <div className="text-xs font-medium">Enable custom code</div>
-                    <div className="text-[11px] text-muted-foreground">
-                      Allow models with custom code (e.g. Nemotron). Only
-                      enable if sure.
-                    </div>
-                  </div>
-                  <Switch
-                    checked={params.trustRemoteCode ?? false}
-                    onCheckedChange={set("trustRemoteCode")}
-                  />
-                </div>
-                {trustRemoteCodeMissing && (
-                  <Alert className="border-amber-200/70 bg-amber-50/70 px-3 py-2 text-amber-950 dark:border-amber-900/70 dark:bg-amber-950/35 dark:text-amber-100">
-                    <AlertTitle className="text-[11px] font-medium">
-                      Keep custom code enabled for this model
-                    </AlertTitle>
-                    <AlertDescription className="text-[11px] text-amber-800 dark:text-amber-200">
-                      This model requires custom code to load. You can edit the
-                      toggle, but loading will stay blocked until it is turned
-                      back on.
-                    </AlertDescription>
-                  </Alert>
-                )}
-              </>
-            )}
-          </div>
-        </CollapsibleSection>
-
-        <CollapsibleSection
-          icon={SlidersHorizontalIcon}
-          label="Sampling"
-          defaultOpen={true}
-        >
-          <div className="flex flex-col gap-5">
-            <ParamSlider
-              label="Temperature"
-              value={params.temperature}
-              min={0}
-              max={2}
-              step={0.1}
-              onChange={set("temperature")}
-            />
-            <ParamSlider
-              label="Top P"
-              value={params.topP}
-              min={0}
-              max={1}
-              step={0.05}
-              onChange={set("topP")}
-              displayValue={params.topP === 1 ? "Off" : undefined}
-            />
-            <ParamSlider
-              label="Top K"
-              value={params.topK}
-              min={0}
-              max={100}
-              step={1}
-              onChange={set("topK")}
-              displayValue={params.topK === 0 ? "Off" : undefined}
-            />
-            <ParamSlider
-              label="Min P"
-              value={params.minP}
-              min={0}
-              max={1}
-              step={0.01}
-              onChange={set("minP")}
-            />
-            <ParamSlider
-              label="Repetition Penalty"
-              value={params.repetitionPenalty}
-              min={1}
-              max={2}
-              step={0.05}
-              onChange={set("repetitionPenalty")}
-              displayValue={params.repetitionPenalty === 1 ? "Off" : undefined}
-            />
-            <ParamSlider
-              label="Presence Penalty"
-              value={params.presencePenalty}
-              min={0}
-              max={2}
-              step={0.1}
-              onChange={set("presencePenalty")}
-              displayValue={params.presencePenalty === 0 ? "Off" : undefined}
-            />
-            {!isGguf && (
+                ) : null}
+                <ParamSlider
+                  label="Min P"
+                  value={params.minP}
+                  disabled={
+                    isVllm && effectiveMinPMode(params) === "server-default"
+                  }
+                  min={0}
+                  max={1}
+                  step={0.01}
+                  onChange={set("minP")}
+                  info="Drops tokens whose probability is below this fraction of the top token's probability. Filters unlikely candidates."
+                />
+              </div>
+            ) : null}
+            {showRepetitionPenalty ? (
               <ParamSlider
-                label="Max Seq Length"
-                value={params.maxSeqLength}
-                min={128}
-                max={32768}
-                step={128}
-                onChange={set("maxSeqLength")}
+                label="Repetition Penalty"
+                value={params.repetitionPenalty}
+                min={1}
+                max={2}
+                step={0.05}
+                onChange={set("repetitionPenalty")}
+                format={(v) => (v === 1 ? "Off" : undefined)}
+                info="Down-weights tokens that have already appeared, reducing repetition. 1.0 = off; higher values penalize more strongly."
               />
-            )}
+            ) : null}
+            {showPresencePenalty ? (
+              <ParamSlider
+                label="Presence Penalty"
+                value={params.presencePenalty}
+                min={0}
+                max={2}
+                step={0.1}
+                onChange={set("presencePenalty")}
+                format={(v) => (v === 0 ? "Off" : undefined)}
+                info="Penalizes any token that has already appeared at least once, encouraging the model to introduce new topics. 0 = off."
+              />
+            ) : null}
             <ParamSlider
               label="Max Tokens"
               value={params.maxTokens}
-              min={64}
-              max={isGguf && ggufContextLength ? ggufContextLength : 32768}
+              min={
+                isExternalModel
+                  ? getExternalMinOutputTokens(externalProviderType)
+                  : MAX_TOKENS_MIN
+              }
+              max={maxTokensMax}
               step={64}
               onChange={set("maxTokens")}
-              displayValue={
-                isGguf &&
-                ggufContextLength &&
-                params.maxTokens >= ggufContextLength
+              format={(v) =>
+                (!isExternalModel || maxTokensUnboundedAtMax) &&
+                v >= maxTokensMax
                   ? "Max"
                   : undefined
               }
+              info="Maximum number of tokens to generate per response. Generation stops at this limit or when the model emits an end-of-sequence token."
             />
+            {showSeed ? (
+              <div className="flex min-h-8 items-center justify-between gap-3">
+                <div className="flex min-w-0 items-center gap-1.5">
+                  <span className="min-w-0 text-ui-13 font-medium leading-[1.25] tracking-nav text-nav-fg">
+                    Seed
+                  </span>
+                  <InfoHint>
+                    Pins the sampling draw so the same prompt and settings can
+                    reproduce the same reply. Leave blank to draw a fresh seed
+                    each request. It only fixes the draw, so the other sampling
+                    settings have to stay put as well; at Temperature 0 decoding
+                    is already greedy and a seed changes nothing. Matching a
+                    reply also needs the model loaded with Parallel Slots at 1
+                    and Speculative Decoding off, since both change how tokens
+                    are batched and that moves the result.
+                  </InfoHint>
+                </div>
+                <input
+                  id="inference-seed"
+                  // A TEXT input: type="number" reports an unreadable entry as "", clearing the pin.
+                  type="text"
+                  inputMode="numeric"
+                  autoComplete="off"
+                  spellCheck={false}
+                  value={
+                    seedDraft ?? (params.seed == null ? "" : String(params.seed))
+                  }
+                  onChange={(e) =>
+                    setSeedDraft(e.target.value.replace(/\D/g, ""))
+                  }
+                  onBlur={() => {
+                    if (seedDraft === null) return;
+                    setSeedDraft(null);
+                    setSeed(committedSeed);
+                  }}
+                  onKeyDown={(e) => {
+                    // Blur is the only commit, so Enter has to reach it.
+                    if (e.key === "Enter") e.currentTarget.blur();
+                  }}
+                  placeholder="Random"
+                  aria-label="Seed"
+                  className="panel-field h-8 w-[calc(84px*var(--ui-space-scale,1))] shrink-0"
+                />
+              </div>
+            ) : null}
+            {!isExternalModel && currentCheckpoint ? (
+              <Suspense fallback={null}>
+                <SamplingFooter
+                  store={useChatRuntimeStore}
+                  notify={toast}
+                  Checkbox={Checkbox}
+                  defaults={DEFAULT_INFERENCE_PARAMS}
+                  qwenThinking={resolveQwenThinkingParams}
+                />
+              </Suspense>
+            ) : null}
           </div>
         </CollapsibleSection>
 
-        <CollapsibleSection icon={Wrench01Icon} label="Tools">
-          <div className="flex flex-col gap-3 py-1">
-            <AutoHealToolCallsToggle />
-            <MaxToolCallsSlider />
-            <ToolCallTimeoutSlider />
-          </div>
-        </CollapsibleSection>
+            {showStudioToolLoopControls ? (
+          <CollapsibleSection label="Tools">
+            <div className="flex flex-col gap-5">
+              {isExternalModel ? null : (
+                <>
+                  <AutoHealToolCallsToggle />
+                  <NudgeToolCallsToggle />
+                </>
+              )}
+              <DeduplicateToolCallsToggle />
+              {isExternalModel ? null : (
+                <>
+                  <ConfirmToolCallsToggle />
+                  <BypassPermissionsToggle />
+                </>
+              )}
+              <MaxToolCallsSlider />
+              <ToolCallTimeoutSlider />
+            </div>
+          </CollapsibleSection>
+            ) : null}
 
-        <ChatTemplateSection onReloadModel={onReloadModel} />
+            {isExternalModel ? null : (
+          <CollapsibleSection label="Retrieval">
+            <RetrievalSettingsSection />
+          </CollapsibleSection>
+            )}
+
+        {modelInfo && (
+          <CollapsibleSection label="Information">{modelInfo}</CollapsibleSection>
+        )}
+
+      </div>
       </div>
       </div>
       <Dialog
@@ -1179,10 +1770,7 @@ export function ChatSettingsPanel({
           setSystemPromptEditorOpen(nextOpen);
         }}
       >
-        <DialogContent
-          className="corner-squircle border border-border/60 bg-background/98 shadow-none sm:max-w-3xl"
-          overlayClassName="bg-background/35 supports-backdrop-filter:backdrop-blur-[1px]"
-        >
+        <DialogContent className="corner-squircle dialog-soft-surface sm:max-w-3xl">
           <DialogHeader>
             <DialogTitle>Edit System Prompt</DialogTitle>
             <DialogDescription>
@@ -1190,55 +1778,154 @@ export function ChatSettingsPanel({
               the preset.
             </DialogDescription>
           </DialogHeader>
-          <div className="space-y-2">
+          <div className="space-y-3">
             <div className="space-y-0.5 px-0.5">
-              <div className="text-[11px] font-medium">Prompt editor</div>
-              <p className="text-[11px] text-muted-foreground">
+              <div className="flex items-center justify-between gap-3">
+                <div className="text-ui-11 font-medium">Prompt editor</div>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => setSystemVariablesOpen((open) => !open)}
+                  className="h-7 gap-1.5 rounded-full px-2.5 text-ui-11 text-muted-foreground"
+                  aria-expanded={systemVariablesOpen}
+                >
+                  <HugeiconsIcon icon={BracesIcon} className="size-3.5" />
+                  Variables
+                  <HugeiconsIcon
+                    icon={ChevronDownStandardIcon}
+                    className={cn(
+                      "size-3.5 transition-transform",
+                      systemVariablesOpen && "rotate-180",
+                    )}
+                  />
+                </Button>
+              </div>
+              <p className="text-ui-11 text-muted-foreground">
                 Use this for longer edits. Save writes back to the active
-                configuration only.
+                configuration only. Insert variables with {"{{ env }}"}.
               </p>
             </div>
-            <Textarea
-              value={systemPromptDraft}
-              onChange={(event) => setSystemPromptDraft(event.target.value)}
-              placeholder="You are a helpful assistant..."
-              className="min-h-[24rem] max-h-[50vh] overflow-y-auto text-sm leading-6 corner-squircle"
-              rows={14}
-            />
+            {systemVariablesOpen ? (
+              <div className="space-y-2 px-0.5">
+                <div className="flex flex-wrap items-start justify-between gap-2">
+                  <div className="space-y-0.5">
+                    <div className="text-ui-11 font-medium">
+                      Prompt variables
+                    </div>
+                    <p className="text-ui-11 text-muted-foreground">
+                      Define values as JSON below, then use each key in your
+                      prompt, like {"{{ env }}"}.
+                    </p>
+                  </div>
+                  <div className="flex flex-col items-end gap-1">
+                    <span className="text-ui-10 text-muted-foreground">
+                      Built-in, fill in automatically
+                    </span>
+                    <div className="flex flex-wrap justify-end gap-1">
+                      {["{{$date}}", "{{$time}}", "{{$now}}"].map((token) => (
+                        <span
+                          key={token}
+                          title={`${token} is replaced automatically when you send`}
+                          className="rounded-full bg-muted px-2 py-0.5 font-mono text-ui-10 text-muted-foreground"
+                        >
+                          {token}
+                        </span>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+                <Textarea
+                  value={systemVariablesDraft}
+                  onChange={(event) =>
+                    setSystemVariablesDraft(event.target.value)
+                  }
+                  placeholder='{ "env": "staging", "version": "v2.3.1" }'
+                  fieldSizing="fixed"
+                  className={cn(
+                    "min-h-24 font-mono text-xs leading-5 corner-squircle focus-visible:ring-0",
+                    systemVariablesError &&
+                      "ring-1 ring-destructive focus-visible:ring-destructive",
+                  )}
+                  rows={5}
+                  aria-label="Prompt variables JSON"
+                  aria-invalid={Boolean(systemVariablesError)}
+                />
+                {systemVariablesError ? (
+                  <p className="px-1 text-ui-11 text-destructive">
+                    {systemVariablesError}
+                  </p>
+                ) : (
+                  <p className="px-1 text-ui-11 text-muted-foreground">
+                    Names you don&apos;t define are left unchanged, so a stray
+                    {" {{ typo }} "}stays visible in the prompt.
+                  </p>
+                )}
+              </div>
+            ) : null}
+            {/* Squircle on the wrapper: Chrome leaves a scroll area's own
+                corners square. */}
+            <div className="corner-squircle overflow-hidden rounded-xl border border-border transition-colors focus-within:border-ring dark:border-transparent dark:focus-within:border-transparent">
+              <Textarea
+                value={systemPromptDraft}
+                onChange={(event) => setSystemPromptDraft(event.target.value)}
+                placeholder="You are a helpful assistant..."
+                fieldSizing="fixed"
+                className="min-h-[min(calc(20rem*var(--ui-space-scale,1)),48dvh)] max-h-[48dvh] overflow-y-auto rounded-none border-0 text-sm leading-6 focus-visible:ring-0"
+                rows={14}
+              />
+            </div>
           </div>
           <DialogFooter className="flex-wrap gap-2 sm:justify-between">
             <Button
               type="button"
               variant="ghost"
-              onClick={() => {
-                setSystemPromptDraft(params.systemPrompt);
-                setSystemPromptEditorOpen(false);
-              }}
+              onClick={() => setSystemPromptDraft("")}
+              disabled={systemPromptDraft.length === 0}
+              className="text-muted-foreground"
             >
-              Cancel
+              Reset
             </Button>
-            <Button
-              type="button"
-              onClick={saveSystemPromptEditor}
-              disabled={!systemPromptEditorDirty}
-            >
-              Save
-            </Button>
+            <div className="flex flex-wrap gap-2">
+              <Button
+                type="button"
+                variant="ghost"
+                onClick={() => {
+                  setSystemPromptDraft(currentSystemPrompt);
+                  setSystemVariablesDraft(currentSystemVariables);
+                  setSystemPromptEditorOpen(false);
+                }}
+              >
+                Cancel
+              </Button>
+              <Button
+                type="button"
+                onClick={saveSystemPromptEditor}
+                disabled={
+                  !systemPromptEditorDirty || Boolean(systemVariablesError)
+                }
+              >
+                Save
+              </Button>
+            </div>
           </DialogFooter>
         </DialogContent>
       </Dialog>
     </>
   );
 
-  if (isMobile) {
+  if (isCompact) {
     return (
       <Sheet open={open} onOpenChange={onOpenChange}>
-        <SheetContent side="right" className="w-[18rem] p-0">
+        <SheetContent side="right" data-chat-settings-sheet="" className="w-[min(calc(18rem*var(--ui-space-scale,1)),100vw)] p-0 font-heading">
           <SheetHeader className="sr-only">
-            <SheetTitle>Configuration</SheetTitle>
+            <SheetTitle>Run settings</SheetTitle>
             <SheetDescription>Chat inference settings</SheetDescription>
           </SheetHeader>
-          <div className="flex h-full flex-col">{settingsContent}</div>
+          {/* The docked panel's slot, so the sheet gets its glass. */}
+          <div data-tour="chat-settings" data-slot="chat-settings-panel" className="relative flex h-full flex-col">
+            {settingsContent}
+          </div>
         </SheetContent>
       </Sheet>
     );
@@ -1246,9 +1933,55 @@ export function ChatSettingsPanel({
 
   return (
     <aside
-      className={`relative z-50 shrink-0 h-full overflow-hidden bg-muted/70 transition-[width] duration-200 ease-linear ${open ? "w-[17rem]" : "w-0"}`}
+      ref={asideRef}
+      data-tour="chat-settings"
+      data-slot="chat-settings-panel"
+      inert={!open}
+      className={cn(
+        "relative z-50 shrink-0 bg-panel-surface text-panel-surface-fg font-heading",
+        open ? "w-(--chat-settings-width)" : "w-0 overflow-hidden",
+      )}
+      style={
+        {
+          "--chat-settings-width": `${settingsWidth * settingsScale}px`,
+          height: `calc(100% - ${CHAT_SETTINGS_TOP})`,
+          marginTop: CHAT_SETTINGS_TOP,
+        } as CSSProperties
+      }
     >
-      <div className="h-full w-[17rem]">{settingsContent}</div>
+      {open ? (
+      <PanelResizeHandle
+        edge="left"
+        open={open}
+        width={settingsWidth}
+        stored={settingsStored}
+        min={CHAT_SETTINGS_WIDTH_MIN}
+        max={settingsMax}
+        scale={settingsScale}
+        clamp={clampChatSettingsWidth}
+        setWidth={setSettingsWidth}
+        resetWidth={resetSettingsWidth}
+        onToggle={() => onOpenChange?.(!open)}
+        target={() => asideRef.current}
+        cssVar="--chat-settings-width"
+        measure={() => (asideRef.current?.getBoundingClientRect().width ?? 0) / settingsScale}
+        label={t("shell.aria.resizeRunSettings")}
+        toggleLabel={t("shell.aria.openRunSettings")}
+        collapseHint={t("shell.resize.collapse")}
+        expandHint={t("shell.resize.expand")}
+        dragHint={t("shell.resize.drag")}
+        dataSlot="chat-settings-resize-handle"
+      />
+      ) : null}
+      <div
+        data-chat-settings-content=""
+        className={cn(
+          "h-full w-full overflow-hidden",
+          open && "border-l border-panel-edge",
+        )}
+      >
+        {settingsContent}
+      </div>
     </aside>
   );
 }
@@ -1259,20 +1992,20 @@ function MaxToolCallsSlider() {
     (s) => s.setMaxToolCallsPerMessage,
   );
 
-  // Slider range 0-41; 41 maps to 9999 ("Max")
-  const sliderValue = maxToolCalls >= 9999 ? 41 : Math.min(maxToolCalls, 40);
+  // Slider range 0-51; 51 maps to UNLIMITED_TOOL_CALLS ("Max")
+  const sliderValue =
+    maxToolCalls >= UNLIMITED_TOOL_CALLS ? 51 : Math.min(maxToolCalls, 50);
 
   return (
     <ParamSlider
       label="Max Tool Calls Per Message"
       value={sliderValue}
       min={0}
-      max={41}
+      max={51}
       step={1}
-      onChange={(v) => setMaxToolCalls(v >= 41 ? 9999 : v)}
-      displayValue={
-        sliderValue >= 41 ? "Max" : sliderValue === 0 ? "Off" : undefined
-      }
+      onChange={(v) => setMaxToolCalls(v >= 51 ? UNLIMITED_TOOL_CALLS : v)}
+      format={(v) => (v >= 51 ? "Max" : v === 0 ? "Off" : undefined)}
+      info="Cap on tool/function calls the model may invoke within a single response. 0 disables tool use; Max removes the cap. Turning on MCP sets it to Max."
     />
   );
 }
@@ -1284,13 +2017,6 @@ function ToolCallTimeoutSlider() {
   // Slider 1-31; 31 maps to 9999 ("Max")
   const sliderValue = timeout >= 9999 ? 31 : Math.min(Math.max(timeout, 1), 30);
 
-  const displayValue =
-    sliderValue >= 31
-      ? "Max"
-      : sliderValue === 1
-        ? "1 minute"
-        : `${sliderValue} minutes`;
-
   return (
     <ParamSlider
       label="Max Tool Call Duration"
@@ -1299,7 +2025,11 @@ function ToolCallTimeoutSlider() {
       max={31}
       step={1}
       onChange={(v) => setTimeout_(v >= 31 ? 9999 : v)}
-      displayValue={displayValue}
+      format={(v) =>
+        v >= 31 ? "Max" : v === 1 ? "1 minute" : `${v} minutes`
+      }
+      valueSize={10}
+      info="Per-call wall-clock limit. Long-running tool executions are terminated when this elapses; the model continues with what completed."
     />
   );
 }
@@ -1311,14 +2041,18 @@ function AutoHealToolCallsToggle() {
   );
 
   return (
-    <div className="flex items-center justify-between gap-3">
-      <div className="min-w-0">
-        <div className="text-xs font-medium">Auto Heal Tool Calls 🦥</div>
-        <div className="text-[11px] text-muted-foreground">
-          Fix malformed tool calls from the model automatically.
-        </div>
+    <div className="flex min-h-8 items-center justify-between gap-3">
+      <div className="flex min-w-0 items-center gap-1.5">
+        <span className="min-w-0 text-ui-13 font-medium leading-[1.25] tracking-nav text-nav-fg">
+          Auto-Healing Tool Calls
+        </span>
+        <InfoHint>
+          Unsloth auto-fixes broken tool calls so inference output is never
+          broken.
+        </InfoHint>
       </div>
       <Switch
+        className="shrink-0"
         checked={autoHealToolCalls}
         onCheckedChange={setAutoHealToolCalls}
       />
@@ -1326,53 +2060,132 @@ function AutoHealToolCallsToggle() {
   );
 }
 
-function ChatTemplateSection({
-  onReloadModel,
-}: {
-  onReloadModel?: () => void;
-}) {
-  const defaultTemplate = useChatRuntimeStore((s) => s.defaultChatTemplate);
-  const override = useChatRuntimeStore((s) => s.chatTemplateOverride);
-  const setOverride = useChatRuntimeStore((s) => s.setChatTemplateOverride);
-
-  if (!defaultTemplate) return null;
-
-  const displayValue = override ?? defaultTemplate;
-  const isModified = override !== null;
+function NudgeToolCallsToggle() {
+  const nudgeToolCalls = useChatRuntimeStore((s) => s.nudgeToolCalls);
+  const setNudgeToolCalls = useChatRuntimeStore((s) => s.setNudgeToolCalls);
 
   return (
-    <CollapsibleSection icon={CodeIcon} label="Chat Template">
-      <div className="flex flex-col gap-2 py-1">
-        <Textarea
-          value={displayValue}
-          onChange={(e) => setOverride(e.target.value)}
-          className="min-h-32 max-h-64 overflow-y-auto font-mono text-[10px] leading-relaxed md:text-[10px] corner-squircle"
-          rows={6}
-          spellCheck={false}
-        />
-        <div className="flex flex-wrap gap-1.5">
-          {isModified && (
-            <>
-              <button
-                type="button"
-                onClick={() => {
-                  onReloadModel?.();
-                }}
-                className="rounded-md bg-primary px-2.5 py-1 text-[11px] font-medium text-primary-foreground transition-colors hover:bg-primary/90"
-              >
-                Apply & Reload
-              </button>
-              <button
-                type="button"
-                onClick={() => setOverride(null)}
-                className="rounded-md border px-2.5 py-1 text-[11px] font-medium text-muted-foreground transition-colors hover:bg-accent"
-              >
-                Revert changes
-              </button>
-            </>
-          )}
-        </div>
+    <div className="flex min-h-8 items-center justify-between gap-3">
+      <div className="flex min-w-0 items-center gap-1.5">
+        <span className="min-w-0 text-ui-13 font-medium leading-[1.25] tracking-nav text-nav-fg">
+          Nudge Tool Calls
+        </span>
+        <InfoHint>
+          When a tool call cannot be repaired, re-ask the model once so the
+          intended tool still runs. API requests stay opt-in.
+        </InfoHint>
       </div>
-    </CollapsibleSection>
+      <Switch
+        className="shrink-0"
+        checked={nudgeToolCalls}
+        onCheckedChange={setNudgeToolCalls}
+      />
+    </div>
+  );
+}
+
+function DeduplicateToolCallsToggle() {
+  const deduplicateToolCalls = useChatRuntimeStore(
+    (s) => s.deduplicateToolCalls,
+  );
+  const setDeduplicateToolCalls = useChatRuntimeStore(
+    (s) => s.setDeduplicateToolCalls,
+  );
+
+  return (
+    <div className="flex min-h-8 items-center justify-between gap-3">
+      <div className="flex min-w-0 items-center gap-1.5">
+        <span className="min-w-0 text-ui-13 font-medium leading-[1.25] tracking-nav text-nav-fg">
+          Deduplicate Tool Calls
+        </span>
+        <InfoHint>
+          Skips a tool call identical to one that already succeeded in this
+          response and tells the model it was a duplicate. Turn off to let a
+          repeated call run again.
+        </InfoHint>
+      </div>
+      <Switch
+        className="shrink-0"
+        checked={deduplicateToolCalls}
+        onCheckedChange={setDeduplicateToolCalls}
+      />
+    </div>
+  );
+}
+
+function ConfirmToolCallsToggle() {
+  const setConfirmToolCalls = useChatRuntimeStore((s) => s.setConfirmToolCalls);
+  const setPermissionMode = useChatRuntimeStore((s) => s.setPermissionMode);
+  const permissionMode = useChatRuntimeStore((s) => s.permissionMode);
+
+  return (
+    <div
+      className={cn(
+        "flex min-h-8 justify-between gap-3",
+        permissionMode === "full" ? "items-start" : "items-center",
+      )}
+    >
+      <div className="flex min-w-0 flex-col gap-0.5">
+        <div className="flex min-w-0 items-center gap-1.5">
+          <span className="min-w-0 text-ui-13 font-medium leading-[1.25] tracking-nav text-nav-fg">
+            Confirm tool calls
+          </span>
+          <InfoHint>
+            When on, every local Unsloth tool call pauses for your approval
+            before it runs (the "Ask for approval" level). When off, tool calls
+            run without prompts inside the sandbox (the "Run automatically"
+            level); on a computer without a working OS sandbox, risky Python
+            and Terminal calls still ask.
+            Provider-hosted tools are not gated here.
+          </InfoHint>
+        </div>
+        {permissionMode === "full" ? (
+          <span className="text-ui-11 text-muted-foreground">
+            Overridden by Full access
+          </span>
+        ) : null}
+      </div>
+      <Switch
+        // Cap top of the 13px title at leading 1.25 (Inter: 0.26em).
+        className={cn(
+          "shrink-0",
+          permissionMode === "full" && "mt-[calc(var(--text-ui-13)*0.26)]",
+        )}
+        checked={permissionMode === "ask"}
+        onCheckedChange={(checked) => {
+          if (checked) {
+            setConfirmToolCalls(true);
+          } else {
+            // Same as picking "Run automatically".
+            setPermissionMode("off");
+          }
+        }}
+        disabled={permissionMode === "full"}
+      />
+    </div>
+  );
+}
+
+function BypassPermissionsToggle() {
+  const permissionMode = useChatRuntimeStore((s) => s.permissionMode);
+
+  return (
+    <div className="flex flex-col gap-2">
+      <div className="flex min-w-0 items-center gap-1.5">
+        <span className="whitespace-nowrap text-ui-13 font-medium leading-[1.25] tracking-nav text-nav-fg">
+          Tool permissions
+        </span>
+        <InfoHint>
+          Choose how Unsloth approves tool calls before they run. Full access
+          disables confirmations and the code sandbox.
+        </InfoHint>
+      </div>
+      <PermissionModeDropdown triggerClassName="h-9 w-full justify-between rounded-full border-0 bg-[var(--panel-input-surface)] px-3.5 text-ui-13 font-medium text-nav-fg shadow-none hover:bg-[var(--panel-input-surface)]" />
+      {permissionMode === "full" ? (
+        <span className="text-ui-11 text-muted-foreground">
+          Tool calls run with no confirmation and no sandbox.
+        </span>
+      ) : null}
+    </div>
   );
 }

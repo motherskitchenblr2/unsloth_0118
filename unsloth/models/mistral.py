@@ -1,36 +1,58 @@
 # Copyright 2023-present Daniel Han-Chen & the Unsloth team. All rights reserved.
-#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
-#
 #     http://www.apache.org/licenses/LICENSE-2.0
-#
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from .loader_utils import DEFAULT_DEVICE_MAP
+from ._cache_kwarg import pop_cache_kwarg
 from .llama import *
 import os
-from ._utils import __version__
+from ._utils import __version__, config_return_dict
 from unsloth_zoo.utils import _get_dtype
 from unsloth_zoo.hf_utils import dtype_from_config
 from ..utils.packing import (
     get_packed_info_from_kwargs,
+    mask_packed_boundary_labels,
     mask_packed_sequence_boundaries,
 )
+from ..context_parallel import get_cp_manager
 from ..utils.attention_dispatch import (
     AttentionConfig,
     AttentionContext,
+    context_parallel_attention,
     run_attention,
     SDPA,
     select_attention_backend,
+    resolve_prefix_seg_info,
+    applies_prefix_seg_info,
 )
 from .llama import (
     LlamaRotaryEmbedding,
     LlamaLinearScalingRotaryEmbedding,
+    original_apply_qkv,
+    original_apply_o,
+    apply_logit_transforms,
+    resolve_logit_scaling,
+    resolve_logit_transforms,
+    fake_quantize_lm_head_inputs,
+    lm_head_needs_forward,
+    output_head_not_fusable,
+    _cache_as_legacy_tuple,
+    _cached_prefill_defaults,
+    _run_backbone,
+    _scoring_output_hidden_states,
+    logits_to_keep_tensor,
+    slice_hidden_to_keep,
+    unsloth_fsdp_unshard,
+    _decode_graphs,
+    _decode_logits,
+    _decode_step_mask,
 )
 from transformers.models.mistral.modeling_mistral import (
     MistralAttention,
@@ -48,9 +70,11 @@ try:
 except:
     MistralSdpaAttention = MistralAttention
     MistralFlashAttention2 = MistralAttention
-from unsloth_zoo.utils import Version, _get_dtype
+from unsloth_zoo.utils import Version
 
 
+@applies_prefix_seg_info
+@context_parallel_attention
 def MistralAttention_fast_forward(
     self,
     hidden_states: torch.Tensor,
@@ -65,7 +89,6 @@ def MistralAttention_fast_forward(
     *args,
     **kwargs,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
-    # Clear inference
     if hasattr(self, "paged_attention"):
         del self.paged_attention_K
         del self.paged_attention_V
@@ -77,13 +100,13 @@ def MistralAttention_fast_forward(
 
     bsz, q_len, _ = hidden_states.size()
 
-    n_heads = self.config.num_attention_heads
+    n_heads = self.__dict__.get("_unsloth_tp_heads", self.config.num_attention_heads)
     n_groups = self.num_key_value_groups
-    n_kv_heads = self.config.num_key_value_heads
+    n_kv_heads = self.__dict__.get("_unsloth_tp_kv_heads", self.config.num_key_value_heads)
     head_dim = self.head_dim
     assert n_kv_heads * n_groups == n_heads
 
-    Q, K, V = self.apply_qkv(self, hidden_states)
+    Q, K, V = getattr(self, "apply_qkv", original_apply_qkv)(self, hidden_states)
     Q = Q.view(bsz, q_len, n_heads, head_dim).transpose(1, 2)
     K = K.view(bsz, q_len, n_kv_heads, head_dim).transpose(1, 2)
     V = V.view(bsz, q_len, n_kv_heads, head_dim).transpose(1, 2)
@@ -93,32 +116,37 @@ def MistralAttention_fast_forward(
     if past_key_value is not None:
         kv_seq_len += past_key_value[0].shape[-2]
 
-    # Extend RoPE dynamically to fit in VRAM
-    self.rotary_emb.extend_rope_embedding(V, seq_len = kv_seq_len)
-    cos, sin = self.rotary_emb.get_cached(kv_seq_len, Q.device.index)
+    # Under context parallel this rank holds a shard of the sequence but its positions are global.
+    cp_manager = get_cp_manager()
+    rope_seq_len = kv_seq_len * cp_manager.size if cp_manager is not None else kv_seq_len
 
-    rope_position_ids = (
-        position_ids if position_ids is not None else kwargs.get("position_ids")
-    )
+    # Extend RoPE dynamically to fit in VRAM; useful for LongRoPE.
+    self.rotary_emb.extend_rope_embedding(V, seq_len = rope_seq_len)
+    cos, sin = self.rotary_emb.get_cached(rope_seq_len, Q.device.index)
+
+    rope_position_ids = position_ids if position_ids is not None else kwargs.get("position_ids")
     # Useful for LongRoPE
     Q, K = fast_rope_embedding(Q, K, cos, sin, rope_position_ids)
 
     if past_key_value is not None:
         K = torch.cat([past_key_value[0], K], dim = 2)
         V = torch.cat([past_key_value[1], V], dim = 2)
+    # Incoming cache; past_key_value is reassigned below (eval keeps use_cache on).
+    had_cache = past_key_value is not None
     past_key_value = (K, V) if use_cache else None
 
-    # Attention module
     sw_cfg = getattr(self.config, "sliding_window", None)
-    sw = kv_seq_len if (sw_cfg is None or sw_cfg == "null") else sw_cfg
-    window_size = (-1, -1) if (kv_seq_len <= sw) else (sw, sw)
+    # A non-positive window means no local attention: 0 would give an all-false SDPA mask.
+    if sw_cfg is None or sw_cfg == "null" or (isinstance(sw_cfg, int) and sw_cfg <= 0):
+        sw = kv_seq_len
+    else:
+        sw = sw_cfg
+    # transformers' window: k > q - sliding_window, so flash's left window is sliding_window - 1.
+    window_size = (-1, -1) if (kv_seq_len <= sw) else (sw - 1, sw - 1)
 
-    use_varlen = (
-        seq_info is not None and past_key_value is None and window_size == (-1, -1)
-    )
-    backend = (
-        SDPA if attention_mask is not None else select_attention_backend(use_varlen)
-    )
+    # Packed rows always take varlen: dense flash would let a document attend into the one before it.
+    use_varlen = seq_info is not None and not had_cache
+    backend = SDPA if attention_mask is not None else select_attention_backend(use_varlen)
     attention_config = AttentionConfig(
         backend = backend,
         n_kv_heads = n_kv_heads,
@@ -128,8 +156,11 @@ def MistralAttention_fast_forward(
             "dropout_p": 0.0,
             "causal": True,
             "softmax_scale": getattr(self, "softmax_scale", None),
+            "window_size": window_size,
         },
     )
+    # PrefixGrouper seg table rides in **kwargs; misuse (KV cache or padding mask) raises; None is default
+    _pg_seg = resolve_prefix_seg_info(kwargs, past_key_value, attention_mask)
     context = AttentionContext(
         bsz = bsz,
         q_len = q_len,
@@ -138,13 +169,18 @@ def MistralAttention_fast_forward(
         head_dim = head_dim,
         requires_grad = hidden_states.requires_grad,
         seq_info = seq_info,
+        training = self.training,
         attention_mask = attention_mask,
         causal_mask = causal_mask,
+        # SDPA needs the window too: training builds no 4D mask, so without it every sequence past
+        # sliding_window attended its whole causal history.
+        sliding_window = None if window_size == (-1, -1) else sw,
+        prefix_seg_info = _pg_seg,
     )
 
     A = run_attention(config = attention_config, context = context, Q = Q, K = K, V = V)
     attn_output = A.reshape(bsz, q_len, n_heads * head_dim)
-    attn_output = self.apply_o(self, attn_output)
+    attn_output = getattr(self, "apply_o", original_apply_o)(self, attn_output)
     attn_weights = None
     return attn_output, attn_weights, past_key_value
 
@@ -167,17 +203,50 @@ def MistralForCausalLM_fast_forward(
     *args,
     **kwargs,
 ) -> Union[Tuple, CausalLMOutputWithPast]:
-    if causal_mask is None and past_key_values is None:
+    shift_labels = kwargs.pop("shift_labels", None)
+    # transformers 5.24 callers pass the cache as `cache`, which would otherwise ride along in kwargs.
+    if "cache" in kwargs:
+        past_key_values = pop_cache_kwarg(kwargs, past_key_values)
+    # Training may resume without for_training() (trainer callback sampling): free kept graphs here.
+    if _decode_graphs.HELD in self.__dict__ and self.training and torch.is_grad_enabled():
+        _decode_graphs.release_if_training(self)
+    past_key_values = _cache_as_legacy_tuple(past_key_values)
+    if past_key_values is not None and len(past_key_values) == 0:
+        past_key_values = None
+    if (
+        past_key_values is not None
+        and input_ids is not None
+        and input_ids.shape[1] == 1
+        and labels is None
+        and shift_labels is None
+        # A tensor row selector is applied by the eager path below; the graph returns every row.
+        and not isinstance(logits_to_keep, torch.Tensor)
+        and not isinstance(num_logits_to_keep, torch.Tensor)
+        and _decode_graphs.enabled()
+    ):
+        # The Llama decode step (window-sliced eager attention core), replayed as in CausalLM_fast_forward.
+        graphed = _decode_graphs.decode_step(
+            self, LlamaModel_fast_forward_inference, _decode_logits, _decode_step_mask, input_ids,
+            past_key_values, position_ids, attention_mask,
+        )  # fmt: skip
+        if graphed is not None:
+            if not (return_dict if return_dict is not None else config_return_dict(self.config)):
+                return (graphed[0], graphed[1], [], [])
+            return CausalLMOutputWithPast(
+                loss = None, logits = graphed[0], past_key_values = graphed[1],
+                hidden_states = [], attentions = [],
+            )  # fmt: skip
+    # PrefixGrouper brings its own mask; a synthesized one would force a fallback.
+    if (
+        causal_mask is None
+        and past_key_values is None
+        and kwargs.get("prefix_seg_info", None) is None
+    ):
         bsz, q_len = input_ids.shape
         sliding_window = getattr(self.config, "sliding_window", None)
 
         if HAS_XFORMERS:
-            # Always create causal mask for xformers
-            if (
-                sliding_window is None
-                or sliding_window == "null"
-                or sliding_window <= 0
-            ):
+            if sliding_window is None or sliding_window == "null" or sliding_window <= 0:
                 causal_mask = xformers.attn_bias.LowerTriangularMask()
             elif q_len <= sliding_window:
                 causal_mask = xformers.attn_bias.LowerTriangularMask()
@@ -186,33 +255,26 @@ def MistralForCausalLM_fast_forward(
                     [q_len] * bsz
                 ).make_local_attention(window_size = sliding_window)
 
-            # If attention_mask exists, it will be handled in the attention forward
+            # If attention_mask exists, it is handled in the attention forward.
 
-        elif self.training:
-            # During training, LlamaModel_fast_forward's DPO embed-masking
-            # block requires a 2D attention_mask (it does
-            # inputs_embeds *= attention_mask.unsqueeze(0).transpose(0, 1).transpose(1, 2)).
-            # Afterwards, LlamaModel_fast_forward sets attention_mask=None
-            # before the attention layers anyway, so leaving the 2D mask
-            # untouched here is safe and avoids converting to 4D (which would
-            # crash the DPO block).
+        elif self.training or kwargs.get("packed_seq_lengths", None) is not None:
+            # LlamaModel_fast_forward's DPO embed-masking block needs the 2D attention_mask; it nulls the mask
+            # before attention anyway, so leaving it 2D avoids a 4D conversion that crashes DPO.
+            # Packed rows need no mask: a row-wide causal mask would let documents attend across.
             pass
 
         else:
-            # Not using xformers - need to create attention masks
             if (
                 sliding_window is None
                 or sliding_window == "null"
                 or sliding_window <= 0
                 or q_len <= sliding_window
             ):
-                # Fully causal mask
                 causal_mask_values = torch.triu(
                     torch.full((q_len, q_len), -torch.inf, device = input_ids.device),
                     diagonal = 1,
                 )
             else:
-                # Sliding window attention
                 q_indices = torch.arange(q_len, device = input_ids.device).view(-1, 1)
                 k_indices = torch.arange(q_len, device = input_ids.device).view(1, -1)
 
@@ -225,12 +287,9 @@ def MistralForCausalLM_fast_forward(
 
             # Combine with existing attention_mask if present
             if attention_mask is None:
-                attention_mask = causal_mask_values[None, None, :, :].expand(
-                    bsz, 1, q_len, q_len
-                )
+                attention_mask = causal_mask_values[None, None, :, :].expand(bsz, 1, q_len, q_len)
             else:
                 if attention_mask.dim() == 2:
-                    # Convert 0/1 padding mask to additive format: 1->0 (keep), 0->-inf (mask)
                     padding_mask = torch.where(
                         attention_mask[:, None, None, :].bool(),
                         0.0,
@@ -238,32 +297,28 @@ def MistralForCausalLM_fast_forward(
                     )
                     attention_mask = causal_mask_values[None, None, :, :] + padding_mask
                 else:
-                    attention_mask = (
-                        attention_mask + causal_mask_values[None, None, :, :]
-                    )
+                    attention_mask = attention_mask + causal_mask_values[None, None, :, :]
 
-            attention_mask = attention_mask.to(
-                dtype = _get_dtype(dtype_from_config(self.config))
-            )
+            attention_mask = attention_mask.to(dtype = _get_dtype(dtype_from_config(self.config)))
 
     output_attentions = (
-        output_attentions
-        if output_attentions is not None
-        else self.config.output_attentions
+        output_attentions if output_attentions is not None else self.config.output_attentions
     )
     output_hidden_states = (
         output_hidden_states
         if output_hidden_states is not None
-        else self.config.output_hidden_states
+        else _scoring_output_hidden_states(self.config)
     )
-    return_dict = (
-        return_dict if return_dict is not None else self.config.use_return_dict
-    )
+    return_dict = return_dict if return_dict is not None else config_return_dict(self.config)
 
-    # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
-    self.model._has_no_labels = labels is None
+    self.model._has_no_labels = labels is None and shift_labels is None
 
-    if past_key_values is not None:
+    if past_key_values is not None and not (input_ids is not None and input_ids.shape[1] == 1):
+        position_ids, attention_mask = _cached_prefill_defaults(
+            past_key_values, input_ids, inputs_embeds, position_ids, attention_mask
+        )
+
+    if past_key_values is not None and input_ids is not None and input_ids.shape[1] == 1:
         outputs = LlamaModel_fast_forward_inference(
             self,
             input_ids,
@@ -272,7 +327,8 @@ def MistralForCausalLM_fast_forward(
             attention_mask = attention_mask,
         )
     else:
-        outputs = self.model(
+        outputs = _run_backbone(
+            self,
             input_ids = input_ids,
             causal_mask = causal_mask,
             attention_mask = attention_mask,
@@ -289,69 +345,112 @@ def MistralForCausalLM_fast_forward(
     hidden_states = outputs[0]
 
     bsz, q_len, hd = hidden_states.shape
+    unsloth_fsdp_unshard(self.lm_head)
     lm_head = self.lm_head.weight
     lm_head_device = lm_head.device
 
-    # Move items to same device as lm_head
     hidden_states = hidden_states.to(lm_head_device)
     if labels is not None:
         labels = labels.to(lm_head_device)
+    if shift_labels is not None:
+        shift_labels = shift_labels.to(lm_head_device)
 
-    # If we are in GRPO mode, return raw hidden states
+    keep = logits_to_keep_tensor(num_logits_to_keep, logits_to_keep)
+    if keep is not None and (labels is not None or shift_labels is not None):
+        keep = None
+    # Merge spellings first so the decode last-token slice hits the normal path; no int max() on tensors.
+    # Labels span the whole sequence, so a suffix slice would misalign the loss.
+    if (
+        isinstance(num_logits_to_keep, torch.Tensor)
+        or isinstance(logits_to_keep, torch.Tensor)
+        or labels is not None
+        or shift_labels is not None
+    ):
+        num_logits_to_keep = 0
+    else:
+        num_logits_to_keep = max(num_logits_to_keep or 0, logits_to_keep or 0)
+
+    # In GRPO mode, return raw hidden states.
     if os.environ.get("UNSLOTH_RETURN_HIDDEN_STATES", "0") == "1":
-        num_logits_to_keep = max(num_logits_to_keep, logits_to_keep)
-        if num_logits_to_keep != 0:
+        if keep is not None:
+            hidden_states = slice_hidden_to_keep(hidden_states, keep)
+        elif num_logits_to_keep != 0:
             hidden_states = hidden_states[:, -num_logits_to_keep:, :]
         return CausalLMOutputWithPast(
             loss = None,
             logits = hidden_states,
-            past_key_values = outputs.past_key_values,
-            hidden_states = outputs.hidden_states,
-            attentions = outputs.attentions,
+            # return_dict = False hands back a tuple: the logits slot is all this branch promises.
+            past_key_values = getattr(outputs, "past_key_values", None),
+            hidden_states = getattr(outputs, "hidden_states", None),
+            attentions = getattr(outputs, "attentions", None),
         )
 
-    if bsz == 1 and q_len == 1:
+    if keep is not None:
+        logits = self.lm_head(slice_hidden_to_keep(hidden_states, keep).to(lm_head.dtype))
+    elif (
+        bsz == 1
+        and q_len == 1
+        and type(self.lm_head) is torch.nn.Linear
+        and self.lm_head.bias is None
+    ):
         logits = torch.mv(lm_head, hidden_states.ravel().to(lm_head.dtype))
         logits = logits.unsqueeze(0).unsqueeze(0)
     elif num_logits_to_keep != 0:
-        logits = self.lm_head(
-            hidden_states[:, -num_logits_to_keep:, :].to(lm_head.dtype)
-        )
+        logits = self.lm_head(hidden_states[:, -num_logits_to_keep:, :].to(lm_head.dtype))
     else:
-        RETURN_LOGITS = os.environ.get("UNSLOTH_RETURN_LOGITS", "0") == "1"
-        # < 1024 Normal Unsloth uses less VRAM!
+        RETURN_LOGITS = os.environ.get("UNSLOTH_RETURN_LOGITS", "0") == "1" or (
+            lm_head_needs_forward(self.lm_head)
+        )
+        # Below 1024 normal Unsloth uses less VRAM.
         if bsz * q_len <= 1024 and not RETURN_LOGITS:
-            # Use unsloth_fused_ce_loss which actually calculates the best chunk size to reduce VRAM usage
+            # unsloth_fused_ce_loss calculates the best chunk size to reduce VRAM usage.
             RETURN_LOGITS = False
 
-        if not RETURN_LOGITS and labels is not None:
+        # A head bias or a live adapter on the head (the fused CE reads lm_head.weight alone) takes the
+        # logits branch. Checked only with labels, so inference never pays for it.
+        if (
+            not RETURN_LOGITS
+            and (labels is not None or shift_labels is not None)
+            and not output_head_not_fusable(self.lm_head)
+        ):
             n_items = kwargs.get("num_items_in_batch", None)
             if n_items is None:
                 n_items = kwargs.get("n_items", None)
-            logit_softcapping = getattr(self.config, "final_logit_softcapping", 0)
+            # Same source as llama.py's fused branch.
+            logit_softcapping, logit_scale_multiply, logit_scale_divide = resolve_logit_transforms(
+                self.config
+            )
 
-            # loss = fused_linear_cross_entropy(
-            #     hidden_states = hidden_states,
-            #     lm_weight = lm_head,
-            #     labels = labels,
-            #     num_items_in_batch = n_items,
-            #     logit_softcapping = logit_softcapping,
-            # )
+            # This branch returns early, so mask_packed_sequence_boundaries() below is never reached
+            if shift_labels is None:
+                labels = mask_packed_boundary_labels(
+                    labels,
+                    kwargs.get("packed_seq_lengths"),
+                )
+
+            hidden_states, lm_head = fake_quantize_lm_head_inputs(
+                self.lm_head, hidden_states, lm_head
+            )
+
             loss = unsloth_fused_ce_loss(
                 trainer = None,
                 hidden_states = hidden_states,
                 lm_head_weight = lm_head,
                 lm_head_bias = None,
-                labels = labels,
+                labels = labels if shift_labels is None else shift_labels,
+                shift_labels = shift_labels is None,
                 mask = None,
                 n_items = n_items,
                 scaling = getattr(self, "accelerator_scaler", None),
                 target_gb = None,
                 torch_compile = True,
                 logit_softcapping = logit_softcapping,
+                logit_scale_multiply = logit_scale_multiply,
+                logit_scale_divide = logit_scale_divide,
             )
             if not return_dict:
-                output = (logits,) + outputs[1:]
+                # Fused CE never materializes logits; use EMPTY_LOGITS like the return_dict branch below (#2068).
+                output = (EMPTY_LOGITS,) + outputs[1:]
                 return (loss,) + output if loss is not None else output
 
             output = CausalLMOutputWithPast(
@@ -367,28 +466,31 @@ def MistralForCausalLM_fast_forward(
     logits = logits.to(_get_dtype(dtype_from_config(self.config)))
 
     loss = None
-    if labels is not None:
+    # Same answer the fused branch above reads, so the two branches cannot drift apart.
+    logit_softcapping, logit_scaling = resolve_logit_scaling(self.config)
+
+    if labels is not None or shift_labels is not None:
         shift_logits = logits
-        # if not hasattr(self, "extra_ignored_labels"):
-        #     # Fixes https://github.com/unslothai/unsloth/issues/10
-        #     self.extra_ignored_labels = torch.full((self.max_seq_length, 1), -100, device = "cuda:0")
-        # pass
-        # shift_labels = torch.hstack((labels[..., 1:], self.extra_ignored_labels[:labels.shape[0]]))
-        shift_labels = torch.empty_like(labels)
-        shift_labels[..., :-1] = labels[..., 1:]
-        shift_labels[..., -1] = -100
-        mask_packed_sequence_boundaries(
-            shift_labels,
-            kwargs.get("packed_seq_lengths"),
-        )
+        if shift_labels is None:
+            shift_labels = torch.empty_like(labels)
+            shift_labels[..., :-1] = labels[..., 1:]
+            shift_labels[..., -1] = -100
+            mask_packed_sequence_boundaries(
+                shift_labels,
+                kwargs.get("packed_seq_lengths"),
+            )
         n_items = kwargs.get("num_items_in_batch", None)
         if n_items is None:
             n_items = kwargs.get("n_items", None)
         loss = fast_cross_entropy_loss(
             logits = shift_logits,
             labels = shift_labels,
+            logit_softcapping = logit_softcapping,
+            logit_scaling = logit_scaling,
             n_items = n_items,
         )
+    # After the loss: the kernel reads the raw logits, and this is in place without grad.
+    logits = apply_logit_transforms(logits, logit_softcapping, logit_scaling)
 
     if not return_dict:
         output = (logits,) + outputs[1:]
@@ -401,6 +503,13 @@ def MistralForCausalLM_fast_forward(
         hidden_states = outputs.hidden_states,
         attentions = outputs.attentions,
     )
+
+
+# Honours UNSLOTH_RETURN_HIDDEN_STATES itself, so GRPO's hidden-state fallback wrapper must not wrap it. The marker
+# is the function itself, so a replacement that copied it with functools.wraps does not inherit the capability.
+MistralForCausalLM_fast_forward.__UNSLOTH_SUPPORTS_RETURN_HIDDEN_STATES__ = (
+    MistralForCausalLM_fast_forward
+)
 
 
 # Transformers had to update for Mistral Nemo 12b since Attention is (5120, 4096) now.
@@ -429,10 +538,8 @@ class FastMistralModel(FastLlamaModel):
             scaled_rope_module = LlamaLinearScalingRotaryEmbedding,
             attention_module = MistralAttention,
         )
-        # Just for Mistral Nemo models!
         if function is not None and init_name is not None:
             function = patch_mistral_nemo_attention(function)
-            # if True:#init_name is not None:
             exec(function, globals())
             MistralAttention.__init__ = eval(init_name)
         MistralAttention.forward = MistralAttention_fast_forward
@@ -444,16 +551,10 @@ class FastMistralModel(FastLlamaModel):
         PeftModelForCausalLM.forward = PeftModel_fast_forward
         fix_prepare_inputs_for_generation(MistralForCausalLM)
 
-        # Solves https://github.com/unslothai/unsloth/issues/168
-        # Static KV Cache was introduced in 4.38.0, causing training to be much slower.
-        # Inference can now be CUDAGraphed, but we shall retain the old rotary embeddings.
-        # https://github.com/huggingface/transformers/pull/27931
-        # https://github.com/huggingface/transformers/blob/v4.37.2/src/transformers/models/llama/modeling_llama.py
+        # Static KV cache (4.38.0) slowed training (#168), so the old rotary embeddings are retained.
         import transformers.models.mistral.modeling_mistral
 
-        transformers.models.mistral.modeling_mistral.MistralRotaryEmbedding = (
-            LlamaRotaryEmbedding
-        )
+        transformers.models.mistral.modeling_mistral.MistralRotaryEmbedding = LlamaRotaryEmbedding
         return
 
     @staticmethod
@@ -463,7 +564,7 @@ class FastMistralModel(FastLlamaModel):
         dtype = None,
         load_in_4bit = True,
         token = None,
-        device_map = "sequential",
+        device_map = DEFAULT_DEVICE_MAP,
         rope_scaling = None,  # Mistral does not support RoPE scaling
         fix_tokenizer = True,
         model_patcher = None,

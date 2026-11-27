@@ -1,8 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
+import { ChevronRightStandardIcon } from "@/lib/chevron-icons";
 import { useEffect, useMemo, useState, type ReactElement } from "react";
-import { ArrowRight01Icon, CheckmarkCircle02Icon, Copy01Icon, Key01Icon } from "@hugeicons/core-free-icons";
+import {
+  CheckmarkCircle02Icon,
+  Key01Icon,
+} from "@hugeicons/core-free-icons";
+import { Copy01Icon } from "@/lib/copy-icon";
 import { HugeiconsIcon } from "@hugeicons/react";
 import { Button } from "@/components/ui/button";
 import {
@@ -16,9 +21,9 @@ import {
 import { Input } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
 import { Textarea } from "@/components/ui/textarea";
+import { copyToClipboard } from "@/lib/copy-to-clipboard";
 import { toastError, toastSuccess } from "@/shared/toast";
 import type { RecipeExecutionRecord } from "../../execution-types";
-import { copyTextToClipboard } from "../../executions/execution-helpers";
 
 type PublishExecutionDialogProps = {
   open: boolean;
@@ -40,7 +45,7 @@ function getExecutionRecordCount(execution: RecipeExecutionRecord | null): numbe
   if (typeof execution.analysis?.num_records === "number") {
     return execution.analysis.num_records;
   }
-  if (execution.datasetTotal > 0) {
+  if (typeof execution.datasetTotal === "number" && execution.datasetTotal > 0) {
     return execution.datasetTotal;
   }
   if (execution.rows > 0) {
@@ -112,7 +117,7 @@ export function PublishExecutionDialog({
     if (!publishedUrl) {
       return;
     }
-    const ok = await copyTextToClipboard(publishedUrl);
+    const ok = await copyToClipboard(publishedUrl);
     if (ok) {
       toastSuccess("Dataset link copied");
       return;
@@ -182,7 +187,7 @@ export function PublishExecutionDialog({
                 </DialogDescription>
               </div>
             </div>
-            <div className="rounded-2xl border border-border/60 bg-card/55 p-3 text-xs">
+            <div className="rounded-lg border border-border/60 bg-card/55 p-3 text-xs">
               <p className="mb-1 text-muted-foreground">Dataset URL</p>
               <p className="break-all font-medium text-foreground">{publishedUrl}</p>
             </div>
@@ -194,7 +199,7 @@ export function PublishExecutionDialog({
               <Button asChild={true}>
                 <a href={publishedUrl} target="_blank" rel="noreferrer">
                   Open repo
-                  <HugeiconsIcon icon={ArrowRight01Icon} className="ml-2 size-4" />
+                  <HugeiconsIcon icon={ChevronRightStandardIcon} className="size-4" />
                 </a>
               </Button>
               <Button variant="ghost" onClick={() => onOpenChange(false)}>
@@ -212,7 +217,7 @@ export function PublishExecutionDialog({
             </DialogHeader>
 
             <div className="space-y-4">
-              <div className="rounded-2xl border border-border/60 bg-card/55 p-3 text-xs">
+              <div className="rounded-lg border border-border/60 bg-card/55 p-3 text-xs">
                 <p className="font-medium text-foreground">From this run</p>
                 <div className="mt-2 grid gap-1.5 text-muted-foreground sm:grid-cols-2">
                   <p>
@@ -297,7 +302,7 @@ export function PublishExecutionDialog({
                 </p>
               </div>
 
-              <div className="corner-squircle flex items-start gap-3 rounded-2xl border border-border/60 bg-card/35 p-3">
+              <div className="corner-squircle flex items-start gap-3 rounded-lg border border-border/60 bg-card/35 p-3">
                 <Switch
                   id="publish-private"
                   size="sm"
@@ -319,7 +324,7 @@ export function PublishExecutionDialog({
               </div>
 
               {publishError ? (
-                <div className="rounded-2xl border border-destructive/40 bg-destructive/5 p-3 text-sm text-destructive">
+                <div className="rounded-lg border border-destructive/40 bg-destructive/5 p-3 text-sm text-destructive">
                   {publishError}
                 </div>
               ) : null}
@@ -333,7 +338,7 @@ export function PublishExecutionDialog({
               >
                 Cancel
               </Button>
-              <Button onClick={() => void handlePublish()} disabled={!canSubmit}>
+              <Button variant="dark" onClick={() => void handlePublish()} disabled={!canSubmit}>
                 {publishing ? "Publishing..." : "Publish to Hugging Face"}
               </Button>
             </DialogFooter>

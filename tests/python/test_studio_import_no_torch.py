@@ -1,18 +1,10 @@
-"""End-to-end sandbox tests: Studio modules in isolated no-torch venvs.
-
-Covers:
-- Python 3.12 and 3.13 venv creation (Intel Mac uses 3.12, Apple Silicon/Linux 3.13)
-- data_collators.py loads and dataclasses instantiate without torch
-- chat_templates.py top-level exec works with stubs for relative imports
-- Negative control: prepending 'import torch' fails in no-torch venv
-- Negative control: installing torchao (from overrides.txt) fails in no-torch venv
-- AST structural checks for top-level torch imports
-"""
+"""Sandbox tests: Unsloth dataset modules load/run in isolated no-torch venvs."""
 
 from __future__ import annotations
 
 import ast
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -22,16 +14,20 @@ from pathlib import Path
 
 import pytest
 
+
+def _shared_setup_1(code, no_torch_venv):
+    result = subprocess.run(
+        [no_torch_venv, "-c", code],
+        capture_output = True,
+        timeout = 30,
+    )
+    return result
+
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
-DATA_COLLATORS = (
-    REPO_ROOT / "studio" / "backend" / "utils" / "datasets" / "data_collators.py"
-)
-CHAT_TEMPLATES = (
-    REPO_ROOT / "studio" / "backend" / "utils" / "datasets" / "chat_templates.py"
-)
-FORMAT_CONVERSION = (
-    REPO_ROOT / "studio" / "backend" / "utils" / "datasets" / "format_conversion.py"
-)
+DATA_COLLATORS = REPO_ROOT / "studio" / "backend" / "utils" / "datasets" / "data_collators.py"
+CHAT_TEMPLATES = REPO_ROOT / "studio" / "backend" / "utils" / "datasets" / "chat_templates.py"
+FORMAT_CONVERSION = REPO_ROOT / "studio" / "backend" / "utils" / "datasets" / "format_conversion.py"
 
 
 def _has_uv() -> bool:
@@ -54,10 +50,7 @@ def _create_venv(venv_dir: Path, python_version: str) -> Path | None:
 
 @pytest.fixture(params = ["3.12", "3.13"], scope = "module")
 def no_torch_venv(request, tmp_path_factory):
-    """Create a temporary venv at the requested Python version with no torch.
-
-    Parametrized for 3.12 (Intel Mac) and 3.13 (Apple Silicon / Linux).
-    """
+    """Temp no-torch venv, parametrized for 3.12 (Intel Mac) and 3.13 (Apple Silicon / Linux)."""
     if not _has_uv():
         pytest.skip("uv not available")
 
@@ -67,19 +60,13 @@ def no_torch_venv(request, tmp_path_factory):
     if venv_python is None:
         pytest.skip(f"Could not create Python {py_version} venv")
 
-    # Verify torch is NOT importable
     check = subprocess.run(
         [str(venv_python), "-c", "import torch"],
         capture_output = True,
     )
-    assert (
-        check.returncode != 0
-    ), f"torch should NOT be importable in fresh {py_version} venv"
+    assert check.returncode != 0, f"torch should NOT be importable in fresh {py_version} venv"
 
     return str(venv_python)
-
-
-# ── AST structural checks ─────────────────────────────────────────────
 
 
 class TestDataCollatorsAST:
@@ -156,9 +143,6 @@ class TestChatTemplatesAST:
             )
 
 
-# ── data_collators.py: exec + dataclass instantiation in no-torch venv ──
-
-
 class TestDataCollatorsNoTorchVenv:
     """Run data_collators.py in an isolated no-torch venv, verify classes load."""
 
@@ -169,14 +153,10 @@ class TestDataCollatorsNoTorchVenv:
             loggers = types.ModuleType('loggers')
             loggers.get_logger = lambda n: None
             sys.modules['loggers'] = loggers
-            exec(open({str(DATA_COLLATORS)!r}).read())
+            exec(open({str(DATA_COLLATORS)!r}, encoding = "utf-8").read())
             print("OK: exec succeeded")
         """)
-        result = subprocess.run(
-            [no_torch_venv, "-c", code],
-            capture_output = True,
-            timeout = 30,
-        )
+        result = _shared_setup_1(code, no_torch_venv)
         assert (
             result.returncode == 0
         ), f"data_collators.py failed in no-torch venv:\n{result.stderr.decode()}"
@@ -189,16 +169,12 @@ class TestDataCollatorsNoTorchVenv:
             loggers = types.ModuleType('loggers')
             loggers.get_logger = lambda n: None
             sys.modules['loggers'] = loggers
-            exec(open({str(DATA_COLLATORS)!r}).read())
+            exec(open({str(DATA_COLLATORS)!r}, encoding = "utf-8").read())
             obj = DataCollatorSpeechSeq2SeqWithPadding(processor=None)
             assert obj.processor is None, "processor should be None"
             print("OK: DataCollatorSpeechSeq2SeqWithPadding instantiated")
         """)
-        result = subprocess.run(
-            [no_torch_venv, "-c", code],
-            capture_output = True,
-            timeout = 30,
-        )
+        result = _shared_setup_1(code, no_torch_venv)
         assert (
             result.returncode == 0
         ), f"DataCollatorSpeechSeq2SeqWithPadding failed:\n{result.stderr.decode()}"
@@ -211,21 +187,15 @@ class TestDataCollatorsNoTorchVenv:
             loggers = types.ModuleType('loggers')
             loggers.get_logger = lambda n: None
             sys.modules['loggers'] = loggers
-            exec(open({str(DATA_COLLATORS)!r}).read())
+            exec(open({str(DATA_COLLATORS)!r}, encoding = "utf-8").read())
             obj = DeepSeekOCRDataCollator(processor=None)
             assert obj.processor is None, "processor should be None"
             assert obj.max_length == 2048, "default max_length should be 2048"
             assert obj.ignore_index == -100, "default ignore_index should be -100"
             print("OK: DeepSeekOCRDataCollator instantiated")
         """)
-        result = subprocess.run(
-            [no_torch_venv, "-c", code],
-            capture_output = True,
-            timeout = 30,
-        )
-        assert (
-            result.returncode == 0
-        ), f"DeepSeekOCRDataCollator failed:\n{result.stderr.decode()}"
+        result = _shared_setup_1(code, no_torch_venv)
+        assert result.returncode == 0, f"DeepSeekOCRDataCollator failed:\n{result.stderr.decode()}"
         assert b"OK: DeepSeekOCRDataCollator instantiated" in result.stdout
 
     def test_dataclass_vlm_collator_instantiable(self, no_torch_venv):
@@ -235,24 +205,15 @@ class TestDataCollatorsNoTorchVenv:
             loggers = types.ModuleType('loggers')
             loggers.get_logger = lambda n: None
             sys.modules['loggers'] = loggers
-            exec(open({str(DATA_COLLATORS)!r}).read())
+            exec(open({str(DATA_COLLATORS)!r}, encoding = "utf-8").read())
             obj = VLMDataCollator(processor=None)
             assert obj.processor is None
             assert obj.mask_input_tokens is True, "default mask_input_tokens should be True"
             print("OK: VLMDataCollator instantiated")
         """)
-        result = subprocess.run(
-            [no_torch_venv, "-c", code],
-            capture_output = True,
-            timeout = 30,
-        )
-        assert (
-            result.returncode == 0
-        ), f"VLMDataCollator failed:\n{result.stderr.decode()}"
+        result = _shared_setup_1(code, no_torch_venv)
+        assert result.returncode == 0, f"VLMDataCollator failed:\n{result.stderr.decode()}"
         assert b"OK: VLMDataCollator instantiated" in result.stdout
-
-
-# ── chat_templates.py: exec in no-torch venv ─────────────────────────
 
 
 class TestChatTemplatesNoTorchVenv:
@@ -279,10 +240,20 @@ class TestChatTemplatesNoTorchVenv:
             model_mappings.MODEL_TO_TEMPLATE_MAPPER = {{}}
             sys.modules['model_mappings'] = model_mappings
 
+            iterable = types.ModuleType('iterable')
+            iterable.is_streaming_dataset = lambda *a, **k: False
+            sys.modules['iterable'] = iterable
+
             # Read and transform the source: replace relative imports with absolute
-            source = open({str(CHAT_TEMPLATES)!r}).read()
+            source = open({str(CHAT_TEMPLATES)!r}, encoding = "utf-8").read()
             source = source.replace('from .format_detection import', 'from format_detection import')
             source = source.replace('from .model_mappings import', 'from model_mappings import')
+            source = source.replace('from .iterable import', 'from iterable import')
+            # cells.py is stdlib-only, so the exec sites import the real module
+            # rather than another stub: the suite checks what actually ships.
+            sys.path.insert(0, {str(CHAT_TEMPLATES.parent)!r})
+            source = source.replace('from .cells import', 'from cells import')
+            source = source.replace('from .remote_images import', 'from remote_images import')
 
             exec(source)
 
@@ -291,11 +262,7 @@ class TestChatTemplatesNoTorchVenv:
             assert 'DEFAULT_ALPACA_TEMPLATE' in ns, "DEFAULT_ALPACA_TEMPLATE not defined after exec"
             print("OK: chat_templates.py exec succeeded")
         """)
-        result = subprocess.run(
-            [no_torch_venv, "-c", code],
-            capture_output = True,
-            timeout = 30,
-        )
+        result = _shared_setup_1(code, no_torch_venv)
         assert (
             result.returncode == 0
         ), f"chat_templates.py failed in no-torch venv:\n{result.stderr.decode()}"
@@ -320,28 +287,29 @@ class TestChatTemplatesNoTorchVenv:
             model_mappings.MODEL_TO_TEMPLATE_MAPPER = {{}}
             sys.modules['model_mappings'] = model_mappings
 
+            iterable = types.ModuleType('iterable')
+            iterable.is_streaming_dataset = lambda *a, **k: False
+            sys.modules['iterable'] = iterable
+
             ns = {{}}
-            source = open({str(CHAT_TEMPLATES)!r}).read()
+            source = open({str(CHAT_TEMPLATES)!r}, encoding = "utf-8").read()
             source = source.replace('from .format_detection import', 'from format_detection import')
             source = source.replace('from .model_mappings import', 'from model_mappings import')
+            source = source.replace('from .iterable import', 'from iterable import')
+            sys.path.insert(0, {str(CHAT_TEMPLATES.parent)!r})
+            source = source.replace('from .cells import', 'from cells import')
+            source = source.replace('from .remote_images import', 'from remote_images import')
             exec(source, ns)
 
             assert 'DEFAULT_ALPACA_TEMPLATE' in ns, "DEFAULT_ALPACA_TEMPLATE not defined"
             assert 'Instruction' in ns['DEFAULT_ALPACA_TEMPLATE'], "Template content unexpected"
             print("OK: DEFAULT_ALPACA_TEMPLATE defined and valid")
         """)
-        result = subprocess.run(
-            [no_torch_venv, "-c", code],
-            capture_output = True,
-            timeout = 30,
-        )
+        result = _shared_setup_1(code, no_torch_venv)
         assert (
             result.returncode == 0
         ), f"DEFAULT_ALPACA_TEMPLATE check failed:\n{result.stderr.decode()}"
         assert b"OK: DEFAULT_ALPACA_TEMPLATE defined and valid" in result.stdout
-
-
-# ── format_conversion.py: AST + runtime tests ────────────────────────
 
 
 class TestFormatConversionAST:
@@ -366,7 +334,6 @@ class TestFormatConversionAST:
                         and child.module
                         and child.module.startswith("torch")
                     ):
-                        # This torch import must be inside a Try node
                         found_in_try = False
                         for try_node in ast.walk(node):
                             if isinstance(try_node, ast.Try):
@@ -380,6 +347,44 @@ class TestFormatConversionAST:
                             f"torch import at line {child.lineno} in {node.name}() "
                             "is not inside a try/except block"
                         )
+
+
+def test_the_hardware_stub_covers_what_format_conversion_imports():
+    """The venv tests below replace utils.hardware with a stub. A name format_conversion.py
+    imports from it that the stub lacks only surfaces as an ImportError inside the venv,
+    after the venv build, so check the two lists against each other here."""
+    imported = set()
+    for node in ast.walk(ast.parse(FORMAT_CONVERSION.read_text(encoding = "utf-8"))):
+        if isinstance(node, ast.ImportFrom) and node.module == "utils.hardware":
+            imported.update(alias.name for alias in node.names)
+    assert imported, "format_conversion.py no longer imports from utils.hardware; drop the stubs"
+    stubbed_per_test = [
+        set(re.findall(r"\bhardware_mod\.(\w+)\s*=", text)) for text in _venv_test_sources()
+    ]
+    assert stubbed_per_test, "no utils.hardware stub found in TestFormatConversionNoTorchVenv"
+    for stubbed in stubbed_per_test:
+        assert imported <= stubbed, f"utils.hardware stub lacks {sorted(imported - stubbed)}"
+
+
+def _venv_test_sources() -> list:
+    """The child scripts of TestFormatConversionNoTorchVenv that stub utils.hardware, as text."""
+    tree = ast.parse(Path(__file__).read_text(encoding = "utf-8"))
+    out = []
+    for node in tree.body:
+        if isinstance(node, ast.ClassDef) and node.name == "TestFormatConversionNoTorchVenv":
+            for call in ast.walk(node):
+                if (
+                    isinstance(call, ast.Call)
+                    and getattr(call.func, "attr", "") == "dedent"
+                    and call.args
+                    and isinstance(call.args[0], ast.JoinedStr)
+                ):
+                    text = "".join(
+                        part.value for part in call.args[0].values if isinstance(part, ast.Constant)
+                    )
+                    if "hardware_mod" in text:
+                        out.append(text)
+    return out
 
 
 class TestFormatConversionNoTorchVenv:
@@ -404,22 +409,35 @@ class TestFormatConversionNoTorchVenv:
             datasets_mod.IterableDataset = type('IterableDataset', (), {{}})
             sys.modules['datasets'] = datasets_mod
 
+            iterable_mod = types.ModuleType('iterable')
+            iterable_mod.is_streaming_dataset = lambda *a, **k: False
+            sys.modules['iterable'] = iterable_mod
+
             # Stub utils.hardware
             utils_mod = types.ModuleType('utils')
             hardware_mod = types.ModuleType('utils.hardware')
             hardware_mod.dataset_map_num_proc = lambda n=None: 1
+            # In process, as the real one answers for an in-memory dataset with no cache files.
+            hardware_mod.light_map_num_proc = lambda dataset, desired=None: None
+            hardware_mod.safe_thread_num_proc = lambda desired=None: 1
             utils_mod.hardware = hardware_mod
             sys.modules['utils'] = utils_mod
             sys.modules['utils.hardware'] = hardware_mod
 
             # Read and exec format_conversion.py
-            source = open({str(FORMAT_CONVERSION)!r}).read()
+            source = open({str(FORMAT_CONVERSION)!r}, encoding = "utf-8").read()
             source = source.replace('from .format_detection import', 'from format_detection import')
+            source = source.replace('from .iterable import', 'from iterable import')
+            sys.path.insert(0, {str(FORMAT_CONVERSION.parent)!r})
+            source = source.replace('from .cells import', 'from cells import')
+            source = source.replace('from .remote_images import', 'from remote_images import')
             ns = {{'__name__': '__test__'}}
             exec(source, ns)
 
             # Test convert_chatml_to_alpaca with a simple dataset
             class FakeDataset:
+                column_names = ['messages']
+
                 def map(self, fn, **kw):
                     result = fn({{
                         'messages': [[
@@ -435,11 +453,7 @@ class TestFormatConversionNoTorchVenv:
             assert result['output'] == ['Hi there']
             print("OK: convert_chatml_to_alpaca works without torch")
         """)
-        result = subprocess.run(
-            [no_torch_venv, "-c", code],
-            capture_output = True,
-            timeout = 30,
-        )
+        result = _shared_setup_1(code, no_torch_venv)
         assert (
             result.returncode == 0
         ), f"convert_chatml_to_alpaca failed without torch:\n{result.stderr.decode()}"
@@ -462,15 +476,26 @@ class TestFormatConversionNoTorchVenv:
             datasets_mod.IterableDataset = type('IterableDataset', (), {{}})
             sys.modules['datasets'] = datasets_mod
 
+            iterable_mod = types.ModuleType('iterable')
+            iterable_mod.is_streaming_dataset = lambda *a, **k: False
+            sys.modules['iterable'] = iterable_mod
+
             utils_mod = types.ModuleType('utils')
             hardware_mod = types.ModuleType('utils.hardware')
             hardware_mod.dataset_map_num_proc = lambda n=None: 1
+            # In process, as the real one answers for an in-memory dataset with no cache files.
+            hardware_mod.light_map_num_proc = lambda dataset, desired=None: None
+            hardware_mod.safe_thread_num_proc = lambda desired=None: 1
             utils_mod.hardware = hardware_mod
             sys.modules['utils'] = utils_mod
             sys.modules['utils.hardware'] = hardware_mod
 
-            source = open({str(FORMAT_CONVERSION)!r}).read()
+            source = open({str(FORMAT_CONVERSION)!r}, encoding = "utf-8").read()
             source = source.replace('from .format_detection import', 'from format_detection import')
+            source = source.replace('from .iterable import', 'from iterable import')
+            sys.path.insert(0, {str(FORMAT_CONVERSION.parent)!r})
+            source = source.replace('from .cells import', 'from cells import')
+            source = source.replace('from .remote_images import', 'from remote_images import')
             ns = {{'__name__': '__test__'}}
             exec(source, ns)
 
@@ -490,18 +515,11 @@ class TestFormatConversionNoTorchVenv:
             assert convo[1]['role'] == 'assistant'
             print("OK: convert_alpaca_to_chatml works without torch")
         """)
-        result = subprocess.run(
-            [no_torch_venv, "-c", code],
-            capture_output = True,
-            timeout = 30,
-        )
+        result = _shared_setup_1(code, no_torch_venv)
         assert (
             result.returncode == 0
         ), f"convert_alpaca_to_chatml failed without torch:\n{result.stderr.decode()}"
         assert b"OK: convert_alpaca_to_chatml works without torch" in result.stdout
-
-
-# ── Negative controls ─────────────────────────────────────────────────
 
 
 class TestNegativeControls:
@@ -522,28 +540,22 @@ class TestNegativeControls:
                 loggers = types.ModuleType('loggers')
                 loggers.get_logger = lambda n: None
                 sys.modules['loggers'] = loggers
-                exec(open({temp_file!r}).read())
+                exec(open({temp_file!r}, encoding = "utf-8").read())
             """)
             result = subprocess.run(
                 [no_torch_venv, "-c", code],
                 capture_output = True,
                 timeout = 30,
             )
+            assert result.returncode != 0, "Expected failure when 'import torch' is prepended"
             assert (
-                result.returncode != 0
-            ), "Expected failure when 'import torch' is prepended"
-            assert (
-                b"ModuleNotFoundError" in result.stderr
-                or b"ImportError" in result.stderr
+                b"ModuleNotFoundError" in result.stderr or b"ImportError" in result.stderr
             ), f"Expected ImportError, got:\n{result.stderr.decode()}"
         finally:
             os.unlink(temp_file)
 
     def test_torchao_install_fails_no_torch_venv(self, no_torch_venv):
-        """Installing torchao (from overrides.txt) fails in a no-torch venv.
-
-        This proves the overrides.txt skip is necessary for Intel Mac.
-        """
+        """torchao install fails in a no-torch venv: proves the overrides.txt skip is needed."""
         result = subprocess.run(
             [
                 no_torch_venv,
@@ -557,10 +569,8 @@ class TestNegativeControls:
             timeout = 60,
         )
         if result.returncode != 0:
-            # torchao install/resolution failed as expected
             pass
         else:
-            # pip dry-run may not catch dependency issues; verify torch is missing
             check = subprocess.run(
                 [no_torch_venv, "-c", "import torch"],
                 capture_output = True,
@@ -577,6 +587,4 @@ class TestNegativeControls:
             timeout = 30,
         )
         assert result.returncode != 0, "import torch should fail in no-torch venv"
-        assert (
-            b"ModuleNotFoundError" in result.stderr or b"ImportError" in result.stderr
-        )
+        assert b"ModuleNotFoundError" in result.stderr or b"ImportError" in result.stderr

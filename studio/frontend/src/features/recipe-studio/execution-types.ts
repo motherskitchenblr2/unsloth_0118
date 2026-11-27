@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
-export type RecipeStudioView = "editor" | "executions";
+export type RecipeStudioView = "easy" | "editor" | "executions";
 
 export type RecipeExecutionKind = "preview" | "full";
 
@@ -30,6 +30,28 @@ export type RecipeExecutionBatch = {
   total?: number | null;
 };
 
+export type RecipeSourceProgress = {
+  source?: string | null;
+  status?: string | null;
+  repo?: string | null;
+  resource?: string | null;
+  page?: number | null;
+  // biome-ignore lint/style/useNamingConvention: backend schema
+  page_items?: number | null;
+  // biome-ignore lint/style/useNamingConvention: backend schema
+  fetched_items?: number | null;
+  // biome-ignore lint/style/useNamingConvention: backend schema
+  estimated_total?: number | null;
+  percent?: number | null;
+  // biome-ignore lint/style/useNamingConvention: backend schema
+  rate_remaining?: number | null;
+  // biome-ignore lint/style/useNamingConvention: backend schema
+  retry_after_sec?: number | null;
+  message?: string | null;
+  // biome-ignore lint/style/useNamingConvention: backend schema
+  updated_at?: number | null;
+};
+
 export type RecipeExecutionAnalysis = {
   num_records?: number;
   target_num_records?: number;
@@ -47,7 +69,6 @@ export type RecipeExecutionRecord = {
   // biome-ignore lint/style/useNamingConvention: backend schema
   jobId: string | null;
   kind: RecipeExecutionKind;
-  // ui-only display label for full runs
   // biome-ignore lint/style/useNamingConvention: ui schema
   run_name: string | null;
   status: RecipeExecutionStatus;
@@ -65,6 +86,8 @@ export type RecipeExecutionRecord = {
   column_progress: RecipeExecutionProgress | null;
   batch: RecipeExecutionBatch | null;
   // biome-ignore lint/style/useNamingConvention: backend schema
+  source_progress: RecipeSourceProgress | null;
+  // biome-ignore lint/style/useNamingConvention: backend schema
   model_usage: Record<string, unknown> | null;
   // biome-ignore lint/style/useNamingConvention: backend schema
   lastEventId: number | null;
@@ -73,7 +96,7 @@ export type RecipeExecutionRecord = {
   // biome-ignore lint/style/useNamingConvention: backend schema
   log_lines: string[];
   dataset: Record<string, unknown>[];
-  datasetTotal: number;
+  datasetTotal: number | null;
   datasetPage: number;
   datasetPageSize: number;
   analysis: RecipeExecutionAnalysis | null;

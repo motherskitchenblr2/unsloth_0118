@@ -1,20 +1,26 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
+import { ChevronLeftStandardIcon, ChevronRightStandardIcon } from "@/lib/chevron-icons";
 import { Button } from "@/components/ui/button";
+import { useT } from "@/i18n";
 import { cn } from "@/lib/utils";
 import { HugeiconsIcon } from "@hugeicons/react";
-import { ArrowLeft01Icon, ArrowRight01Icon, Cancel01Icon, CheckmarkCircle01Icon } from "@hugeicons/core-free-icons";
+import {
+  Cancel01Icon,
+  CheckmarkCircle02Icon,
+} from "@hugeicons/core-free-icons";
 import { Dialog as DialogPrimitive } from "radix-ui";
 import { AnimatePresence, motion } from "motion/react";
 import { useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { MODAL_SURFACE, useSurfaceRef } from "@/lib/surface-registry";
 import { cssEscape, toRect } from "../lib/dom";
 import { fireConfettiFireworks } from "../lib/confetti-fireworks";
 import { computeCardPos, padded, pickPlacement } from "../lib/layout";
 import { SpotlightOverlay } from "./spotlight-overlay";
 import type { Placement, Rect, TourStep } from "../types";
 
-type GuidedTourProps = { open: boolean; onOpenChange: (open: boolean) => void; steps: TourStep[]; onSkip: () => void; onComplete: () => void; celebrate?: boolean }; // confetti on complete only
+type GuidedTourProps = { open: boolean; onOpenChange: (open: boolean) => void; steps: TourStep[]; onSkip: () => void; onComplete: () => void; celebrate?: boolean };
 
 export function GuidedTour({
   open,
@@ -25,6 +31,7 @@ export function GuidedTour({
   celebrate = false,
 }: GuidedTourProps) {
   const maskId = `${useId()}-tour-mask`;
+  const t = useT();
   const [idx, setIdx] = useState(0);
   const [vw, setVw] = useState(0);
   const [vh, setVh] = useState(0);
@@ -35,10 +42,17 @@ export function GuidedTour({
     top: 12,
   });
   const cardRef = useRef<HTMLDivElement>(null);
+  const overlayRef = useSurfaceRef<HTMLDivElement>(MODAL_SURFACE);
   const closeLockRef = useRef(false);
   const rafRef = useRef<number | null>(null);
   const lastRectRef = useRef<Rect | null>(null);
-  const activeStepRef = useRef<TourStep | null>(null);
+
+  // Rewound during render, or reopening would fire the last step's onEnter before rewinding.
+  const [wasOpen, setWasOpen] = useState(open);
+  if (open !== wasOpen) {
+    setWasOpen(open);
+    if (open) setIdx(0);
+  }
 
   const step = steps[idx] ?? null;
   const total = steps.length;
@@ -50,30 +64,17 @@ export function GuidedTour({
     return padded(targetRect, pad, vw, vh);
   }, [step?.target, targetRect, vw, vh]);
 
+  // Cleanup so a step is also left on unmount, or onEnter side effects (sidebar pin) leak.
   useEffect(() => {
-    if (!open) return;
-    const prev = activeStepRef.current;
-    if (prev && prev.id !== step?.id) {
-      void prev.onExit?.();
-    }
-    activeStepRef.current = step;
-    if (step) {
-      void step.onEnter?.();
-    }
-  }, [open, step?.id]); // run before target lookup effect below
-
-  useEffect(() => {
-    if (open) return;
-    const prev = activeStepRef.current;
-    activeStepRef.current = null;
-    if (prev) {
-      void prev.onExit?.();
-    }
-  }, [open]);
+    if (!open || !step) return;
+    void step.onEnter?.();
+    return () => {
+      void step.onExit?.();
+    };
+  }, [open, step?.id]); // stays above the target lookup effect below
 
   useEffect(() => {
     if (!open) return;
-    setIdx(0);
     setTargetRect(null);
     closeLockRef.current = false;
     lastRectRef.current = null;
@@ -102,15 +103,17 @@ export function GuidedTour({
     let raf = 0;
     let t = 0;
 
-    function findTarget(): HTMLElement | null {
-      const found = document.querySelector(sel);
-      if (!(found instanceof HTMLElement)) return null;
-      return found;
-    }
-
     function isUsableTarget(candidate: HTMLElement): boolean {
       const r = candidate.getBoundingClientRect();
       return r.width >= 6 && r.height >= 6;
+    }
+
+    // First visible match: Images and Video share Train targets, and a hidden page stays mounted earlier in the DOM.
+    function findTarget(): HTMLElement | null {
+      const found = [...document.querySelectorAll(sel)].filter(
+        (c): c is HTMLElement => c instanceof HTMLElement,
+      );
+      return found.find(isUsableTarget) ?? found[0] ?? null;
     }
 
     function rectChanged(a: Rect | null, b: Rect): boolean {
@@ -240,6 +243,10 @@ export function GuidedTour({
             <>
               <DialogPrimitive.Overlay asChild>
                 <motion.div
+                  ref={overlayRef}
+                  // The shared slot, so modal checks see the tour.
+                  data-slot="dialog-overlay"
+                  data-viewport-backdrop={true}
                   className="fixed inset-0 z-50"
                   initial={{ opacity: 0 }}
                   animate={{ opacity: 1 }}
@@ -249,7 +256,7 @@ export function GuidedTour({
                   <SpotlightOverlay rect={spotlightRect} vw={vw} vh={vh} maskId={maskId} />
                   {spotlightRect && (
                     <motion.div
-                      className="fixed z-[51] pointer-events-none rounded-[22px] ring-1 ring-white/10"
+                      className="fixed z-[51] pointer-events-none rounded-2xl ring-1 ring-[rgb(255_255_255_/_calc(0.1*var(--contrast-edge-gain,1)))]"
                       initial={false}
                       animate={{
                         left: spotlightRect.x,
@@ -284,8 +291,11 @@ export function GuidedTour({
                   exit={{ opacity: 0, scale: 0.99, y: 10 }}
                   transition={{ duration: 0.22, ease: [0.165, 0.84, 0.44, 1] }}
                   className={cn(
-                    "relative overflow-hidden rounded-[28px] corner-squircle",
-                    "bg-white/95 text-foreground ring-1 ring-black/10 dark:bg-zinc-900/96 dark:text-zinc-100 dark:ring-white/12",
+                    // Plain rounded, no corner-squircle: at this radius superellipse(2)
+                    // hugs the corner about twice as tightly as the arc, which reads as a
+                    // boxed-in card rather than a rounded one.
+                    "glass-card relative overflow-hidden rounded-3xl",
+                    "bg-white/95 text-foreground ring-1 ring-[rgb(0_0_0_/_calc(0.1*var(--contrast-edge-gain,1)))] dark:bg-zinc-900/96 dark:text-zinc-100 dark:ring-[rgb(255_255_255_/_calc(0.12*var(--contrast-edge-gain,1)))]",
                     "shadow-[0_30px_120px_rgba(0,0,0,0.35)]",
                   )}
                   style={{
@@ -294,7 +304,7 @@ export function GuidedTour({
                 >
                   <div
                     className={cn(
-                      "absolute z-10 size-3 rotate-45 rounded-[3px] bg-white/95 ring-1 ring-black/10 dark:bg-zinc-900/96 dark:ring-white/12",
+                      "absolute z-10 size-3 rotate-45 rounded-[3px] bg-white/95 ring-1 ring-[rgb(0_0_0_/_calc(0.1*var(--contrast-edge-gain,1)))] dark:bg-zinc-900/96 dark:ring-[rgb(255_255_255_/_calc(0.12*var(--contrast-edge-gain,1)))]",
                       placement === "right" &&
                         "-left-1 top-1/2 -translate-y-1/2",
                       placement === "left" &&
@@ -306,35 +316,37 @@ export function GuidedTour({
                     )}
                     aria-hidden={true}
                   />
-                  <div className="absolute inset-x-0 top-0 h-20 bg-gradient-to-b from-emerald-400/18 via-cyan-300/6 to-transparent dark:from-emerald-400/24 dark:via-cyan-300/12" />
-                  <div className="absolute -left-14 -top-16 size-44 rounded-full bg-emerald-400/20 blur-2xl dark:bg-emerald-400/26" />
+                  {/* Rounded to match the card. A square-cornered rectangle here reads as a
+                      second, boxier outline whenever it is not clipped to the card's radius. */}
+                  <div className="absolute inset-x-0 top-0 h-20 rounded-t-3xl bg-gradient-to-b from-control-accent/18 via-control-accent/6 to-transparent dark:from-control-accent/24 dark:via-control-accent/12" />
+                  <div className="absolute -left-14 -top-16 size-44 rounded-full bg-control-accent/20 blur-2xl dark:bg-control-accent/26" />
                   <div className="absolute -right-14 -bottom-16 size-44 rounded-full bg-cyan-300/18 blur-2xl dark:bg-cyan-300/24" />
 
                   <div className="relative p-5">
                     <div className="flex items-start justify-between gap-3">
                       <div className="min-w-0">
-                        <div className="inline-flex items-center gap-2 rounded-full bg-black/[0.04] px-2.5 py-1 text-[10px] font-mono text-foreground/60 ring-1 ring-black/10 dark:bg-white/[0.04] dark:text-zinc-200/75 dark:ring-white/14">
+                        <div className="inline-flex items-center gap-2 rounded-full bg-[rgb(0_0_0_/_calc(0.04*var(--contrast-wash-gain,1)))] px-2.5 py-1 text-ui-10 font-mono text-foreground/60 ring-1 ring-[rgb(0_0_0_/_calc(0.1*var(--contrast-edge-gain,1)))] dark:bg-[rgb(255_255_255_/_calc(0.04*var(--contrast-wash-gain,1)))] dark:text-zinc-200/75 dark:ring-[rgb(255_255_255_/_calc(0.14*var(--contrast-edge-gain,1)))]">
                           {idx + 1}/{total}
-                          <span className="size-1 rounded-full bg-emerald-500/70" />
-                          guided tour
+                          <span className="size-1 rounded-full bg-control-accent/70" />
+                          {t("tour.badge")}
                         </div>
                         <DialogPrimitive.Title
-                          className="mt-2 text-[18px] leading-tight"
+                          className="mt-2 text-ui-18 leading-tight"
                           style={{ fontFamily: "var(--font-serif)" }}
                         >
-                          {step?.title ?? "Quick tour"}
+                          {step?.title ?? t("tour.defaultTitle")}
                         </DialogPrimitive.Title>
                         <DialogPrimitive.Description className="mt-1.5 text-sm leading-relaxed text-foreground/70 dark:text-zinc-200/75">
-                          {step?.body ?? "Let’s get you oriented."}
+                          {step?.body ?? t("tour.defaultBody")}
                         </DialogPrimitive.Description>
                       </div>
 
                       <Button
                         variant="ghost"
                         size="icon-sm"
-                        className="text-foreground/60 hover:text-foreground hover:bg-black/[0.05] dark:text-zinc-300/70 dark:hover:text-zinc-100 dark:hover:bg-white/[0.08]"
+                        className="text-foreground/60 hover:text-foreground hover:bg-[rgb(0_0_0_/_calc(0.05*var(--contrast-wash-gain,1)))] dark:text-zinc-300/70 dark:hover:text-zinc-100 dark:hover:bg-[rgb(255_255_255_/_calc(0.1*var(--contrast-wash-gain,1)))]"
                         onClick={() => requestClose("skip")}
-                        aria-label="Skip tour"
+                        aria-label={t("tour.skipTour")}
                       >
                         <HugeiconsIcon icon={Cancel01Icon} className="size-4" />
                       </Button>
@@ -343,39 +355,39 @@ export function GuidedTour({
                     <div className="mt-5 flex items-center justify-between gap-3">
                       <Button
                         variant="ghost"
-                        className="text-foreground/60 hover:text-foreground hover:bg-black/[0.05] dark:text-zinc-300/70 dark:hover:text-zinc-100 dark:hover:bg-white/[0.08]"
+                        className="text-foreground/60 hover:text-foreground hover:bg-[rgb(0_0_0_/_calc(0.05*var(--contrast-wash-gain,1)))] dark:text-zinc-300/70 dark:hover:text-zinc-100 dark:hover:bg-[rgb(255_255_255_/_calc(0.1*var(--contrast-wash-gain,1)))]"
                         onClick={() => requestClose("skip")}
                       >
-                        Skip
+                        {t("tour.skip")}
                       </Button>
 
                       <div className="flex items-center gap-2">
                         <Button
                           variant="outline"
-                          className="border-black/10 bg-white/70 text-foreground hover:bg-white hover:text-foreground dark:border-white/15 dark:bg-white/[0.07] dark:text-zinc-100 dark:hover:bg-white/[0.12]"
+                          className="text-foreground hover:text-foreground dark:text-zinc-100"
                           disabled={idx === 0}
                           onClick={() => setIdx((i) => Math.max(0, i - 1))}
                         >
-                          <HugeiconsIcon icon={ArrowLeft01Icon} className="size-4" />
-                          Back
+                          <HugeiconsIcon icon={ChevronLeftStandardIcon} className="size-4" />
+                          {t("tour.back")}
                         </Button>
                         {isLast ? (
                           <Button
                             variant="dark"
-                            className="bg-gradient-to-r from-emerald-500 to-cyan-400 text-white hover:from-emerald-600 hover:to-cyan-500"
+                            className="bg-control-accent text-control-accent-foreground hover:bg-control-accent/90"
                             onClick={() => requestClose("complete")}
                           >
-                            <HugeiconsIcon icon={CheckmarkCircle01Icon} className="size-4" />
-                            Done
+                            <HugeiconsIcon icon={CheckmarkCircle02Icon} className="size-4" />
+                            {t("common.done")}
                           </Button>
                         ) : (
                           <Button
                             variant="dark"
-                            className="bg-gradient-to-r from-emerald-500 to-cyan-400 text-white hover:from-emerald-600 hover:to-cyan-500"
+                            className="bg-control-accent text-control-accent-foreground hover:bg-control-accent/90"
                             onClick={() => setIdx((i) => Math.min(total - 1, i + 1))}
                           >
-                            Next
-                            <HugeiconsIcon icon={ArrowRight01Icon} className="size-4" />
+                            {t("tour.next")}
+                            <HugeiconsIcon icon={ChevronRightStandardIcon} className="size-4" />
                           </Button>
                         )}
                       </div>
@@ -383,8 +395,8 @@ export function GuidedTour({
                   </div>
 
                   <div className="h-px bg-gradient-to-r from-transparent via-black/10 to-transparent dark:via-white/14" />
-                  <div className="px-5 py-3 text-[11px] text-foreground/55 dark:text-zinc-300/65">
-                    Tip: `Esc` skips. Tour blocks clicks so you can read.
+                  <div className="px-5 py-3 text-ui-11 text-foreground/55 dark:text-zinc-300/65">
+                    {t("tour.tip")}
                   </div>
                 </motion.div>
               </DialogPrimitive.Content>
