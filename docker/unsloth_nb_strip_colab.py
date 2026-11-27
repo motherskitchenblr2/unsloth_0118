@@ -26,9 +26,7 @@ _WIDGET_VIEW_MIME = "application/vnd.jupyter.widget-view+json"
 
 
 def _is_intro_line(line):
-    """True for the Colab run announcement, bare or inside a single-line HTML comment.
-    Only a comment that OPENS AND CLOSES on one line matches, so dropping it can never
-    leave a dangling `<!--` that swallows the rest of the cell."""
+    """Matches the Colab intro, bare or in one-line HTML comments; never an unclosed opener."""
     stripped = line.strip()
     low = stripped.lower()
     if low.startswith(_INTRO_PREFIX):
@@ -84,9 +82,7 @@ def _strip_cell(cell):
 
 
 def _strip_intro(nb):
-    """Strip the Colab intro from the LEADING markdown block: cells[0] alone misses the
-    notebooks that put the badge there and the sentence in cells[1]. The scan stops at
-    the first non-markdown cell, so it never reaches prose between code cells."""
+    """Strips the Colab intro from leading markdown cells (badge and sentence may be split)."""
     cells = nb.get("cells")
     if not isinstance(cells, list):
         return False
@@ -132,11 +128,8 @@ def _unlink(path):
 
 
 def _stage_clean(path):
-    """(tmp, hash_before, hash_after) for a cleaned copy written beside the notebook but
-    NOT published, or None when there was nothing to change or the write failed.
-
-    Split out of strip_notebook so migrate can record the new hash before the notebook
-    carries it."""
+    """Returns (tmp, hash_before, hash_after) for a cleaned copy staged, not published, beside the
+    notebook, or None if unchanged or failed; split so migrate can record the hash first."""
     try:
         before = _sha256(path)
         with open(path, "r", encoding = "utf-8") as f:
@@ -163,8 +156,7 @@ def _stage_clean(path):
 def _publish(tmp, path, before):
     """Move the staged copy onto the notebook. False if it was not published."""
     try:
-        # JupyterLab is already serving the tree, so a save between the read above and
-        # this replace would be overwritten and then recorded as pristine forever
+        # JupyterLab is serving the tree, so recheck before replacing.
         if _sha256(path) != before:
             _unlink(tmp)
             return False
@@ -177,10 +169,7 @@ def _publish(tmp, path, before):
 
 
 def _write_state(state_path, lines):
-    """Replace the state file durably; False when it could not be written.
-
-    fsync before the rename, because a crash between the two makes the rename visible
-    with the content unwritten, which strands the notebooks the same way."""
+    """Returns False on failure; fsync before rename so no crash exposes unwritten content."""
     tmp = state_path + ".tmp"
     try:
         with open(tmp, "w", encoding = "utf-8") as f:
@@ -195,15 +184,8 @@ def _write_state(state_path, lines):
 
 
 def _resume(path, rec):
-    """Finish a publish that was interrupted after its record landed. True if it did.
-
-    Recording before publishing closes the window that stranded the whole set at once,
-    but it leaves a one-notebook window of its own: a stop between os.replace on the
-    state file and os.replace on the notebook leaves `rec` describing the cleaned bytes
-    while the file still holds the pristine ones, and every later run reads that
-    mismatch as a user edit and carries the stale record forward forever. Cleaning what
-    is actually on disk tells the two apart, because only the interrupted case
-    reproduces `rec` byte for byte; a real edit cannot, so nothing else is touched."""
+    """Finishes a publish interrupted between the state and notebook renames, True if it did; else
+    that stop reads as a user edit, and only this case reproduces the record byte for byte."""
     st = _stage_clean(path)
     if st is None:
         return False
@@ -215,8 +197,7 @@ def _resume(path, rec):
 
 
 def strip_notebook(path, staged = None):
-    """True if the notebook was modified and written back. `staged`, when given, gets
-    {"sha256": ...} for the bytes THIS call wrote, so the caller need not re-read."""
+    """True if modified and written back; staged, when given, gets sha256 of the bytes written."""
     st = _stage_clean(path)
     if st is None:
         return False
@@ -237,21 +218,8 @@ def _sha256(path):
 
 
 def migrate(state_path, dest):
-    """Clean every notebook the state file says we own, recording each one BEFORE it is
-    published.
-
-    Publishing the whole set first and then writing the state once meant that losing
-    that single write left every cleaned notebook no longer matching its record. The
-    refresh reads a hash mismatch as a user edit and carries the stale record forward,
-    so upstream updates stop reaching those notebooks permanently, while this reports
-    success. It is not a one-notebook risk either: on the first boot after this ships,
-    migrate cleans the entire set in one pass, so a docker stop or an ENOSPC anywhere
-    in that window stranded all of them at once.
-
-    Ordering it the other way is safe in the direction that matters. If the state write
-    fails, nothing has been published and the disk still matches the record, so the next
-    start simply tries again. The narrow window that is left, a stop between the two
-    renames, is reconciled by _resume rather than mistaken for a user edit."""
+    """Cleans every owned notebook, recording each in the state file before it is published, so one
+    lost state write cannot strand the set; a stop between the renames is reconciled by _resume."""
     try:
         with open(state_path, "r", encoding = "utf-8") as f:
             lines = f.read().splitlines()
@@ -290,7 +258,6 @@ def migrate(state_path, dest):
         if _publish(tmp, path, before):
             changed += 1
         else:
-            # nothing landed, so take the record back off
             out[i] = line
             _write_state(state_path, out)
 

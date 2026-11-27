@@ -6,8 +6,11 @@
 from __future__ import annotations
 
 import codecs
+import random
 import sys
+import threading
 import time
+import tracemalloc
 from email.message import Message
 from pathlib import Path
 
@@ -29,7 +32,6 @@ class _FakeResp:
             self.headers["Content-Type"] = content_type
 
     def read(self, n: int | None = None) -> bytes:
-        # Advance a cursor like a real stream so the chunked reader reaches EOF.
         chunk = self._body[self._pos :] if n is None else self._body[self._pos : self._pos + n]
         self._pos += len(chunk)
         return chunk
@@ -48,7 +50,6 @@ class _FakeOpener:
 
 
 def _fetch_with(monkeypatch, body: bytes, content_type: str | None) -> str:
-    # Pass SSRF validation and skip real DNS/network.
     monkeypatch.setattr(
         tools, "_validate_and_resolve_host", lambda host, port: (True, "", ["93.184.216.34"])
     )
@@ -157,6 +158,20 @@ def test_mislabeled_pdf_is_read_past_text_download_cap(monkeypatch):
     assert "Cross-reference data was fetched" in out
 
 
+def test_html_labeled_pdf_with_body_bytes_is_read_to_eof(monkeypatch):
+    pymupdf = pytest.importorskip("pymupdf")
+    doc = pymupdf.open()
+    payload = b"<body>" + random.Random(0).randbytes(1024 * 1024)
+    doc.embfile_add("blob.bin", payload, ufilename = "blob.bin")
+    page = doc.new_page()
+    page.insert_text((40, 40), "PDF body-window marker")
+    body = doc.tobytes(deflate = False, use_objstms = 0, compression_effort = 0)
+    doc.close()
+
+    out = _fetch_with(monkeypatch, body, "text/html")
+    assert "PDF body-window marker" in out
+
+
 def test_pdf_extraction_caps_pages_and_intermediate_text(monkeypatch):
     from core.rag.parsers import Page
 
@@ -165,7 +180,7 @@ def test_pdf_extraction_caps_pages_and_intermediate_text(monkeypatch):
     def fake_parse(data, *, max_pages = None):
         seen["max_pages"] = max_pages
         pages = [Page(text = "x" * 1000, page_number = i, char_count = 1000) for i in range(1, 51)]
-        return pages, 60  # document actually has more pages than the cap
+        return pages, 60
 
     monkeypatch.setattr("core.rag.parsers.parse_pdf_bytes", fake_parse)
     text = tools._extract_pdf_text(b"unused")
@@ -178,7 +193,6 @@ def test_pdf_extraction_caps_pages_and_intermediate_text(monkeypatch):
 def test_pdf_exactly_at_page_cap_not_marked_capped(monkeypatch):
     from core.rag.parsers import Page
 
-    # Exactly _MAX_WEB_PDF_PAGES pages are fully read, so no "capped" marker.
     monkeypatch.setattr(
         "core.rag.parsers.parse_pdf_bytes",
         lambda data, *, max_pages = None: (
@@ -216,6 +230,41 @@ def test_pdf_result_discarded_after_fetch_deadline(monkeypatch):
     monkeypatch.setattr(tools, "_extract_pdf_text", slow_extract)
     out = _fetch_with(monkeypatch, _pdf_bytes("Readable text"), "application/pdf")
     assert out == "Failed to fetch URL: timed out."
+
+
+def test_pdf_read_queued_behind_indexing_stops_on_cancel(monkeypatch):
+    from core.rag.parsers import MUPDF_LOCK
+
+    body = _pdf_bytes("Readable text")
+    monkeypatch.setattr(
+        tools, "_validate_and_resolve_host", lambda host, port: (True, "", ["93.184.216.34"])
+    )
+    monkeypatch.setattr(
+        tools.urllib.request,
+        "build_opener",
+        lambda *a, **k: _FakeOpener(_FakeResp(body, "application/pdf")),
+    )
+    monkeypatch.setattr(tools, "_extract_pdf_text", lambda data: pytest.fail("read while locked"))
+    held, release = threading.Event(), threading.Event()
+
+    def indexing():
+        with MUPDF_LOCK:
+            held.set()
+            release.wait(10)
+
+    holder = threading.Thread(target = indexing)
+    holder.start()
+    held.wait(5)
+    cancel = threading.Event()
+    threading.Timer(0.3, cancel.set).start()
+    started = time.monotonic()
+    try:
+        out = tools._fetch_page_text("https://example.com/a.pdf", timeout = 5, cancel_event = cancel)
+    finally:
+        release.set()
+        holder.join()
+    assert out == "Failed to fetch URL: cancelled."
+    assert time.monotonic() - started < 3
 
 
 def test_text_octet_stream_kept_after_sniffing(monkeypatch):
@@ -267,7 +316,6 @@ def test_bom_unicode_text_without_charset_kept(monkeypatch, bom, encoding, conte
 
 
 def test_valid_utf8_binary_caught_by_control_chars(monkeypatch):
-    # These controls are valid UTF-8 and therefore produce no replacement chars.
     body = bytes([0, 1, 2, 3, 4, 5, 6, 7]) * 400
     out = _fetch_with(monkeypatch, body, "text/plain")
     assert "binary content" in out
@@ -323,7 +371,6 @@ def test_office_labeled_binary_caught_by_magic(monkeypatch, content_type, magic)
 
 
 def test_latin1_text_without_charset_kept(monkeypatch):
-    # The cp1252 retry should rescue accent-heavy text with ASCII structure.
     body = (
         "Muller lauft uber die Strasse: schoene, groesse. MARKERWORD ".replace("ue", "ü")
         + "äöüß éèà "
@@ -377,14 +424,12 @@ def test_malformed_charset_falls_back(monkeypatch):
 
 @pytest.mark.parametrize("charset", ["utf-16", "utf-16-le", "utf-32"])
 def test_declared_wide_codec_still_honoured(monkeypatch, charset):
-    # The guard discards a label whose decode raises; a codec decoding ITS OWN page must not.
     body = "MARKERWORD and more text".encode(charset)
     out = _fetch_with(monkeypatch, body, f"text/plain; charset={charset}")
     assert "MARKERWORD" in out
 
 
 def test_high_byte_binary_not_rescued_as_cp1252(monkeypatch):
-    # cp1252 maps these bytes to printable characters, but they lack ASCII structure.
     body = bytes(range(0xA0, 0x100)) * 40
     out = _fetch_with(monkeypatch, body, "text/plain")
     assert "binary content" in out
@@ -404,8 +449,354 @@ def test_html_page_unaffected(monkeypatch):
     assert "non-text content" not in out and "binary content" not in out
 
 
+def test_article_after_a_large_inline_head_is_read(monkeypatch):
+    style = b".c{color:red}\n" * (2 * 1024 * 1024 // 14)
+    html = (
+        b"<html><head><style>"
+        + style
+        + b"</style></head><body><article><h1>Brightline files for bankruptcy</h1>"
+        + b"<p>The rail operator filed for Chapter 11 protection on Friday.</p></article></body></html>"
+    )
+    out = _fetch_with(monkeypatch, html, "text/html; charset=utf-8")
+    assert "Brightline files for bankruptcy" in out
+    assert "Chapter 11 protection" in out
+
+
+def test_article_after_a_utf8_bom_and_large_inline_head_is_read(monkeypatch):
+    html = (
+        codecs.BOM_UTF8
+        + b"<html><head><style>"
+        + b"x" * (768 * 1024)
+        + b"</style></head><body><article><h1>BOM article body</h1></article></body></html>"
+    )
+    out = _fetch_with(monkeypatch, html, "text/html; charset=utf-8")
+    assert "BOM article body" in out
+
+
+def test_body_text_inside_head_script_does_not_end_the_read(monkeypatch):
+    html = (
+        b'<html><head><script>const example = "<body>";</script><style>'
+        + b"x" * (768 * 1024)
+        + b"</style></head><body><article><h1>Actual article body</h1></article></body></html>"
+    )
+    out = _fetch_with(monkeypatch, html, "text/html; charset=utf-8")
+    assert "Actual article body" in out
+
+
+@pytest.mark.parametrize("reference", ["&#10;", "&#x20;", "&Tab;", "&NewLine;"])
+def test_whitespace_reference_in_large_head_keeps_article(monkeypatch, reference):
+    html = (
+        "<html><head>"
+        + reference
+        + "<style>"
+        + "x" * (768 * 1024)
+        + "</style></head><body><h1>Whitespace article marker</h1></body></html>"
+    ).encode()
+    assert "Whitespace article marker" in _fetch_with(monkeypatch, html, "text/html")
+
+
+@pytest.mark.parametrize(
+    "codec", ["utf-16", "utf-32", "utf-16-le", "utf-16-be", "utf-32-le", "utf-32-be"]
+)
+def test_wide_encoded_large_head_keeps_article(monkeypatch, codec):
+    html = (
+        "<html><head><style>/*"
+        + "🌍" * (200 * 1024)
+        + "*/</style></head><body><h1>Wide article marker</h1></body></html>"
+    ).encode(codec)
+    content_type = "text/html" if codec in ("utf-16", "utf-32") else f"text/html; charset={codec}"
+    assert "Wide article marker" in _fetch_with(monkeypatch, html, content_type)
+
+
+def test_html_body_locator_does_not_store_every_newline():
+    tracemalloc.start()
+    try:
+        locator = tools._HTMLBodyLocator()
+        locator.feed_bytes(b"\n" * (256 * 1024))
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    assert locator.body_at is None
+    assert peak < 4 * 1024 * 1024
+
+
+def test_unterminated_html_token_has_linear_reparse_work(monkeypatch):
+    payload = b"<" + b"x" * (4 * 1024 * 1024)
+    resp = _FakeResp(payload, "text/html")
+    scanned = 0
+    feed = tools.HTMLParser.feed
+
+    def counted_feed(parser, data):
+        nonlocal scanned
+        scanned += len(parser.rawdata) + len(data)
+        return feed(parser, data)
+
+    monkeypatch.setattr(tools.HTMLParser, "feed", counted_feed)
+    error, body = tools._read_capped_body(
+        resp,
+        tools._MAX_HTML_FETCH_BYTES,
+        timeout = 5,
+        deadline = None,
+        cancel_event = None,
+        body_window = tools._MAX_FETCH_BYTES,
+    )
+    assert error is None
+    assert body == payload
+    assert scanned < 3 * len(payload)
+
+
+@pytest.mark.parametrize(
+    "opening,closing", [(b"<!--", b"-->"), (b'<link href="data:image/png;base64,', b'">')]
+)
+def test_large_head_token_keeps_article(monkeypatch, opening, closing):
+    html = (
+        b"<html><head>"
+        + opening
+        + b"x" * (768 * 1024)
+        + closing
+        + b"</head><body><h1>Long token article marker</h1></body></html>"
+    )
+    assert "Long token article marker" in _fetch_with(monkeypatch, html, "text/html")
+
+
+_MENU = b'<li><a href="/api/item">Menu entry</a></li>\n'
+_LINES = b"<p>line</p>" * (1024 * 1024)
+
+
+def _menu_page(content: bytes) -> bytes:
+    menu = _MENU * (700 * 1024 // len(_MENU))
+    return (
+        b"<html><head><title>t</title></head><body><nav><ul>"
+        + menu
+        + b"</ul></nav>"
+        + content
+        + b"</body></html>"
+    )
+
+
+def _read_html(resp, cancel_event = None):
+    return tools._read_capped_body(
+        resp,
+        tools._MAX_HTML_FETCH_BYTES,
+        timeout = 5,
+        deadline = None,
+        cancel_event = cancel_event,
+        body_window = tools._MAX_FETCH_BYTES,
+    )
+
+
+def _first_window(body: bytes) -> bytes:
+    return body[: body.index(b"</head>") + tools._MAX_FETCH_BYTES]
+
+
+@pytest.mark.parametrize("tag", [b"main", b"article"])
+def test_page_text_after_a_large_menu_is_read(monkeypatch, tag):
+    html = _menu_page(b"<%b><h1>Dense layer</h1><p>BODY-MARK takes units.</p></%b>" % (tag, tag))
+    assert "BODY-MARK takes units." in _fetch_with(monkeypatch, html, "text/html")
+
+
+def test_page_text_after_a_large_menu_gets_a_full_window():
+    body = _menu_page(b"<main><h1>Start</h1>" + _LINES + b"</main>")
+    resp = _FakeResp(body, "text/html")
+    error, read = _read_html(resp)
+    window_end = body.index(b"<main>") + tools._MAX_FETCH_BYTES
+    assert error is None
+    assert window_end <= resp._pos < window_end + 2 * 65536
+    assert read == body[: resp._pos]
+
+
+def test_page_text_inside_the_window_reads_no_further():
+    body = b"<html><head><title>t</title></head><body><main><h1>Start</h1>" + _LINES + b"</main>"
+    resp = _FakeResp(body, "text/html")
+    assert _read_html(resp) == (None, _first_window(body))
+    assert resp._pos == len(_first_window(body))
+
+
+def test_page_without_a_content_start_keeps_the_first_window():
+    body = b"<html><head><title>t</title></head><body>" + _LINES + b"</body></html>"
+    assert _read_html(_FakeResp(body, "text/html")) == (None, _first_window(body))
+
+
+def test_failed_read_past_the_window_keeps_the_first_window():
+    body = b"<html><head><title>t</title></head><body>" + _LINES + b"</body></html>"
+    resp = _FakeResp(body, "text/html")
+    read = resp.read
+
+    def stalling_read(n = None):
+        if resp._pos > 1024 * 1024:
+            raise TimeoutError("timed out")
+        return read(n)
+
+    resp.read = stalling_read
+    assert _read_html(resp) == (None, _first_window(body))
+
+
+def test_failed_read_after_a_late_content_start_keeps_the_first_window():
+    body = _menu_page(b"<main><h1>Start</h1>" + _LINES + b"</main>")
+    resp = _FakeResp(body, "text/html")
+    read = resp.read
+
+    def stalling_read(n = None):
+        if resp._pos > body.index(b"<main>") + 65536:
+            raise TimeoutError("timed out")
+        return read(n)
+
+    resp.read = stalling_read
+    assert _read_html(resp) == (None, _first_window(body))
+
+
+def test_read_past_the_window_stops_when_cancelled():
+    cancel = threading.Event()
+    resp = _FakeResp(_menu_page(_LINES), "text/html")
+    read = resp.read
+
+    def cancelling_read(n = None):
+        if resp._pos > 1024 * 1024:
+            cancel.set()
+        return read(n)
+
+    resp.read = cancelling_read
+    assert _read_html(resp, cancel) == ("Failed to fetch URL: cancelled.", b"")
+
+
+def _main_menu_page(content: bytes) -> bytes:
+    menu = _MENU * (510 * 1024 // len(_MENU))
+    return (
+        b"<html><head><title>t</title></head><body><main><nav><ul>"
+        + menu
+        + b"</ul></nav>"
+        + content
+        + b"</main></body></html>"
+    )
+
+
+def test_page_text_after_a_large_menu_inside_main_is_read(monkeypatch):
+    steps = b"".join(b'<p data-pad="%b">Step %d.</p>' % (b"x" * 4096, n) for n in range(10))
+    html = _main_menu_page(
+        b"<article><h1>Install</h1>" + steps + b"<p>BODY-MARK last step.</p></article>"
+    )
+    assert "BODY-MARK last step." in _fetch_with(monkeypatch, html, "text/html")
+
+
+def test_heading_past_the_window_gets_a_full_window():
+    body = (
+        b"<html><head><title>t</title></head><body><nav>"
+        + b"x" * (100 * 1024)
+        + b"</nav><main><script>"
+        + b"x" * (450 * 1024)
+        + b"</script><h1>Start</h1>"
+        + _LINES
+        + b"</main>"
+    )
+    resp = _FakeResp(body, "text/html")
+    error, read = _read_html(resp)
+    window_end = body.index(b"<h1>") + tools._MAX_FETCH_BYTES
+    assert error is None
+    assert window_end <= resp._pos < window_end + 2 * 65536
+    assert read == body[: resp._pos]
+
+
+def test_repeated_articles_keep_the_first_window():
+    body = (
+        b"<html><head><title>t</title></head><body><main>"
+        + b"<article><p>post</p></article>" * (100 * 1024)
+        + b"</main>"
+    )
+    resp = _FakeResp(body, "text/html")
+    assert _read_html(resp) == (None, _first_window(body))
+    assert resp._pos == len(_first_window(body))
+
+
+def test_failed_read_past_a_late_heading_keeps_the_first_window():
+    body = _main_menu_page(b"<article><h1>Start</h1>" + _LINES + b"</article>")
+    resp = _FakeResp(body, "text/html")
+    read = resp.read
+
+    def stalling_read(n = None):
+        if resp._pos > len(_first_window(body)):
+            raise TimeoutError("timed out")
+        return read(n)
+
+    resp.read = stalling_read
+    assert _read_html(resp) == (None, _first_window(body))
+
+
+def test_failed_read_past_a_later_heading_keeps_the_main_window():
+    body = _menu_page(
+        b"<main><p>BODY-MARK install steps.</p>"
+        + b"<p>x</p>" * (300 * 1024 // 8)
+        + b"<h1>Late</h1>"
+        + _LINES
+        + b"</main>"
+    )
+    resp = _FakeResp(body, "text/html")
+    read = resp.read
+    window_end = body.index(b"<main>") + tools._MAX_FETCH_BYTES
+
+    def stalling_read(n = None):
+        if resp._pos > window_end + 65536:
+            raise TimeoutError("timed out")
+        return read(n)
+
+    resp.read = stalling_read
+    error, read_body = _read_html(resp)
+    assert error is None
+    assert b"BODY-MARK install steps." in read_body
+    assert window_end <= len(read_body) <= window_end + 65536
+    assert read_body == body[: len(read_body)]
+
+
+@pytest.mark.parametrize(
+    "content_type,body",
+    [
+        (
+            "text/html",
+            b"<html><head><title>t</title></head><body><article>"
+            + b"<h1>Harbor ferry adds night service</h1><p>Boats run every thirty minutes.</p></article>"
+            + b"<script>"
+            + b"x" * (4 * 1024 * 1024)
+            + b"</script></body></html>",
+        ),
+        (
+            "text/html",
+            b"<html><head><title>t</title></head><main>"
+            + b"<h1>Harbor ferry adds night service</h1><p>Boats run every thirty minutes.</p></main>"
+            + b"<script>"
+            + b"x" * (4 * 1024 * 1024)
+            + b"</script></html>",
+        ),
+        (
+            "text/html",
+            b"<html><head><title>t</title></head><body><p>Harbor ferry adds night service</p>"
+            + b"<p>log line</p>" * (512 * 1024)
+            + b"</body></html>",
+        ),
+        ("text/plain", b"Harbor ferry adds night service\n" + b"log line\n" * (512 * 1024)),
+    ],
+    ids = ["html", "html-without-body-tag", "html-without-content-start", "text"],
+)
+def test_large_page_on_a_slow_link_still_returns_its_start(monkeypatch, content_type, body):
+    clock = {"time": 1000.0}
+    monkeypatch.setattr(tools.time, "monotonic", lambda: clock["time"])
+    resp = _FakeResp(body, content_type)
+    read = resp.read
+
+    def slow_read(n = None):
+        chunk = read(n)
+        clock["time"] += len(chunk) / (64 * 1024)
+        return chunk
+
+    resp.read = slow_read
+    monkeypatch.setattr(
+        tools, "_validate_and_resolve_host", lambda host, port: (True, "", ["93.184.216.34"])
+    )
+    monkeypatch.setattr(tools.urllib.request, "build_opener", lambda *a, **k: _FakeOpener(resp))
+    out = tools._fetch_page_text("https://example.com/thing", timeout = 30)
+    assert "Harbor ferry adds night service" in out
+
+
 def test_content_type_sanitized_in_message(monkeypatch):
-    # Do not echo obs-folded header content into the model response.
     out = _fetch_with(monkeypatch, b"PK\x03\x04" * 500, "application/zip\r\n data: injected")
     assert "\n" not in out and "\r" not in out
     assert "injected" not in out
@@ -426,7 +817,6 @@ def test_binary_char_ratio_boundary(monkeypatch, n_bad, n_total, expect_binary):
 
 
 def test_text_with_a_few_stray_replacement_chars_kept(monkeypatch):
-    # Minor encoding glitches below the floor should not drop a real page.
     body = ("Real article text. " * 200).encode() + b"\xff\xfe\xff"
     out = _fetch_with(monkeypatch, body, "text/html")
     assert "Real article text." in out

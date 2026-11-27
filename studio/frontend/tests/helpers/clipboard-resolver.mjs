@@ -1,14 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
-// bundler-resolver's two rules, plus the two this suite needs:
-//
-//   1. "@tauri-apps/plugin-clipboard-manager" -> a local stub, because the real
-//      package only resolves inside a Tauri webview.
-//   2. A "?bust=N" query on the importer is copied onto every src module it pulls
-//      in. lib/api-base computes `isTauri` once, at module evaluation, so the only
-//      way to exercise both branches in one process is to evaluate the whole
-//      subgraph again under a fresh key.
+// Tauri clipboard stub, and ?bust=N on src imports so module-level isTauri is re-evaluated.
 import { existsSync } from "node:fs";
 import { fileURLToPath, pathToFileURL } from "node:url";
 

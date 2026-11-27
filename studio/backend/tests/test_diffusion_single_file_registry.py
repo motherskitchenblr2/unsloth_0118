@@ -1,12 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
-"""Single-file support Unsloth registers for transformer classes diffusers has not.
-
-Without it, every GGUF load of Qwen-Image-2.1 on a CUDA, ROCm or XPU host died before reading a
-byte with "FromOriginalModelMixin is currently only compatible with ...", because a GPU backend
-routes GGUFs to diffusers and diffusers had no single-file entry for the class.
-"""
+"""Single-file entries diffusers lacks, needed for Qwen-Image-2.1 GGUF loads on GPU backends."""
 
 from __future__ import annotations
 
@@ -29,11 +24,7 @@ def _sfm():
 
 
 def test_the_fused_mlp_splits_gate_first_and_the_prefix_goes():
-    """The one layout difference between an sd.cpp 2.1 file and diffusers, and its order.
-
-    Gate first, proj second is what the upstream bf16 weights say: both halves of the fused tensor
-    are bit-identical to their diffusers tensors that way round, and off by up to 1.08 the other.
-    """
+    """Fused gate_up splits gate first: upstream bf16 weights match diffusers only in that order."""
     gate = torch.arange(0, 6 * 4, dtype = torch.float32).reshape(6, 4)
     proj = -torch.arange(0, 6 * 4, dtype = torch.float32).reshape(6, 4)
     checkpoint = {
@@ -117,13 +108,12 @@ def test_registration_fills_the_gap_and_the_real_call_stops_refusing(monkeypatch
     monkeypatch.setattr(sfm, "SINGLE_FILE_LOADABLE_CLASSES", dict(sfm.SINGLE_FILE_LOADABLE_CLASSES))
     sfm.SINGLE_FILE_LOADABLE_CLASSES.pop(CLASS, None)
 
-    assert studio._register_unregistered_single_file_classes() == (CLASS,)
+    # Other classes of the table (Krea 2, HunyuanImage 2.1) may register alongside it.
+    assert CLASS in studio._register_unregistered_single_file_classes()
     entry = sfm.SINGLE_FILE_LOADABLE_CLASSES[CLASS]
     assert entry["checkpoint_mapping_fn"] is studio._qwen_image_21_checkpoint_to_diffusers
     assert entry["default_subfolder"] == "transformer"
-    # And diffusers' own lookup now resolves the class, which is the check that raised.
     assert sfm._get_single_file_loadable_mapping_class(getattr(diffusers, CLASS)) == CLASS
-    # Idempotent.
     assert studio._register_unregistered_single_file_classes() == ()
 
 
@@ -135,14 +125,12 @@ def test_registration_never_overwrites_diffusers_own_entry(monkeypatch):
     )
     monkeypatch.setattr(diffusers, CLASS, type(CLASS, (), {}), raising = False)
 
-    assert studio._register_unregistered_single_file_classes() == ()
+    assert CLASS not in studio._register_unregistered_single_file_classes()
     assert sfm.SINGLE_FILE_LOADABLE_CLASSES[CLASS] is upstream
 
 
 def test_a_class_this_diffusers_lacks_is_not_registered(monkeypatch):
-    """Not tidiness: diffusers resolves EVERY registry entry with getattr(diffusers, name) on each
-    from_single_file call, so one entry for a missing class would break every other family's
-    single-file load along with it."""
+    """A missing class breaks all loads: diffusers getattr()s every registry entry per call."""
     diffusers, sfm = _sfm()
     monkeypatch.setattr(sfm, "SINGLE_FILE_LOADABLE_CLASSES", dict(sfm.SINGLE_FILE_LOADABLE_CLASSES))
     assert getattr(diffusers, "NotAClassThisDiffusersShips2DModel", None) is None
@@ -157,8 +145,7 @@ def test_a_class_this_diffusers_lacks_is_not_registered(monkeypatch):
 
 
 def test_the_transformer_only_single_file_branch_registers_before_loading():
-    """The call site, not just the helper: registration has to precede both the prefix shim (which
-    wraps whatever entry it finds) and the from_single_file it exists for."""
+    """Call site: register before the prefix shim (it wraps any entry) and from_single_file."""
     import inspect
 
     source = inspect.getsource(studio)
