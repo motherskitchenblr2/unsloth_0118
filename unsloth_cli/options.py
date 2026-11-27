@@ -13,12 +13,10 @@ from pydantic import BaseModel
 
 
 def _python_name_to_cli_flag(name: str) -> str:
-    """Convert python_name to --cli-flag."""
     return "--" + name.replace("_", "-")
 
 
 def _unwrap_optional(annotation: Any) -> Any:
-    """Unwrap Optional[X] to X."""
     origin = get_origin(annotation)
     if origin is not None:
         args = get_args(annotation)
@@ -48,7 +46,6 @@ def _list_element_type(annotation: Any) -> type:
 
 
 def _get_python_type(annotation: Any) -> type:
-    """Get the Python type for annotation."""
     unwrapped = _unwrap_optional(annotation)
     if unwrapped in (str, int, float, bool, Path):
         return unwrapped
@@ -56,10 +53,7 @@ def _get_python_type(annotation: Any) -> type:
 
 
 def _collect_config_fields(config_class: type[BaseModel]) -> list[tuple[str, Any]]:
-    """
-    Flatten config class fields (recursing into nested models) into a list of
-    (name, field_info) tuples. Raises ValueError on duplicate field names.
-    """
+    """Flatten config fields, including nested models; raises ValueError on duplicate names."""
     fields = []
     seen_names: set[str] = set()
 
@@ -80,12 +74,8 @@ def _collect_config_fields(config_class: type[BaseModel]) -> list[tuple[str, Any
 
 
 def add_options_from_config(config_class: type[BaseModel]) -> Callable:
-    """
-    Decorator that adds CLI options for all fields in a Pydantic config model.
-
-    The decorated function should declare a `config_overrides: dict = None` parameter
-    which will receive a dict of all CLI-provided config values.
-    """
+    """Decorator adding CLI options for every config model field; the function should declare a
+    config_overrides: dict = None parameter, which receives all CLI-provided values."""
     fields = _collect_config_fields(config_class)
     field_names = {name for name, _field_info in fields}
 

@@ -12,7 +12,7 @@ What this checks (in order, fail-fast):
   5. A 5-step LoRA train on a tiny model actually runs forward + backward.
 
 Run inside the container:
-    bash docker/run.sh --rocm python /workspace/smoke_test_rocm.py
+    UNSLOTH_WORKSPACE_VOLUME= bash docker/run.sh --rocm python /workspace/smoke_test_rocm.py
 
 Skip step 5 (faster, no model download):
     ... python /workspace/smoke_test_rocm.py --skip-train
@@ -32,8 +32,6 @@ def check_torch() -> None:
     banner("torch ROCm build")
     import torch
 
-    # torch.version.hip is the canonical indicator of a ROCm wheel.
-    # It is None for CUDA builds.
     if torch.version.hip is None:
         sys.exit(
             f"FAIL: this is not a ROCm torch build ({torch.__version__}). "
@@ -52,19 +50,12 @@ def check_torch() -> None:
     for i in range(n):
         name = torch.cuda.get_device_name(i)
         props = torch.cuda.get_device_properties(i)
-        # PyTorch ROCm surfaces the gfx code in gcnArchName (e.g.
-        # "gfx1100:sramecc+"); strip the feature suffix for readability.
+        # gcnArchName looks like "gfx1100:sramecc+"; strip the feature suffix.
         arch = getattr(props, "gcnArchName", "").split(":")[0]
         bf16 = torch.cuda.is_bf16_supported()
         print(f"device {i}    {name}  arch={arch}  bf16={bf16}")
     print()
-    # ROCm does not expose a reliable sm_X.Y compute capability the way NVIDIA
-    # does -- the values from get_device_properties() vary by ROCm version and
-    # don't map cleanly to gfx codes. Which arches the wheels carry is decided
-    # by the ROCm version and index the image was built with (Dockerfile.rocm);
-    # the entrypoint already printed the arch note for this card.
-    # A device the runtime lists but cannot run a kernel on shows up here, not
-    # in device_count().
+    # ROCm capability can't map to gfx, so run a real kernel; listed but unusable devices fail.
     x = torch.ones(64, 64, device = "cuda", dtype = torch.float16)
     y = (x @ x).float().sum().item()
     assert y == 64 * 64 * 64, f"FAIL: fp16 matmul on the GPU returned {y}, expected {64 * 64 * 64}"
@@ -73,9 +64,7 @@ def check_torch() -> None:
 
 def check_imports() -> None:
     banner("dep imports")
-    # unsloth must be imported before transformers/trl/peft so its
-    # monkey-patches land, and before unsloth_zoo so it sees
-    # UNSLOTH_IS_PRESENT. Import order matches the CUDA smoke test.
+    # Import unsloth before transformers/trl/peft and unsloth_zoo, as in the CUDA smoke test.
     import unsloth
 
     print(f"unsloth     {unsloth.__version__}")
@@ -198,8 +187,7 @@ def check_tiny_train() -> None:
 
     changed = sum(int(not torch.equal(a, b.detach())) for a, b in zip(before, trainable))
     assert changed, "FAIL: the optimizer steps left every LoRA weight unchanged"
-    # the same batch five times over at lr 1e-3: the loss has to come down, or the
-    # forward/backward is not computing what it claims
+    # Five steps on one batch must cut the loss (lr 1e-3), else forward/backward is wrong.
     assert (
         losses[-1] < losses[0]
     ), f"FAIL: loss did not decrease over 5 steps on one batch: {losses}"

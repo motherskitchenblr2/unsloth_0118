@@ -52,8 +52,7 @@ def _is_shell_cell(text):
 
 
 def _unquoted(line):
-    """`line` with every quoted stretch blanked, so a marker inside a string literal
-    cannot be read as a command. Length is preserved; only the characters change."""
+    """Blank quoted stretches (length kept) so a marker in a string is not read as a command."""
     out = []
     quote = None
     for ch in line:
@@ -69,11 +68,9 @@ def _unquoted(line):
     return "".join(out)
 
 
-# Shell command separators. A marker right after one of these begins a command; the
-# same words anywhere else on the segment are an argument or an operand.
+# Shell separators: a marker right after one starts a command; elsewhere it is an argument.
 _SEG_RE = re.compile(r"\|\||&&|[;&|(){}`]")
 
-# Words that may stand in front of a command without changing what the command is.
 _CMD_PREFIXES = ("sudo", "env", "time", "nohup", "xargs", "then", "do", "else", "!")
 
 _PY_DASH_M = re.compile(r"^\S*python[0-9.]* -m ")
@@ -187,9 +184,7 @@ def _normalize_install(text):
         body = " ".join(line.split())
         if not body:
             continue
-        # Keep the INDENTATION: the cell is an `if "COLAB_" not in ...:` block, so a
-        # line's indent decides which runtime it runs on. Only the spacing WITHIN a
-        # line churns, and tabs expand so a tab/space rewrite stays cosmetic.
+        # Keep the indentation: it decides which runtime branch a line is in.
         indent = line[: len(line) - len(line.lstrip())]
         lines.append(" " * len(indent.expandtabs(4)) + body)
     return "\n".join(lines)
