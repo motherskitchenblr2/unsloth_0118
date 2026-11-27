@@ -1,34 +1,34 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
-"""Qwen-Image-2.1 denoiser forward with the per-step token layout built once (bit-identical).
-
-Kill switch: ``UNSLOTH_DIFFUSION_Q21_FAST_STEP=0``."""
+"""Qwen-Image-2.1 denoiser forward with per-step token layout built once, bit-identical; kill switch
+UNSLOTH_DIFFUSION_Q21_FAST_STEP=0"""
 
 from __future__ import annotations
 
-import ast
 import functools
-import hashlib
 import inspect
-import io
 import math
 import os
-import textwrap
 import threading
-import tokenize
 import weakref
 from typing import Any, Optional
 
+from .diffusion_autoopt.patches import source_digest
+
 FAST_STEP_ENV = "UNSLOTH_DIFFUSION_Q21_FAST_STEP"
+COMPACT_KV_ENV = "UNSLOTH_DIFFUSION_Q21_COMPACT_KV"
+SHARED_PREFIX_KV_ENV = "UNSLOTH_DIFFUSION_Q21_SHARED_PREFIX_KV"
 
 _MODULE = "diffusers.models.transformers.transformer_qwenimage21"
 _CLASS = "QwenImage21Transformer2DModel"
 
-# Stock diffusers sources the fast forward relies on; any drift keeps the stock forward.
+# Stock diffusers sources the fast forward relies on; any drift falls back to the stock forward.
 _FINGERPRINTS: dict[str, frozenset] = {
     "forward": frozenset({"7c1fd48f75efbe41"}),
-    "build_token_metadata": frozenset({"51818c1674e0d406"}),
+    # 0.41.0; main d42ebf9c builds the same int64 block ids from a Python list instead of a tensor-repeats
+    # repeat_interleave (Neuron lowering), so the ids are equal element for element.
+    "build_token_metadata": frozenset({"51818c1674e0d406", "9282e4c4803957f8"}),
     "rope_forward": frozenset({"f9e064940341e3ee"}),
     "prefix_segments": frozenset({"27729cffc22b0aa5"}),
 }
@@ -44,34 +44,8 @@ def fast_step_disabled() -> bool:
     return (os.environ.get(FAST_STEP_ENV) or "").strip().lower() in ("0", "off", "false", "no")
 
 
-def _digest(fn: Any) -> Optional[str]:
-    """Source text, not ``ast.dump``, whose output changes between Python versions."""
-    try:
-        src = textwrap.dedent(inspect.getsource(inspect.unwrap(fn)))
-        tree = ast.parse(src)
-        comments = [
-            tok.start
-            for tok in tokenize.generate_tokens(io.StringIO(src).readline)
-            if tok.type == tokenize.COMMENT
-        ]
-    except (OSError, TypeError, SyntaxError, ValueError, tokenize.TokenError):
-        return None
-    lines = src.splitlines()
-    for row, col in comments:
-        lines[row - 1] = lines[row - 1][:col]
-    for node in ast.walk(tree):
-        body = getattr(node, "body", None)
-        if (
-            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
-            and body
-            and isinstance(body[0], ast.Expr)
-            and isinstance(getattr(body[0], "value", None), ast.Constant)
-            and isinstance(body[0].value.value, str)
-        ):
-            for row in range(body[0].lineno, body[0].end_lineno + 1):
-                lines[row - 1] = ""
-    text = "\n".join(line.rstrip() for line in lines if line.strip())
-    return hashlib.sha256(text.encode()).hexdigest()[:16]
+# One fingerprint util for every patch module (diffusion_autoopt.patches); kept under this name for importers.
+_digest = source_digest
 
 
 def stock_digests(module: Any) -> dict[str, Optional[str]]:
@@ -111,9 +85,11 @@ class _Layout:
         "target_token_mask",
         "prefix_len",
         "tail_is_image",
+        "tail_all_target",
         "vlm_row",
         "_segments",
         "_vlm_text",
+        "_tails",
         "__weakref__",
     )
 
@@ -132,10 +108,47 @@ def _build_layout(model: Any, mod: Any, img_mask: Any, shapes: list, device: Any
     lay.prefix_len = int((~lay.target_token_mask).sum())
     # Decode steps read rows [prefix_len:] only; all-image tails never need the text projection.
     lay.tail_is_image = bool(lay.image_pad_mask[lay.prefix_len :].all())
+    lay.tail_all_target = bool(lay.target_token_mask[lay.prefix_len :].all())
     lay.vlm_row = img_mask[0].clone()  # the caller may reuse and rewrite its mask
     lay._segments = None
     lay._vlm_text = {}
+    lay._tails = None
     return lay
+
+
+def _prompt_tokens(pipe: Any, prompt: str) -> Optional[int]:
+    template = getattr(pipe, "prompt_template_t2i", None)
+    processor = getattr(pipe, "processor", None)
+    tokenizer = getattr(processor, "tokenizer", None) or getattr(pipe, "tokenizer", None)
+    if not isinstance(template, str) or not callable(tokenizer):
+        return None
+    try:
+        return len(tokenizer(template.format(prompt or " "))["input_ids"])
+    except Exception:  # noqa: BLE001 - unknown tokenizer shape: the caller splits every prompt apart
+        return None
+
+
+def text_length_runs(pipe: Any, chunk: list) -> list:
+    """Split ``(prompt, seed)`` jobs into runs of equal prompt token length (RoPE layout comes from row 0)."""
+    if len(chunk) < 2 or type(getattr(pipe, "transformer", None)).__name__ != _CLASS:
+        return [chunk]
+    if all(prompt == chunk[0][0] for prompt, _ in chunk):
+        return [chunk]
+    lengths: dict = {}
+    runs: list = []
+    previous = object()
+    for job in chunk:
+        prompt = job[0]
+        if prompt not in lengths:
+            lengths[prompt] = _prompt_tokens(pipe, prompt)
+        length = lengths[prompt]
+        # An unknown length matches nothing, not even another unknown one.
+        if runs and length is not None and length == previous:
+            runs[-1].append(job)
+        else:
+            runs.append([job])
+        previous = length
+    return runs
 
 
 def _segments(lay: _Layout, mod: Any) -> list:
@@ -198,6 +211,77 @@ def _layout_for(
     return lay
 
 
+def _eager_fast(model: Any) -> bool:
+    from .diffusion_qwenimage21_eager import active
+    return active(model)
+
+
+def _tails(lay: _Layout) -> tuple:
+    """The decode rows of the RoPE table and modulation mask; one view per layout, so a graph replay can tell by
+    identity that its copy is current."""
+    if lay._tails is None:
+        lay._tails = (lay.rotary_emb[lay.prefix_len :], lay.target_token_mask[lay.prefix_len :])
+    return lay._tails
+
+
+def _cached_core(
+    model: Any,
+    text_dtype: Any,
+    total: int,
+    prefix_len: int,
+    hidden_states: Any,
+    timestep: Any,
+    encoder_hidden_states_mask: Any,
+    text_positions: Any,
+    vlm_text: Any,
+    rotary_emb: Any,
+    modulation_mask: Any,
+    layer_cache: Any,
+    broadcast_modulation: bool = False,
+) -> Any:
+    """One decode step from the prefix KV cache. Reads no host value off the device, so it records as a CUDA graph;
+    the eager step and the graph run this same code. ``layer_cache(i)`` returns block ``i``'s cache entry.
+    ``broadcast_modulation``: every row is a target row, so the sampled-t row is read broadcast."""
+    import torch
+
+    batch_size = hidden_states.shape[0]
+    device = hidden_states.device
+    hidden_states = model.img_in(hidden_states)
+    full = torch.empty((batch_size, total, hidden_states.shape[2]), dtype = text_dtype, device = device)
+    full[:, prefix_len:] = hidden_states[:, hidden_states.shape[1] - (total - prefix_len) :]
+
+    timestep = timestep.to(hidden_states.dtype)
+    timestep = torch.cat([timestep, timestep.new_zeros(1)], dim = 0)
+    temb = model.time_text_embed(timestep, hidden_states)
+    modulation = model.modulation(temb)
+
+    attention_mask = None
+    if encoder_hidden_states_mask is not None:
+        joint_key_valid = torch.ones(batch_size, total, dtype = torch.bool, device = device)
+        joint_key_valid[:, text_positions] = encoder_hidden_states_mask.bool()[:, vlm_text]
+        attention_mask = joint_key_valid[:, None, None, :]
+
+    block_modulation, block_rows = modulation, modulation_mask
+    if broadcast_modulation:
+        block_modulation, block_rows = modulation[:-1], None
+    joint_hidden_states = full[:, prefix_len:]
+    for index_block, block in enumerate(model.transformer_blocks):
+        joint_hidden_states = block(
+            hidden_states = joint_hidden_states,
+            modulation = block_modulation,
+            rotary_emb = rotary_emb,
+            attention_mask = attention_mask,
+            target_token_mask = block_rows,
+            layer_cache = block_layer_cache(block, layer_cache(index_block)),
+            kv_cache_mode = "cached",
+            cache_write_slice = None,
+            segments = None,
+            key_valid = None,
+        )
+    joint_hidden_states = model.norm_out(joint_hidden_states, temb, modulation_mask)
+    return model.proj_out(joint_hidden_states)
+
+
 def _cached_step(
     model: Any,
     lay: _Layout,
@@ -207,49 +291,187 @@ def _cached_step(
     encoder_hidden_states_mask: Any,
     kv_cache: Any,
 ) -> Any:
+    rotary_emb, modulation_mask = _tails(lay)
+    broadcast = lay.tail_all_target and _eager_fast(model)
+    if broadcast:
+        from .diffusion_qwenimage21_eager import STATS
+        STATS["mod_broadcast"] += 1
+    return _cached_core(
+        model,
+        text_dtype,
+        lay.total,
+        lay.prefix_len,
+        hidden_states,
+        timestep,
+        encoder_hidden_states_mask,
+        lay.text_positions,
+        None
+        if encoder_hidden_states_mask is None
+        else _vlm_text(lay, encoder_hidden_states_mask.shape[1]),
+        rotary_emb,
+        modulation_mask,
+        kv_cache.get_layer,
+        broadcast_modulation = broadcast,
+    )
+
+
+# graph_plan makes a decode step all-tensor inputs; step 0 stays eager.
+# K/V, RoPE and index inputs are sticky: copied only when a different tensor is passed.
+
+GRAPH_STICKY = ("text_positions", "vlm_text", "rotary_emb", "modulation_mask", "kv")
+
+# Each graph copies the prefix K/V; large image prefixes run eager to avoid pinning it twice.
+GRAPH_KV_MAX_BYTES = 1 << 30
+
+
+def _graph_step(
+    self,
+    hidden_states,
+    timestep,
+    encoder_hidden_states_mask,
+    text_positions,
+    vlm_text,
+    rotary_emb,
+    modulation_mask,
+    kv,
+    total,
+    prefix_len,
+    text_dtype,
+):
     import torch
 
-    batch_size = hidden_states.shape[0]
-    device = hidden_states.device
-    prefix_len = lay.prefix_len
-    hidden_states = model.img_in(hidden_states)
-    # Keep the stock (batch, total, dim) layout so the blocks see the same strides.
-    full = torch.empty(
-        (batch_size, lay.total, hidden_states.shape[2]), dtype = text_dtype, device = device
+    mod = _module()
+    caches = []
+    for key, value in kv:
+        entry = mod.QwenImage21KVLayerCache()
+        entry.store(key, value)
+        caches.append(entry)
+    output = _cached_core(
+        self,
+        getattr(torch, text_dtype),
+        total,
+        prefix_len,
+        hidden_states,
+        timestep,
+        encoder_hidden_states_mask,
+        text_positions,
+        vlm_text,
+        rotary_emb,
+        modulation_mask,
+        caches.__getitem__,
     )
-    full[:, prefix_len:] = hidden_states[:, hidden_states.shape[1] - (lay.total - prefix_len) :]
+    return (output,)
 
-    timestep = timestep.to(hidden_states.dtype)
-    timestep = torch.cat([timestep, timestep.new_zeros(1)], dim = 0)
-    temb = model.time_text_embed(timestep, hidden_states)
-    modulation = model.modulation(temb)
 
-    attention_mask = None
-    if encoder_hidden_states_mask is not None:
-        joint_key_valid = torch.ones(batch_size, lay.total, dtype = torch.bool, device = device)
-        joint_key_valid[:, lay.text_positions] = encoder_hidden_states_mask.bool()[
-            :, _vlm_text(lay, encoder_hidden_states_mask.shape[1])
-        ]
-        attention_mask = joint_key_valid[:, None, None, :]
+# Under block offload a planned step enters via the hooked forward with GRAPH_STEP_MODE.
+GRAPH_STEP_MODE = "unsloth_graph_step"
 
-    joint_hidden_states = full[:, prefix_len:]
-    rotary_emb = lay.rotary_emb[prefix_len:]
-    modulation_mask = lay.target_token_mask[prefix_len:]
-    for index_block, block in enumerate(model.transformer_blocks):
-        joint_hidden_states = block(
-            hidden_states = joint_hidden_states,
-            modulation = modulation,
-            rotary_emb = rotary_emb,
-            attention_mask = attention_mask,
-            target_token_mask = modulation_mask,
-            layer_cache = kv_cache.get_layer(index_block),
-            kv_cache_mode = "cached",
-            cache_write_slice = None,
-            segments = None,
-            key_valid = None,
-        )
-    joint_hidden_states = model.norm_out(joint_hidden_states, temb, modulation_mask)
-    return model.proj_out(joint_hidden_states)
+
+def placed_step(forward: Any, step: dict) -> Any:
+    return forward(
+        step["hidden_states"],
+        None,
+        step["timestep"],
+        None,
+        None,
+        kv_cache = step,
+        kv_cache_mode = GRAPH_STEP_MODE,
+        return_dict = False,
+    )
+
+
+def _module() -> Any:
+    import importlib
+    return importlib.import_module(_MODULE)
+
+
+def graph_plan(module: Any, args: tuple, kwargs: dict) -> Optional[tuple]:
+    """``(callable, kwargs)`` replaying this decode step from tensors only, or None to run the call eager.
+
+    Never syncs the host on a decode step of a render whose prefill went through the fast forward (the layout is
+    then found by identity). Never raises."""
+    try:
+        return _graph_plan(module, args, kwargs)
+    except Exception:  # noqa: BLE001 - an unplannable call simply runs eager
+        return None
+
+
+def _graph_plan(module: Any, args: tuple, kwargs: dict) -> Optional[tuple]:
+    import torch
+
+    if (
+        args
+        or kwargs.get("kv_cache_mode") != "cached"
+        or kwargs.get("return_dict", True) is not False
+    ):
+        return None
+    kv_cache = kwargs.get("kv_cache")
+    hidden_states = kwargs.get("hidden_states")
+    encoder_hidden_states = kwargs.get("encoder_hidden_states")
+    timestep = kwargs.get("timestep")
+    img_mask = kwargs.get("img_mask")
+    img_shapes = kwargs.get("img_shapes")
+    mask = kwargs.get("encoder_hidden_states_mask")
+    known = {
+        "hidden_states",
+        "encoder_hidden_states",
+        "timestep",
+        "img_shapes",
+        "img_mask",
+        "encoder_hidden_states_mask",
+        "attention_kwargs",
+        "kv_cache",
+        "kv_cache_mode",
+        "return_dict",
+    }
+    # LoRA scale rides in attention_kwargs through the forward's decorator, which the graph step bypasses.
+    if set(kwargs) - known or kwargs.get("attention_kwargs"):
+        return None
+    if kv_cache is None or not torch.is_tensor(hidden_states) or not torch.is_tensor(timestep):
+        return None
+    if (
+        not torch.is_tensor(encoder_hidden_states)
+        or not torch.is_tensor(img_mask)
+        or img_shapes is None
+    ):
+        return None
+    if torch.is_grad_enabled() or fast_step_disabled() or not module.config.causal_condition:
+        return None
+    if not getattr(vars(type(module)).get("forward"), "__unsloth_q21_fast_step__", False):
+        return None
+    mod = _module()
+    lay = _layout_for(module, mod, img_mask, img_shapes, hidden_states.device, reuse_identity = True)
+    _, text_dtype = _text_dtype(module, encoder_hidden_states)
+    if text_dtype is None or not lay.tail_is_image:
+        return None
+    kv = []
+    kv_bytes = 0
+    for index in range(len(module.transformer_blocks)):
+        entry = kv_cache.get_layer(index)
+        key, value = getattr(entry, "k", None), getattr(entry, "v", None)
+        if not torch.is_tensor(key) or not torch.is_tensor(value):
+            return None
+        if _is_shared(key) or _is_shared(value):
+            return None
+        kv_bytes += key.numel() * key.element_size() + value.numel() * value.element_size()
+        kv.append((key, value))
+    if kv_bytes > GRAPH_KV_MAX_BYTES:
+        return None
+    rotary_emb, modulation_mask = _tails(lay)
+    plan = {
+        "hidden_states": hidden_states,
+        "timestep": timestep,
+        "encoder_hidden_states_mask": mask,
+        "text_positions": lay.text_positions if mask is not None else None,
+        "vlm_text": _vlm_text(lay, mask.shape[1]) if mask is not None else None,
+        "rotary_emb": rotary_emb,
+        "modulation_mask": modulation_mask,
+        "kv": tuple(kv),
+        "total": int(lay.total),
+        "prefix_len": int(lay.prefix_len),
+        "text_dtype": str(text_dtype).rsplit(".", 1)[-1],
+    }
+    return _graph_step.__get__(module), plan
 
 
 def _autocast_state(device_type: str) -> tuple:
@@ -293,6 +515,8 @@ def _make_forward(mod: Any, stock: Any) -> Any:
         kv_cache_mode = None,
         return_dict = True,
     ):
+        if kv_cache_mode == GRAPH_STEP_MODE:
+            return _graph_step(self, **kv_cache)
         if torch.is_grad_enabled() or torch.compiler.is_compiling() or fast_step_disabled():
             return stock_inner(
                 self,
@@ -400,8 +624,12 @@ def _make_forward(mod: Any, stock: Any) -> Any:
             cache_write_slice = slice(0, prefix_len) if kv_cache_mode == "extract" else None
             block_key_valid = joint_key_valid
 
+        compact_kv = compact_kv_enabled()
+        share_kv = batch_size > 1 and shared_prefix_kv_enabled()
         for index_block, block in enumerate(self.transformer_blocks):
             layer_cache = kv_cache.get_layer(index_block) if kv_cache is not None else None
+            if layer_cache is not None and kv_cache_mode == "cached":
+                layer_cache = block_layer_cache(block, layer_cache)
             joint_hidden_states = block(
                 hidden_states = joint_hidden_states,
                 modulation = modulation,
@@ -414,6 +642,16 @@ def _make_forward(mod: Any, stock: Any) -> Any:
                 segments = block_segments,
                 key_valid = block_key_valid,
             )
+            if layer_cache is not None and cache_write_slice is not None and compact_kv:
+                _compact_layer_cache(layer_cache)
+            if (
+                layer_cache is not None
+                and cache_write_slice is not None
+                and share_kv
+                and _too_large_to_graph(layer_cache, len(self.transformer_blocks))
+            ):
+                # Per block, so the prefill never holds n copies of every layer at once.
+                share_prefix_rows((layer_cache,))
 
         joint_hidden_states = self.norm_out(joint_hidden_states, temb, modulation_mask)
         output = self.proj_out(joint_hidden_states)
@@ -426,15 +664,176 @@ def _make_forward(mod: Any, stock: Any) -> Any:
     wrapped = lora_scale("attention_kwargs")(forward) if callable(lora_scale) else forward
     wrapped.__unsloth_q21_fast_step__ = True
     wrapped.__unsloth_stock_forward__ = stock
+    # Read by diffusion_capture_safe: decode steps record as CUDA graphs through graph_plan.
+    wrapped.__unsloth_graph_plan__ = graph_plan
+    wrapped.__unsloth_graph_sticky__ = GRAPH_STICKY
+    wrapped.__unsloth_graph_placed__ = placed_step
     return wrapped
+
+
+def compact_kv_enabled() -> bool:
+    return (os.environ.get(COMPACT_KV_ENV) or "").strip().lower() not in ("0", "off", "false", "no")
+
+
+def shared_prefix_kv_enabled() -> bool:
+    return (os.environ.get(SHARED_PREFIX_KV_ENV) or "").strip().lower() not in (
+        "0",
+        "off",
+        "false",
+        "no",
+    )
+
+
+_INT_VIEW = {1: "int8", 2: "int16", 4: "int32", 8: "int64"}
+SHARED_PREFIX_STATS = {"shared": 0, "distinct": 0, "bytes": 0, "densified": 0}
+
+
+def _is_shared(t: Any) -> bool:
+    """A prefix entry ``share_prefix_rows`` stored as one row expanded to n (stock entries never have batch stride 0)."""
+    import torch
+    return torch.is_tensor(t) and t.dim() == 4 and t.shape[0] > 1 and t.stride(0) == 0
+
+
+def _too_large_to_graph(entry: Any, layers: int) -> bool:
+    """Only a prefix ``graph_plan`` refuses (all layers' K/V over GRAPH_KV_MAX_BYTES) is shared, so a shared entry
+    never reaches a CUDA graph key, which keys on strides; smaller prefixes keep the stock layout."""
+    import torch
+
+    k, v = getattr(entry, "k", None), getattr(entry, "v", None)
+    if not torch.is_tensor(k) or not torch.is_tensor(v):
+        return False
+    per_layer = k.numel() * k.element_size() + v.numel() * v.element_size()
+    return per_layer * max(int(layers), 1) > GRAPH_KV_MAX_BYTES
+
+
+def _plain_eager(block: Any) -> bool:
+    """No compiled call, per-block graph or hook wraps the block, so nothing guards on the K/V strides."""
+    return (
+        getattr(block, "_compiled_call_impl", None) is None
+        and "forward" not in vars(block)
+        and getattr(block, "_diffusers_hook", None) is None
+    )
+
+
+def block_layer_cache(block: Any, entry: Any) -> Any:
+    """The cache entry block ``block`` reads on a cached step. A shared entry goes to a compiled or graphed block as a
+    dense copy with the stock layout, so Dynamo guards and graph keys match a distinct-prompt batch of the same shape
+    (no recompile, no new key); the copy lives for this block's call only, so the cache keeps one row per layer. A plain
+    eager block reads the expanded view directly (``torch.cat`` copies it as it copies n rows)."""
+    if entry is None or not (
+        _is_shared(getattr(entry, "k", None)) or _is_shared(getattr(entry, "v", None))
+    ):
+        return entry
+    if _plain_eager(block):
+        return entry
+    import copy
+
+    dense = copy.copy(entry)
+    dense.k = entry.k.contiguous()
+    dense.v = entry.v.contiguous()
+    SHARED_PREFIX_STATS["densified"] += 1
+    return dense
+
+
+def _capturing_on(device: Any) -> bool:
+    """Whether a CUDA graph records on the current stream of ``device``'s card (queried on that card, not the current
+    one). An unanswerable query counts as capturing: the caller then keeps every row."""
+    import torch
+
+    if getattr(device, "type", None) != "cuda":
+        return False
+    try:
+        current = torch.cuda.current_device()
+        index = current if device.index is None else int(device.index)
+        if index == current:
+            return bool(torch.cuda.is_current_stream_capturing())
+        with torch.cuda.device(index):
+            return bool(torch.cuda.is_current_stream_capturing())
+    except Exception:  # noqa: BLE001
+        return True
+
+
+def share_prefix_rows(entries: Any) -> int:
+    """One prompt rendered n times stores n bit-identical copies of the prefix K/V; keep one, expanded back to n.
+
+    Every cached step reads an entry through ``torch.cat``, which copies an expanded view exactly as it copies the n
+    stored rows; compiled or graphed blocks get a dense copy instead (``block_layer_cache``). Rows are compared bitwise
+    (one host sync per entry, prefill only), so -0.0 / +0.0 or NaN payloads keep every copy. Both replacements are
+    built before either is stored, and an out-of-memory error propagates with the entry untouched. ``entries``: layer
+    caches holding ``k`` / ``v``. Returns bytes freed."""
+    import torch
+
+    oom = getattr(torch, "OutOfMemoryError", torch.cuda.OutOfMemoryError)
+    if torch.compiler.is_compiling():
+        return 0
+    if torch.cuda.is_available() and _capturing_on(torch.device("cuda")):
+        return 0
+    freed = 0
+    try:
+        for entry in entries:
+            pair = [getattr(entry, name, None) for name in ("k", "v")]
+            if any(
+                not torch.is_tensor(t)
+                or t.dim() != 4
+                or t.shape[0] < 2
+                or not t.is_contiguous()
+                or t.shape[0] != pair[0].shape[0]
+                or t.element_size() not in _INT_VIEW
+                for t in pair
+            ):
+                continue
+            # The comparison syncs the K/V's own card: skip it while that card records a graph.
+            if any(_capturing_on(t.device) for t in pair):
+                continue
+            try:
+                same = torch.stack(
+                    [
+                        torch.eq(bits[1:], bits[:1]).all()
+                        for bits in (
+                            t.view(getattr(torch, _INT_VIEW[t.element_size()])) for t in pair
+                        )
+                    ]
+                ).all()
+                if not bool(same):
+                    SHARED_PREFIX_STATS["distinct"] += 1
+                    continue
+                shared = [t[:1].clone().expand_as(t) for t in pair]
+            except oom:
+                raise
+            except Exception:  # noqa: BLE001 - a memory saving only: this entry keeps every row
+                continue
+            entry.k, entry.v = shared
+            freed += sum(
+                (t.shape[0] - 1) * (t.numel() // t.shape[0]) * t.element_size() for t in pair
+            )
+            SHARED_PREFIX_STATS["shared"] += 1
+    finally:
+        SHARED_PREFIX_STATS["bytes"] += freed
+    return freed
+
+
+def _compact_layer_cache(layer_cache: Any) -> None:
+    """Copy a prefix K/V entry that is a view of a larger buffer. Under compile Inductor turns the extract step's
+    ``key[:, :prefix].clone()`` into a view of the full text + image K/V, pinning ~2 GiB across 32 blocks at 1 MP for
+    step 0. Bit-identical."""
+    for name in ("k", "v"):
+        tensor = getattr(layer_cache, name, None)
+        try:
+            if (
+                tensor is None
+                or tensor.untyped_storage().nbytes() <= tensor.numel() * tensor.element_size()
+            ):
+                continue
+            setattr(layer_cache, name, tensor.clone())
+        except Exception:  # noqa: BLE001 - a memory saving only; keep the entry as stored
+            continue
 
 
 def install(logger: Any = None) -> bool:
     if fast_step_disabled():
         return False
     try:
-        import importlib
-        mod = importlib.import_module(_MODULE)
+        mod = _module()
     except Exception:  # noqa: BLE001 - diffusers without Qwen-Image 2.1
         return False
     cls = getattr(mod, _CLASS, None)

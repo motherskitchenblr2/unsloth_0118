@@ -1,26 +1,12 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
-"""Build a pre-quantized transformer checkpoint for the Unsloth diffusion fast path.
-
-Quantise a model's dense bf16 DiT transformer ONCE and save the quantized state dict, so
-the backend can load the already-quantized weights at runtime (meta-init +
-load_state_dict(assign=True)) instead of materialising the dense bf16 on the GPU. That
-drops the transformer GPU load peak ~2x and the download ~2x for fp8 (measured on Z-Image:
-12.9 -> 6.3 GB peak, 12 -> 6.28 GB on disk), with bit-identical output -- it is the exact
-same torchao config + min_features filter the runtime path uses, applied ahead of time.
-
-Run on one CUDA (Blackwell / Ada / Hopper) GPU. fp8 works on torch 2.9+; the FP4/MX schemes
-need the newer kernels (see scripts/nvfp4_t211_probe.py).
-
-  python scripts/build_prequant_checkpoint.py \
-      --base Tongyi-MAI/Z-Image-Turbo --family z-image --scheme fp8 \
-      --out outputs/quant_research/prequant_fp8/transformer_fp8.pt [--upload-repo ORG/REPO]
-"""
+"""Quantizes the DiT once so runtime loads it with assign=True, skipping the dense bf16 GPU load peak."""
 
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import time
 from pathlib import Path
@@ -43,12 +29,7 @@ def resolve_build_family(base: str, override: Optional[str] = None) -> Optional[
 def convrot_refusal(
     group: int, rotatable: Sequence[str], not_divisible: Sequence[str]
 ) -> Optional[str]:
-    """Why a ConvRot build must not be quantised and saved, or None when it is fine.
-
-    An empty rotatable set means the group divides no quantized input axis (a group larger than
-    every Linear, say). The build would still stamp the v2 tag and an empty fqn list, which
-    ``rotation_metadata_error`` refuses at load time, so the only thing it produces is a
-    multi-gigabyte artifact nothing can ever open. Refuse before the hours, not after."""
+    """Refuse a ConvRot build with no rotatable Linear before quantising; load would refuse it."""
     if rotatable:
         return None
     return (
@@ -67,6 +48,7 @@ def upload_destination(
     override: Optional[str] = None,
     upload_repo: Optional[str] = None,
     component: str = DEFAULT_COMPONENT,
+    convrot_group: Optional[int] = None,
 ) -> str:
     """The repo-root filename this build should publish under.
 
@@ -88,7 +70,14 @@ def upload_destination(
     dispatches on the extension alone, so a safetensors build published as ``.pt`` is read as a
     pickle and a pickle published as ``.safetensors`` is read from a header it does not have. Either
     way the upload succeeds and the artifact is unopenable, after the hours the quantization took.
+
+    nvfp4 publishes safetensors only: Studio never resolves or opens an nvfp4 pickle.
     """
+    if (scheme or "").strip().lower() == "nvfp4" and not safetensors:
+        raise ValueError(
+            "nvfp4 checkpoints are published as .safetensors only (Studio never reads an nvfp4 "
+            "pickle); write --out as a .safetensors file"
+        )
     if override:
         wanted = ".safetensors" if safetensors else ".pt"
         if not override.lower().endswith(wanted):
@@ -100,8 +89,7 @@ def upload_destination(
             )
         return override
     if component and component != DEFAULT_COMPONENT:
-        # A second denoiser (Wan A14B's transformer_2) resolves ONLY its task-specific row, with no
-        # fallback, so any other name would publish an artifact the loader never asks for.
+        # A second denoiser resolves only its task-specific row, so other names would never be loaded.
         from core.inference.diffusion_families import family_prequant_filename
 
         specific = family_prequant_filename(fam, scheme, task = component)
@@ -124,15 +112,25 @@ def upload_destination(
     if not rotated and not safetensors:
         return prequant_filename(scheme)
     from core.inference.diffusion_families import family_prequant_filename
+    from core.inference.diffusion_transformer_quant import (
+        convrot_prequant_filename,
+        convrot_spec_for_scheme,
+    )
 
-    preferred = family_prequant_filename(fam, scheme)
+    family = getattr(fam, "name", None)
+    rotated_name = convrot_prequant_filename(scheme, family) if rotated else None
+    if rotated_name:
+        spec_group = convrot_spec_for_scheme(scheme, family)[0]
+        # Group 0: no runtime path to match, the file's own metadata carries its group.
+        if spec_group and convrot_group is not None and int(convrot_group) != spec_group:
+            raise ValueError(
+                f"{rotated_name} is reserved for the ConvRot group {spec_group} build that matches "
+                f"the runtime path; a group {convrot_group} build needs --upload-filename."
+            )
+    preferred = rotated_name or family_prequant_filename(fam, scheme)
     why = "a rotated checkpoint" if rotated else "a safetensors checkpoint"
     if not preferred:
-        # A PLAIN safetensors build now has a derived name, and only because
-        # ``derived_prequant_filenames`` asks for ``<Model>-<SCHEME>.safetensors`` FIRST. The
-        # reachability this refusal protects is exactly what that chain supplies, so refusing here
-        # would make every family without a declared entry pass an override it could compute
-        # itself. Rotation keeps needing a declared name: no derived spelling carries the marker.
+        # Plain safetensors builds have a derived name; rotated builds still need a declared one.
         if safetensors and not rotated and upload_repo:
             from core.inference.diffusion_prequant import prequant_repo_filename
             return prequant_repo_filename(upload_repo, scheme, ".safetensors")
@@ -141,12 +139,6 @@ def upload_destination(
             f"{scheme!r}, so {why} has no name the loader would ask for. Add the "
             "entry to the family table, or pass --upload-filename."
         )
-    # Both directions, not just one. The declared name and the container have to agree, and a
-    # family that has moved its entry to a .safetensors artifact makes the REVERSE mismatch the
-    # reachable one: a rotated pickle build then publishes torch.save bytes under a safetensors
-    # name, every loader dispatches on the extension and hands them to safe_open, and the artifact
-    # is unopenable after the hours the quantization took. Same failure as the guarded direction,
-    # so it gets the same refusal.
     wanted = ".safetensors" if safetensors else ".pt"
     if not preferred.lower().endswith(wanted):
         reads_as = "a pickle" if safetensors else "safetensors"
@@ -208,10 +200,19 @@ def main(argv = None) -> int:
         type = int,
         default = 0,
         help = "bake a ConvRot block-Hadamard activation rotation at this group size (a power of "
-        "4; 0 = off). Every quantized Linear whose in_features the group divides has its "
+        "4; 0 = off). A family with an int8 ConvRot spec at this group (Qwen-Image-2.1: "
+        "256) rotates exactly the Linears that spec names, so the artifact matches the opt-in "
+        "runtime path (UNSLOTH_DIFFUSION_INT8_CONVROT=1); otherwise every quantized Linear whose in_features the group divides has its "
         "weight rotated before quantize_ so the quantizer sees a flatter distribution; the "
         "exact fqn list is recorded in the checkpoint and the loader rotates the "
         "activations of that list and nothing else. Writes the v2 format tag.",
+    )
+    p.add_argument(
+        "--nvfp4-weight-quant",
+        default = None,
+        choices = ["max6", "4over6"],
+        help = "nvfp4 block-scale choice: max6 (torchao's) or 4over6 (per 16-block max/6 vs max/4, "
+        "per-tensor scale for an E4M3 top of 256). Default: UNSLOTH_NVFP4_WEIGHT_QUANT, else 4over6.",
     )
     p.add_argument(
         "--upload-repo", default = None, help = "optional HF repo id to upload the checkpoint to"
@@ -225,6 +226,18 @@ def main(argv = None) -> int:
         "otherwise",
     )
     args = p.parse_args(argv)
+    if (args.scheme or "").strip().lower() == "nvfp4" and not str(args.out).lower().endswith(
+        ".safetensors"
+    ):
+        print(
+            "error: --scheme nvfp4 writes .safetensors only (Studio never reads an NVFP4 pickle); "
+            "give --out a .safetensors path",
+            flush = True,
+        )
+        return 2
+    if (args.scheme or "").strip().lower() != "nvfp4" and args.nvfp4_weight_quant:
+        print("error: --nvfp4-weight-quant applies to --scheme nvfp4 only", flush = True)
+        return 2
 
     sys.path.insert(0, str(BACKEND))
     import torch
@@ -240,6 +253,8 @@ def main(argv = None) -> int:
         TQ_SCHEMES,
         _make_quant_config,
         _resolve_fast_accum,
+        convrot_fqns,
+        convrot_spec_for_scheme,
         make_filter_fn,
     )
     from torchao.quantization import quantize_
@@ -253,19 +268,14 @@ def main(argv = None) -> int:
     if fam is None:
         print(f"error: unknown family '{args.family}'", flush = True)
         return 2
-    # What the artifact RECORDS as its base, which is not always what this build READ. Weights staged into a local
-    # directory keep that directory's name, and the loader's ``_same_base_model`` compares final path segments: a
-    # checkpoint built from ./temp/qwen_image_21 records a base whose tail is "qwen_image_21", the load asks for
-    # "Qwen/Qwen-Image-2.1", the tails differ and a perfectly good artifact is refused after the dense shards were
-    # already dropped. Pinned to the FAMILY's own base_repo rather than taken on trust, so the override can only ever
-    # name the model this family is for, and cannot relabel one checkpoint as another.
+    convrot_group = int(args.convrot_groupsize)
+    spec_group, spec_suffixes = convrot_spec_for_scheme(scheme, fam.name)
+    convrot_suffixes: tuple = spec_suffixes if convrot_group and convrot_group == spec_group else ()
+    # The recorded base may differ from the one read: a local staging dir name would fail the
+    # loader's _same_base_model tail comparison, so --base-model-id (pinned to base_repo) overrides it.
     recorded_base = args.base_model_id or args.base
     if args.base_model_id:
-        # EXACT, not the loader's ``_same_base_model``. That helper compares final path segments on
-        # purpose, so a checkpoint built from ./temp/qwen_image_21 still matches Qwen/Qwen-Image-2.1;
-        # borrowing it here would also accept ``other/Qwen-Image-2.1``, record the artifact under that
-        # namespace, and have the loader's equally tolerant comparison wave it through as the official
-        # base. What gets WRITTEN into a published file has to be the canonical id itself.
+        # Exact match, not _same_base_model, so a published file always records the canonical id.
         if recorded_base.strip() != fam.base_repo:
             print(
                 f"error: --base-model-id {recorded_base!r} is not {fam.name}'s base "
@@ -274,8 +284,6 @@ def main(argv = None) -> int:
             )
             return 2
     transformer_cls = getattr(diffusers, fam.transformer_class)
-    # The CONTAINER is chosen by the --out extension, so one flag picks the on-disk format, the reachable upload name
-    # and the writer, and they cannot be set to disagree.
     is_safetensors_out = str(args.out).lower().endswith(".safetensors")
     if is_safetensors_out:
         from core.inference.prequant_safetensors import (
@@ -291,10 +299,8 @@ def main(argv = None) -> int:
                 flush = True,
             )
             return 2
-        # The helpers importing is not the same question as this scheme producing something they can
-        # flatten, and for int8 the two disagree through torchao 0.17. Probed here, on one tiny CPU
-        # Linear, so the answer arrives in a second instead of after the download and the hours of
-        # GPU quantization. None means the probe could not run, which is not evidence: proceed.
+        # Importable helpers do not mean this scheme flattens (int8 does not through torchao 0.17).
+        # Probe on a tiny CPU Linear before the long download; None means the probe could not run, so proceed.
         from core.inference.diffusion_transformer_quant import _make_quant_config
 
         if scheme_is_flattenable(_make_quant_config(scheme)) is False:
@@ -306,15 +312,15 @@ def main(argv = None) -> int:
                 flush = True,
             )
             return 2
-    # Resolved BEFORE the load, so a rotated build with nowhere resolvable to publish fails in a second rather than
-    # after the quantise and the multi-gigabyte save.
+    # Resolved before the load so a bad upload target fails fast.
     upload_dest = None
     if args.upload_repo:
         try:
             upload_dest = upload_destination(
                 fam,
                 scheme,
-                rotated = bool(args.convrot_groupsize),
+                rotated = bool(convrot_group),
+                convrot_group = convrot_group,
                 safetensors = is_safetensors_out,
                 override = args.upload_filename,
                 upload_repo = args.upload_repo,
@@ -343,18 +349,19 @@ def main(argv = None) -> int:
         require_divisible = filter_settings["require_divisible"],
     )
 
-    # ConvRot, BEFORE quantize_: rotating the weights is only worth anything if the quantizer then sees the rotated
-    # distribution. The fqn list is recorded, never re-derived at load time.
+    # Rotate before quantize_ so the quantizer sees the rotated distribution.
     rotation: dict = {}
-    if args.convrot_groupsize:
+    if convrot_group:
         from core.inference.diffusion_convrot import (
             rotatable_fqns,
             rotate_linears_,
             rotation_metadata,
         )
 
-        group = int(args.convrot_groupsize)
+        group = int(convrot_group)
         rotatable, not_divisible = rotatable_fqns(transformer, filter_fn, group)
+        if convrot_suffixes:
+            rotatable = convrot_fqns(transformer, filter_fn, group, convrot_suffixes)
         refusal = convrot_refusal(group, rotatable, not_divisible)
         if refusal:
             print(f"error: {refusal}", flush = True)
@@ -368,6 +375,14 @@ def main(argv = None) -> int:
             flush = True,
         )
 
+    weight_quant = None
+    if scheme == "nvfp4":
+        from core.inference.diffusion_nvfp4_weight_quant import WEIGHT_QUANT_ENV, resolve_method
+
+        weight_quant = resolve_method(args.nvfp4_weight_quant)
+        os.environ[WEIGHT_QUANT_ENV] = weight_quant
+        print(f"  nvfp4 weight scales: {weight_quant}", flush = True)
+
     quantize_(transformer, _make_quant_config(scheme), filter_fn = filter_fn)
 
     state_dict = {
@@ -379,7 +394,6 @@ def main(argv = None) -> int:
         "family": fam.name,
         "scheme": scheme,
         "min_features": args.min_features,
-        # Let the loader reject a checkpoint that would not match the runtime path.
         "exclude_name_tokens": list(exclude_name_tokens),
         "require_bf16": require_bf16,
         "require_divisible": filter_settings["require_divisible"],
@@ -387,22 +401,23 @@ def main(argv = None) -> int:
         "torch_dtype": args.dtype,
         "quant_backend": "torchao",
         "transformer_class": fam.transformer_class,
-        # The subfolder built above: the loader refuses it as another denoiser (e.g. transformer_2).
         "component": component,
         "torch_version": torch.__version__,
         "torchao_version": getattr(torchao, "__version__", "?"),
         "diffusers_version": diffusers.__version__,
     }
-    from core.inference.diffusion_prequant import packed_weight_fingerprint
+    if weight_quant is not None:
+        metadata["nvfp4_weight_quant"] = weight_quant
+    from core.inference.diffusion_prequant import canonical_weight_fingerprint
 
-    metadata["fingerprint"] = packed_weight_fingerprint(state_dict)
+    # Version-neutral, so a file built on one torchao generation verifies on every other.
+    metadata["fingerprint"] = canonical_weight_fingerprint(state_dict)
     # fp8 granularity: lets the loader reject a stale per-tensor checkpoint (runtime needs per-row).
     if scheme == TQ_FP8:
         metadata["fp8_granularity"] = FP8_GRANULARITY
     metadata.update(rotation)
     ckpt = {
-        # v2 when a rotation is baked in, so an Unsloth predating the online half refuses the file rather than running
-        # the rotated weights against unrotated activations.
+        # v2 when rotated, so an older Unsloth refuses the file instead of mismatching activations.
         "format": prequant_format_for(metadata),
         "metadata": metadata,
         "state_dict": state_dict,

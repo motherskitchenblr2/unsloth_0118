@@ -5,10 +5,13 @@
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import json
 import logging
+import ntpath
 import os
 from pathlib import Path
+import re
 import shutil
 import site
 import subprocess
@@ -17,6 +20,7 @@ import unicodedata
 import uuid
 
 from . import os_sandbox
+from . import mxc_read_grants
 from . import mxc_runtime
 from .mxc_runtime import MXC_SCHEMA_VERSION
 
@@ -25,6 +29,11 @@ logger = logging.getLogger(__name__)
 MAX_ENVIRONMENT_ENTRIES = 512
 DACL_FALLBACK_ENV = "UNSLOTH_MXC_ALLOW_DACL_FALLBACK"
 _WSL_TERMINAL_MARKERS = ("\\system32\\bash.exe", "\\windowsapps\\bash.exe")
+# CreateProcessW's lpCommandLine bound, in UTF-16 units; cmd itself stops at 8191 characters of payload.
+MAX_COMMAND_LINE = 32767
+_CMD_NAMES = {"cmd", "cmd.exe"}
+_CMD_SWITCHES = {"/d", "/s"}
+_DRIVE_ROOT = re.compile(r"[A-Za-z]:\\\Z")
 
 
 def _studio_ui_policy() -> dict:
@@ -50,8 +59,16 @@ class MxcPolicyError(RuntimeError):
 
 
 def dacl_fallback_enabled() -> bool:
-    """Host opt-in to MXC's AppContainer tier, which temporarily adds ACEs to the granted host paths."""
-    return os.environ.get(DACL_FALLBACK_ENV, "").strip() == "1"
+    """Opt-in to the AppContainer tier (temporarily adds ACEs); always off on MXC 1.1.0, which has none."""
+    if not mxc_runtime.selected_pin().has_host_prep:
+        return False
+    if DACL_FALLBACK_ENV in os.environ:
+        return os.environ[DACL_FALLBACK_ENV].strip() == "1"
+    try:
+        from utils.mxc_isolation_settings import dacl_fallback_setting
+        return dacl_fallback_setting()
+    except Exception:  # noqa: BLE001 - outside the backend (installer, probe child) there is no setting
+        return False
 
 
 def _reject_grants_over_dacl_journal(grants: list[str]) -> None:
@@ -177,8 +194,8 @@ def _scan_workdir(workdir: str, *, required: bool) -> tuple[str, ...]:
         raise MxcPolicyError(str(exc)) from exc
     if required and os_sandbox.WORKDIR_SCAN_INCOMPLETE in limitations:
         raise MxcPolicyError(
-            "the session workdir is too large to check for host channels, and `required` "
-            "cannot promise a boundary it did not verify. Start a new chat, or use `auto`."
+            "the session workdir is too large to check for host channels, "
+            "so this call needs the user's approval. Call the tool again to ask for it."
         )
     return limitations
 
@@ -189,26 +206,38 @@ def _trusted_terminal_path_dirs(plan) -> list[str]:
         return []
     from .tools import _is_trusted_windows_program_dir
 
-    return [
-        entry
-        for entry in (plan.env.get("PATH") or "").split(os.pathsep)
-        if entry and os.path.isabs(entry) and _is_trusted_windows_program_dir(entry)
-    ]
+    result: list[str] = []
+    for entry in (plan.env.get("PATH") or "").split(os.pathsep):
+        if not (entry and os.path.isabs(entry) and _is_trusted_windows_program_dir(entry)):
+            continue
+        if not os.path.isdir(entry):
+            continue
+        # Skipped, not fatal: one third-party link on PATH (Java 8's java8path, #13656) failed every Terminal launch.
+        try:
+            result.append(_safe_canonical_path(entry, directory = True))
+        except MxcPolicyError as exc:
+            logger.info("Not granting a Terminal PATH entry to the MXC profile: %s", exc)
+    return result
 
 
 def _runtime_read_roots(executable: str, extra: list[str] = ()) -> list[str]:
-    # Preserve the lexical executable for launch. Grants may use canonical roots,
-    # but never broaden to the user profile or a drive root.
-    roots = [os.path.dirname(os.path.abspath(executable)), sys.prefix, sys.base_prefix, *extra]
+    # Resolve base_prefix first: uv junction can be retargeted on upgrade. Never broaden grants to the profile or drive root; reject reparse points in inputs
+    base_prefix = os.path.realpath(sys.base_prefix)
+    roots = [os.path.dirname(os.path.abspath(executable)), sys.prefix, base_prefix, *extra]
     roots.extend(site.getsitepackages())
     roots.append(str(Path(__file__).with_name("sandbox_site")))
     system_root = os.environ.get("SystemRoot") or os.environ.get("WINDIR")
     if system_root:
         roots.append(system_root)
     result: list[str] = []
+    seen: set[str] = set()
     for root in roots:
         if not root:
             continue
+        # sys.prefix is also site.getsitepackages()[0] on Windows; other spellings keep their checks.
+        if root in seen:
+            continue
+        seen.add(root)
         if not os.path.isdir(root):
             continue
         canonical = _safe_canonical_path(root, directory = True)
@@ -261,9 +290,77 @@ def _model_read_roots(workdir: str, granted: list[str]) -> list[str]:
     return result
 
 
+def is_cmd_argv(argv) -> bool:
+    """``cmd [/d] [/s] /c <payload>``: the Terminal shape whose payload must reach cmd unescaped."""
+    if len(argv) < 3 or not all(isinstance(part, str) for part in argv):
+        return False
+    if ntpath.basename(argv[0]).casefold() not in _CMD_NAMES or argv[-2].casefold() != "/c":
+        return False
+    switches = [part.casefold() for part in argv[1:-2]]
+    return len(set(switches)) == len(switches) and set(switches) <= _CMD_SWITCHES
+
+
+def cmd_command_line(cmd_path: str, payload: str) -> str:
+    """Quotes for cmd: /s strips only the outer pair, and list2cmdline escapes break paths, so a denied read looks like a command that never ran"""
+    if "\0" in payload:
+        raise MxcPolicyError("the Terminal command contains a NUL character")
+    if "\n" in payload or "\r" in payload:
+        raise MxcPolicyError(
+            "cmd runs only the first line of a multi-line command; send one command per call"
+        )
+    command_line = f'"{cmd_path}" /d /s /c "{payload}"'
+    if len(command_line) > MAX_COMMAND_LINE:
+        raise MxcPolicyError("the Terminal command exceeds the Windows command-line limit")
+    return command_line
+
+
+def host_spawn_args(argv):
+    """What Popen gets for an unisolated launch: a cmd Terminal keeps cmd's own quoting there too."""
+    if not is_cmd_argv(argv):
+        return argv
+    try:
+        return cmd_command_line(_system_cmd(), argv[-1])
+    except MxcPolicyError:
+        return argv  # a multi-line or oversized command keeps today's argv behaviour on the host
+
+
+def _system_cmd() -> str:
+    """System32's cmd.exe. COMSPEC is caller-controlled, so it is never consulted."""
+    try:
+        import ctypes
+
+        buffer = ctypes.create_unicode_buffer(260)
+        size = ctypes.windll.kernel32.GetSystemDirectoryW(buffer, len(buffer))
+        if 0 < size < len(buffer):
+            return os.path.join(buffer.value, "cmd.exe")
+    except (AttributeError, OSError):
+        pass
+    system_root = os.environ.get("SystemRoot") or os.environ.get("WINDIR") or "C:\\Windows"
+    return ntpath.join(system_root, "System32", "cmd.exe")
+
+
+def _checked_cwd_alias(cwd_alias: str, workdir_identity: dict[str, int]) -> str:
+    """A drive letter defined to name the workdir: stock git cannot resolve a nested cwd inside the container."""
+    if not isinstance(cwd_alias, str) or not _DRIVE_ROOT.match(cwd_alias):
+        raise MxcPolicyError(
+            f"the MXC workdir alias must be a drive root such as Z:\\: {cwd_alias!r}"
+        )
+    try:
+        identity = _object_identity(cwd_alias, directory = True)
+    except OSError as exc:
+        raise MxcPolicyError(f"the MXC workdir alias cannot be opened: {cwd_alias}") from exc
+    if identity != workdir_identity:
+        raise MxcPolicyError(
+            f"the MXC workdir alias does not name the session workdir: {cwd_alias}"
+        )
+    return cwd_alias
+
+
 def _selected_runtime(plan) -> str:
     executable = plan.argv[0]
-    if os.path.isabs(executable):
+    if plan.execution_kind == "terminal" and is_cmd_argv(plan.argv):
+        selected = _system_cmd()
+    elif os.path.isabs(executable):
         selected = executable
     elif plan.execution_kind == "terminal":
         selected = shutil.which(executable, path = plan.env.get("PATH"))
@@ -287,7 +384,7 @@ def _selected_runtime(plan) -> str:
 
 
 def canonical_config_bytes(config: dict) -> bytes:
-    """Serialize exactly the deterministic stable-v0.8 request sent to WXC."""
+    """Serialize exactly the deterministic request sent to WXC."""
     return json.dumps(
         config,
         ensure_ascii = False,
@@ -297,7 +394,12 @@ def canonical_config_bytes(config: dict) -> bytes:
 
 
 def compute_policy_hash(config: dict) -> str:
-    return "sha256:" + hashlib.sha256(canonical_config_bytes(config)).hexdigest()
+    return policy_hash_of_bytes(canonical_config_bytes(config))
+
+
+def policy_hash_of_bytes(config_bytes: bytes) -> str:
+    """The policy hash of bytes canonical_config_bytes already produced."""
+    return "sha256:" + hashlib.sha256(config_bytes).hexdigest()
 
 
 def verify_launch_identities(request: dict) -> None:
@@ -306,6 +408,8 @@ def verify_launch_identities(request: dict) -> None:
         raise MxcPolicyError("the selected workload executable changed before WXC dispatch")
     if _object_identity(request["cwd"], directory = True) != request["workdirIdentity"]:
         raise MxcPolicyError("the MXC workdir changed before WXC dispatch")
+    if request.get("cwdAlias") is not None:
+        _checked_cwd_alias(request["cwdAlias"], request["workdirIdentity"])
     _safe_canonical_path(request["cwd"], directory = True)
     _scan_workdir(request["cwd"], required = request["requireCompleteScan"])
 
@@ -318,11 +422,12 @@ def _with_session_packages(env: dict[str, str], workdir: str) -> dict[str, str]:
         # Windows environment names are case-insensitive, and the inherited PATH is often spelled Path.
         return next((k for k in env if k.upper() == name), name)
 
-    env[key("PIP_TARGET")] = packages
+    env[key("PIP_PREFIX")] = packages
+    env[key("PIP_IGNORE_INSTALLED")] = "1"
     env[key("PYTHONNOUSERSITE")] = "1"
     # Appended, so an installed package or script cannot shadow the sandbox shim or a trusted command.
     for name, value in (
-        ("PYTHONPATH", packages),
+        ("PYTHONPATH", os.pathsep.join(os_sandbox.session_package_paths(packages))),
         ("PATH", os.path.join(packages, "Scripts")),
         ("PATH", os.path.join(packages, "bin")),
     ):
@@ -331,7 +436,78 @@ def _with_session_packages(env: dict[str, str], workdir: str) -> dict[str, str]:
     return env
 
 
-def build_launch_request(plan, *, run_id: str | None = None) -> dict:
+def _egress_denied_cidrs() -> list[str]:
+    from .providers import _METADATA_IPS
+    from .sandbox_egress import _LOCAL_NAT64, _NAT64, _THIS_NETWORK
+
+    ipv4 = [_THIS_NETWORK] + [
+        ipaddress.ip_network(cidr) for cidr in ("169.254.0.0/16", "224.0.0.0/4", "240.0.0.0/4")
+    ]
+    ipv4 += [ipaddress.ip_network(ip) for ip in _METADATA_IPS if ip.version == 4]
+    ipv4 = list(ipaddress.collapse_addresses(ipv4))
+    ipv6 = [_LOCAL_NAT64] + [
+        ipaddress.ip_network(cidr) for cidr in ("::/128", "fe80::/10", "ff00::/8")
+    ]
+    ipv6 += [ipaddress.ip_network(ip) for ip in _METADATA_IPS if ip.version == 6]
+    for network in ipv4:
+        address = int(network.network_address)
+        ipv6.append(
+            ipaddress.ip_network((int(_NAT64.network_address) | address, 96 + network.prefixlen))
+        )
+        ipv6.append(
+            ipaddress.ip_network(((0x2002 << 112) | (address << 80), 16 + network.prefixlen))
+        )
+    return [str(network) for network in (*ipv4, *ipaddress.collapse_addresses(ipv6))]
+
+
+def _egress_rules(plan) -> dict:
+    if not getattr(plan, "egress_proxy", False):
+        return {}
+    if not getattr(plan, "egress_rules_probe", False):
+        from . import mxc_probe
+
+        # The fallback tiers refuse a policy with egress rules, and wxc-exec does not report the tier.
+        cancel_event = plan.cancel_event
+        available, _ = mxc_probe.probe(
+            plan.argv[0],
+            execution_kind = "terminal",
+            cancel_event = cancel_event,
+            egress_rules = True,
+        )
+        if cancel_event is not None and cancel_event.is_set():
+            raise MxcPolicyError("execution cancelled during MXC egress qualification")
+        if not available:
+            return {}
+    return {"deny": [{"to": [{"cidr": cidr} for cidr in _egress_denied_cidrs()]}]}
+
+
+def _download_rc_dir() -> str:
+    directory = mxc_runtime._studio_root() / "mxc-runtime" / "download-rc"
+    directory.mkdir(parents = True, exist_ok = True)
+    # MXC filters addresses. curl can restrict redirect schemes, and GNU Wget can only cap the count.
+    files = (
+        (".curlrc", 'proto = "=http,https"\nproto-redir = "=http,https"\n'),
+        ("wgetrc", "netrc = off\nmax_redirect = 0\n"),
+    )
+    for name, text in files:
+        path = directory / name
+        try:
+            current = path.read_text(encoding = "utf-8")
+        except OSError:
+            current = None
+        if current != text:
+            staged = directory / f"{name}.{uuid.uuid4().hex}"
+            staged.write_text(text, encoding = "utf-8")
+            os.replace(staged, path)
+    return _safe_canonical_path(str(directory), directory = True)
+
+
+def build_launch_request(
+    plan,
+    *,
+    run_id: str | None = None,
+    cwd_alias: str | None = None,
+) -> dict:
     if sys.platform != "win32":
         raise MxcPolicyError("MXC policy construction is Windows-only")
     if plan.execution_kind not in {"python", "terminal"}:
@@ -347,16 +523,44 @@ def build_launch_request(plan, *, run_id: str | None = None) -> dict:
     workdir = _safe_canonical_path(plan.workdir, directory = True)
     limitations = _scan_workdir(workdir, required = required)
     selected_runtime = _selected_runtime(plan)
-    readonly = _runtime_read_roots(selected_runtime, _trusted_terminal_path_dirs(plan))
-    readonly = _without_nested(readonly + _model_read_roots(workdir, readonly))
+    runtime_roots = _runtime_read_roots(selected_runtime, _trusted_terminal_path_dirs(plan))
+    readonly = _without_nested(runtime_roots + _model_read_roots(workdir, runtime_roots))
+    egress_rules = _egress_rules(plan)
+    rc_dir = _download_rc_dir() if egress_rules else None
+    if rc_dir:
+        readonly = _without_nested(readonly + [rc_dir])
     _reject_grants_over_dacl_journal([workdir, *readonly])
+    # Tier 3 walks every readonly tree per launch, so a one-time grant skips it. Read fresh: a grant on a stale cached on would outlive another process opt-out
+    mxc_read_grants.refresh_saved_switches()
+    if dacl_fallback_enabled():
+        mxc_read_grants.ensure(runtime_roots)
+    else:
+        mxc_read_grants.revoke_recorded()
     execution_argv = list(plan.argv)
     execution_argv[0] = selected_runtime
+    if plan.execution_kind == "terminal" and is_cmd_argv(plan.argv):
+        command_line = cmd_command_line(selected_runtime, plan.argv[-1])
+    else:
+        command_line = subprocess.list2cmdline(execution_argv)
+    workdir_identity = _object_identity(workdir, directory = True)
+    if cwd_alias is not None:
+        cwd_alias = _checked_cwd_alias(cwd_alias, workdir_identity)
     run_id = run_id or uuid.uuid4().hex
-    workload_env = _with_session_packages(dict(plan.env), workdir)
-    # MXC's Windows ProcessContainer validator requires LOCALAPPDATA to be
-    # present. Point it inside the session instead of exposing the real profile.
+    workload_env = dict(plan.env)
+    # Downloads use the tool binaries on the isolated PATH, with no session-installed executables.
+    if not rc_dir:
+        workload_env = _with_session_packages(workload_env, workdir)
+    # MXC ProcessContainer validator requires LOCALAPPDATA; point it inside the session, not at the real profile
     workload_env.setdefault("LOCALAPPDATA", workdir)
+    if rc_dir:
+        wgetrc = os.path.join(rc_dir, "wgetrc")
+        workload_env.update(
+            CURL_HOME = rc_dir,
+            WGETRC = wgetrc,
+            SYSTEM_WGETRC = wgetrc,
+            # cmd would otherwise run a curl.bat the workload left in the current directory.
+            NoDefaultCurrentDirectoryInExePath = "1",
+        )
     ui_policy = _studio_ui_policy()
     config = {
         "version": MXC_SCHEMA_VERSION,
@@ -364,8 +568,9 @@ def build_launch_request(plan, *, run_id: str | None = None) -> dict:
         "containment": "processcontainer",
         "lifecycle": {"destroyOnExit": True, "preservePolicy": False},
         "process": {
-            "commandLine": subprocess.list2cmdline(execution_argv),
-            "cwd": workdir,
+            "commandLine": command_line,
+            # Grants, scans and identities stay on the canonical workdir; only the workload starts in the alias.
+            "cwd": cwd_alias or workdir,
             "env": [f"{key}={value}" for key, value in sorted(workload_env.items())],
             "timeout": 0
             if plan.timeout_seconds is None
@@ -376,12 +581,10 @@ def build_launch_request(plan, *, run_id: str | None = None) -> dict:
             "readonlyPaths": readonly,
             "deniedPaths": [],
         },
+        # 0.8.0 blocked host loopback too, and "deny" is the only value the DACL tier accepts.
         "network": {
-            "defaultPolicy": "allow",
-            "allowLocalNetwork": True,
-            "allowedHosts": [],
-            "blockedHosts": [],
-            "enforcementMode": "capabilities",
+            "egress": {"default": "allow", **egress_rules},
+            "ingress": {"default": "allow", "hostLoopback": "deny"},
         },
         "processContainer": {
             "leastPrivilege": False,
@@ -391,15 +594,18 @@ def build_launch_request(plan, *, run_id: str | None = None) -> dict:
         "ui": ui_policy["ui"],
         "fallback": {"allowDaclMutation": dacl_fallback_enabled()},
     }
+    config_bytes = canonical_config_bytes(config)
     request = {
         "runtimePath": os.path.realpath(selected_runtime),
         "runtimeIdentity": _object_identity(selected_runtime, directory = False),
         "cwd": workdir,
-        "workdirIdentity": _object_identity(workdir, directory = True),
+        "workdirIdentity": workdir_identity,
+        "cwdAlias": cwd_alias,
         "config": config,
-        "configBytes": canonical_config_bytes(config),
-        "policyHash": compute_policy_hash(config),
+        "configBytes": config_bytes,
+        "policyHash": policy_hash_of_bytes(config_bytes),
         "requireCompleteScan": required,
+        "egressRules": bool(egress_rules),
         "launchLimitations": limitations,
     }
     return request

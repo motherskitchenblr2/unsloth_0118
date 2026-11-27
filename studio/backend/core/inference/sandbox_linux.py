@@ -5,7 +5,11 @@
 
 from __future__ import annotations
 
+import errno
+import fnmatch
+import glob
 import os
+import re
 import shutil
 import stat
 import site
@@ -19,7 +23,7 @@ from functools import lru_cache
 
 from loggers import get_logger
 
-from . import sandbox_landlock, sandbox_seccomp
+from . import sandbox_egress, sandbox_landlock, sandbox_seccomp
 from .os_sandbox import (
     CACHE_SCAN_SECONDS,
     PROFILE_VERSION,
@@ -33,6 +37,8 @@ from .os_sandbox import (
     editable_source_roots,
     scan_workdir_for_host_channels,
     model_library_roots,
+    session_package_paths,
+    session_script_dirs,
     studio_state_roots,
 )
 
@@ -78,47 +84,148 @@ _SYSTEM_ROOTS = (
 )
 
 
+# Pins bubblewrap for packagers and FHS-style launchers; the executable itself is still checked.
+BWRAP_PATH_ENV = "UNSLOTH_BWRAP_PATH"
+
+
+class BwrapUntrustedError(SandboxUnavailableError):
+    """bwrap exists but is refused; `pinned` or `hidden_root` means installing another copy would not help."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        pinned: bool = False,
+        hidden_root: bool = False,
+    ) -> None:
+        super().__init__(message)
+        self.pinned = pinned
+        self.hidden_root = hidden_root
+
+
+def _unmapped_uid() -> int | None:
+    """The overflow uid when a user namespace hides host owners (root shows as it), else None."""
+    try:
+        with open("/proc/self/uid_map", encoding = "utf-8") as f:
+            ranges = [
+                tuple(map(int, line.split())) for line in f.read().splitlines() if line.strip()
+            ]
+        with open("/proc/sys/kernel/overflowuid", encoding = "utf-8") as f:
+            overflow = int(f.read())
+    except (OSError, ValueError):
+        return None
+    # A mapped overflow uid is a real user (rootless containers map 65534), not hidden root.
+    if any(len(r) != 3 or r[0] <= overflow < r[0] + r[2] for r in ranges):
+        return None
+    # Unmapped itself, Studio's own files would show as this uid too.
+    return None if os.geteuid() == overflow else overflow
+
+
+def _executable_refusal(resolved: str, owners: tuple[int, ...]) -> str | None:
+    """Why the file at `resolved` could be modified by someone outside `owners`, or None."""
+    try:
+        executable = os.stat(resolved, follow_symlinks = False)
+    except OSError as exc:
+        return str(exc)
+    if (
+        not stat.S_ISREG(executable.st_mode)
+        or executable.st_uid not in owners
+        or executable.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+        or not os.access(resolved, os.X_OK)
+    ):
+        return "the executable is not root-owned, executable, and non-writable"
+    return None
+
+
+def _has_access_acl(path: str) -> bool:
+    """With an access ACL the group mode bits are its mask, so a named user may be the writer."""
+    try:
+        return "system.posix_acl_access" in os.listxattr(path, follow_symlinks = False)
+    except OSError as exc:
+        if exc.errno in (errno.ENOTSUP, errno.EOPNOTSUPP):
+            return False
+        raise
+
+
+def _ancestor_refusal(resolved: str) -> str | None:
+    """Why a directory above `resolved` would let a non-root user replace it, or None."""
+    parent = os.path.dirname(resolved)
+    in_root_group = 0 in os.getresgid() or 0 in os.getgroups()
+    try:
+        while True:
+            directory = os.stat(parent, follow_symlinks = False)
+            mode = directory.st_mode
+            # Sticky (/nix/store is root:nixbld 1775): other writers cannot rename or delete root's entries.
+            # Group root write alone (/usr 0775 root:root) is safe while Studio is outside group root.
+            if (
+                not stat.S_ISDIR(mode)
+                or directory.st_uid != 0
+                or (
+                    mode & (stat.S_IWGRP | stat.S_IWOTH)
+                    and not mode & stat.S_ISVTX
+                    and (
+                        mode & stat.S_IWOTH
+                        or directory.st_gid != 0
+                        or in_root_group
+                        or _has_access_acl(parent)
+                    )
+                )
+            ):
+                return f"its directory is replaceable: {parent}"
+            ancestor = os.path.dirname(parent)
+            if ancestor == parent:
+                return None
+            parent = ancestor
+    except OSError as exc:
+        return str(exc)
+
+
 def _trusted_bwrap_path() -> str:
     """Resolve bubblewrap to a system-owned executable that the Studio user cannot replace."""
-    candidate = shutil.which("bwrap")
+    pinned = os.environ.get(BWRAP_PATH_ENV, "")
+    if pinned and not os.path.isabs(pinned):
+        raise BwrapUntrustedError(
+            f"{BWRAP_PATH_ENV} must be an absolute path: {pinned}", pinned = True
+        )
+    candidate = pinned or shutil.which("bwrap")
     if candidate is None:
         raise SandboxUnavailableError("bubblewrap (bwrap) is not installed on this host")
     resolved = os.path.realpath(candidate)
-    try:
-        executable = os.stat(resolved, follow_symlinks = False)
-        if (
-            not stat.S_ISREG(executable.st_mode)
-            or executable.st_uid != 0
-            or executable.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
-            or not os.access(resolved, os.X_OK)
-        ):
-            raise OSError("the executable is not root-owned, executable, and non-writable")
-        parent = os.path.dirname(resolved)
-        while True:
-            directory = os.stat(parent, follow_symlinks = False)
-            if (
-                not stat.S_ISDIR(directory.st_mode)
-                or directory.st_uid != 0
-                or directory.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
-            ):
-                raise OSError(f"its directory is replaceable: {parent}")
-            ancestor = os.path.dirname(parent)
-            if ancestor == parent:
-                break
-            parent = ancestor
-    except OSError as exc:
-        raise SandboxUnavailableError(
-            "bubblewrap must come from a trusted system installation; install it with the "
-            f"distribution package manager ({exc})"
-        ) from exc
-    return resolved
+    overflow = _unmapped_uid()
+    vouched = (0,) if overflow is None else (0, overflow)
+    if pinned:
+        # The pin vouches for the path: in an FHS env even / is a tmpfs owned by the Studio user.
+        detail = _executable_refusal(resolved, vouched)
+        if detail is None:
+            return resolved
+        raise BwrapUntrustedError(
+            f"{BWRAP_PATH_ENV} names a bubblewrap Unsloth will not run ({resolved}: {detail})",
+            pinned = True,
+        )
+    detail = _executable_refusal(resolved, (0,)) or _ancestor_refusal(resolved)
+    if detail is None:
+        return resolved
+    if overflow is not None and _executable_refusal(resolved, vouched) is None:
+        raise BwrapUntrustedError(
+            "Unsloth runs in a user namespace (an AppImage or nixpkgs FHS wrapper, Flatpak or a "
+            f"rootless container) where Unsloth cannot confirm that {resolved} is system-owned "
+            f"({detail}). If it is the system bubblewrap, set {BWRAP_PATH_ENV}={candidate}",
+            hidden_root = True,
+        )
+    raise BwrapUntrustedError(
+        "bubblewrap must come from a trusted system installation; install it with the "
+        f"distribution package manager ({resolved}: {detail})"
+    )
 
 
 def bwrap_identity() -> str:
     """Stable identity included in capability-cache keys."""
     path = _trusted_bwrap_path()
     info = os.stat(path, follow_symlinks = False)
-    return repr((path, info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_mode))
+    layout = "emptyproc" if empty_proc_layout(path) else "proc"
+    return repr(
+        (path, info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_mode, layout)
+    )
 
 
 # /etc is fresh in the jail; without these nothing dynamically linked starts.
@@ -130,6 +237,12 @@ _ETC_FILES = (
     "/etc/localtime",
     "/etc/nsswitch.conf",
 )
+# Distro JDKs link their configuration into /etc/java*.
+_ETC_JAVA_GLOB = "/etc/java*"
+# conf/security holds java.security; Fedora's separate lib/security holds default.policy.
+_ETC_JAVA_SECURITY_MARKERS = ("java.security", "default.policy")
+# Files beside security/; exclude management/ and its JMX credentials.
+_ETC_JAVA_FILES = ("*.properties", "*.cfg")
 # Bound only when it passes _trusted_system_file.
 _ETC_FILES_IF_TRUSTED = ("/etc/gitconfig",)
 # PUBLIC halves one by one, never /etc/ssl or /etc/pki whole: both hold private keys.
@@ -147,6 +260,7 @@ _NETWORK_FILES = (
     "/etc/pki/tls/cert.pem",
     "/etc/pki/tls/openssl.cnf",
     "/etc/pki/ca-trust",
+    "/etc/pki/java/cacerts",
     "/etc/ca-certificates",
     "/etc/ca-certificates.conf",
     "/etc/crypto-policies",
@@ -154,10 +268,13 @@ _NETWORK_FILES = (
 )
 # Bound at the jail's own HOME with HF_HOME pinned to match.
 _MODEL_CACHE_RELPATH = os.path.join(".cache", "huggingface")
-# Excludes $HF_HOME/token and executable modules; the writable hub is a deliberate tradeoff (#5603).
-_MODEL_CACHE_SUBDIRS = ("hub", "datasets", "xet", "assets")
+# Excludes $HF_HOME/token and executable modules; the writable hub is a tradeoff (#5603); datasets/
+# is out since Studio mmaps Arrow files and tool-rewritten offsets would be read past them.
+_MODEL_CACHE_SUBDIRS = ("hub", "xet", "assets")
 # NixOS keeps glibc here, so a store interpreter cannot link without it.
 _NIX_STORE = "/nix/store"
+# The NixOS system PATH (and nix-ld's loader) resolve through this link into the store.
+_NIXOS_CURRENT_SYSTEM = "/run/current-system"
 
 
 def _trusted_system_file(path: str) -> bool:
@@ -169,6 +286,36 @@ def _trusted_system_file(path: str) -> bool:
     if not stat.S_ISREG(info.st_mode):
         return False
     return info.st_uid == 0 and not info.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+
+
+def _etc_java_binds() -> tuple[str, ...]:
+    """Select JDK security directories and adjacent configuration files."""
+    binds: list[str] = []
+    for top in sorted(glob.glob(_ETC_JAVA_GLOB)):
+        if os.path.islink(top):
+            continue  # os.walk follows top-level symlinks even with followlinks=False.
+        for root, dirs, files in os.walk(top):
+            dirs.sort()
+            security = os.path.join(root, "security")
+            # The glob also matches non-JDK trees.
+            markers = (os.path.join(security, name) for name in _ETC_JAVA_SECURITY_MARKERS)
+            if (
+                "security" in dirs
+                and not os.path.islink(security)
+                and any(os.path.isfile(m) and not os.path.islink(m) for m in markers)
+            ):
+                dirs.remove("security")
+                binds.append(security)
+                binds.extend(
+                    os.path.join(root, name)
+                    for name in sorted(files)
+                    if any(fnmatch.fnmatch(name, pattern) for pattern in _ETC_JAVA_FILES)
+                    and stat.S_ISREG(os.lstat(os.path.join(root, name)).st_mode)
+                )
+            # Fedora's conf/ is three levels down.
+            if os.path.relpath(root, top).count(os.sep) >= 3:
+                dirs[:] = []
+    return tuple(binds)
 
 
 def _within(path: str, root: str) -> bool:
@@ -241,7 +388,7 @@ def _without_studio_state(roots: tuple[str, ...], depth: int = 4) -> tuple[str, 
         if depth <= 0:
             # Fails CLOSED: restoring an ancestor of the state directory would hand over auth/auth.db.
             logger.warning(
-                "Not binding %s read-only: Studio's own state is nested too "
+                "Not binding %s read-only: Unsloth's own state is nested too "
                 "deeply inside it to exclude",
                 root,
             )
@@ -293,13 +440,175 @@ def _bwrap_long_options(identity: tuple[str, int, int]) -> frozenset[str]:
     )
 
 
-def _bwrap_supports(bwrap: str, option: str) -> bool:
+def _bwrap_file_identity(bwrap: str) -> tuple[str, int, int]:
     try:
         info = os.stat(bwrap)
-        identity = (bwrap, info.st_ino, info.st_mtime_ns)
+        return (bwrap, info.st_ino, info.st_mtime_ns)
     except OSError:
-        identity = (bwrap, 0, 0)
-    return option in _bwrap_long_options(identity)
+        return (bwrap, 0, 0)
+
+
+def _bwrap_supports(bwrap: str, option: str) -> bool:
+    return option in _bwrap_long_options(_bwrap_file_identity(bwrap))
+
+
+# A container masking parts of its own /proc (Docker, Colab) refuses a fresh one in a child namespace.
+# bwrap <= 0.11 says "on /newroot/proc", 0.12 says "on /proc" (openai/codex#44329).
+_PROC_MOUNT_REFUSED = re.compile(
+    r"Can't mount proc on (?:/newroot)?/proc: "
+    r"(?:Permission denied|Operation not permitted|Invalid argument)"
+)
+
+
+def proc_mount_refused(stderr: str) -> bool:
+    return bool(_PROC_MOUNT_REFUSED.search(stderr or ""))
+
+
+def _system_true() -> str | None:
+    """The host's `true`, resolved: in the store on NixOS and in FHS envs built from it."""
+    found = next(
+        (
+            p
+            for p in ("/usr/bin/true", "/bin/true", f"{_NIXOS_CURRENT_SYSTEM}/sw/bin/true")
+            if os.path.isfile(p)
+        ),
+        None,
+    )
+    return None if found is None else os.path.realpath(found)
+
+
+def _nixos_current_system() -> str | None:
+    """Where /run/current-system points, when it is a NixOS link into the store."""
+    try:
+        target = os.readlink(_NIXOS_CURRENT_SYSTEM)
+    except OSError:
+        return None
+    return target if _within(target, _NIX_STORE) else None
+
+
+def _preflight(bwrap: str, proc: tuple[str, ...]) -> "subprocess.CompletedProcess | None":
+    """The launch's namespaces, /proc and system binds in its order, running only `true`."""
+    # NixOS has no FHS `true`: run the store file itself, with the store bound as launches bind it.
+    true = _system_true()
+    if true is None:
+        return None
+    argv = [bwrap, "--unshare-user", "--unshare-pid", *proc, "--dev", "/dev"]
+    roots = _SYSTEM_ROOTS + ((_NIX_STORE,) if _within(true, _NIX_STORE) else ())
+    for root in roots:
+        if os.path.isdir(root):
+            argv += ["--ro-bind-try", root, root]
+    try:
+        return subprocess.run(
+            [*argv, "--", true],
+            stdin = subprocess.DEVNULL,
+            stdout = subprocess.DEVNULL,
+            stderr = subprocess.PIPE,
+            # The detector matches English strerror text.
+            env = {**os.environ, "LC_ALL": "C", "LANG": "C", "LANGUAGE": ""},
+            text = True,
+            encoding = "utf-8",
+            errors = "replace",
+            timeout = 10,
+            close_fds = True,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+class _PreflightInconclusive(Exception):
+    """The preflight could not run or failed before /proc: not cached, retried after a back-off."""
+
+
+# A wedged bwrap times out at 10 s a run: retry it this often, not on every identity read.
+_INCONCLUSIVE_RETRY_SECONDS = 300.0
+_inconclusive_until: "dict[tuple[str, int, int], float]" = {}
+
+
+@lru_cache(maxsize = 8)
+def _fresh_proc_answer(identity: tuple[str, int, int]) -> bool:
+    fresh = _preflight(identity[0], ("--proc", "/proc"))
+    if fresh is None:
+        raise _PreflightInconclusive
+    if fresh.returncode == 0:
+        return False
+    if not proc_mount_refused(fresh.stderr):
+        # bwrap failed before /proc (e.g. a uid map AppArmor still denies): the layout is unknown until that is fixed.
+        raise _PreflightInconclusive
+    without = _preflight(identity[0], ())
+    if without is None:
+        raise _PreflightInconclusive
+    return without.returncode == 0
+
+
+def _fresh_proc_refused(identity: tuple[str, int, int]) -> bool:
+    """Only the /proc mount fails while the rest of bwrap works; any other failure is the probe's to report."""
+    if time.monotonic() < _inconclusive_until.get(identity, 0.0):
+        return False
+    try:
+        return _fresh_proc_answer(identity)
+    except _PreflightInconclusive:
+        _inconclusive_until[identity] = time.monotonic() + _INCONCLUSIVE_RETRY_SECONDS
+        return False
+
+
+def empty_proc_layout(bwrap: str | None = None) -> bool:
+    """Whether launches mount an empty private /proc instead of a fresh procfs. Never the host's: it lists every cmdline."""
+    try:
+        path = bwrap or _trusted_bwrap_path()
+    except SandboxUnavailableError:
+        return False
+    return _fresh_proc_refused(_bwrap_file_identity(path))
+
+
+def forget_proc_layout() -> None:
+    _fresh_proc_answer.cache_clear()
+    _inconclusive_until.clear()
+    _private_network_answers.clear()
+
+
+_EGRESS_INNER = "/run/unsloth-egress"
+_EGRESS_PORT = 3128
+_private_network_answers: "dict[tuple, bool]" = {}
+
+
+def _private_network_works(bwrap: str, empty_proc: bool) -> bool:
+    key = (_bwrap_file_identity(bwrap), empty_proc)
+    if key not in _private_network_answers:
+        if not _bwrap_supports(bwrap, "--unshare-net"):
+            return False
+        proc = ("--tmpfs", "/proc") if empty_proc else ("--proc", "/proc")
+        done = _preflight(bwrap, ("--unshare-net", *proc))
+        if done is None:
+            return False
+        _private_network_answers[key] = done.returncode == 0
+    return _private_network_answers[key]
+
+
+def _start_egress(bwrap: str, empty_proc: bool) -> "tuple[str, sandbox_egress.EgressProxy] | None":
+    """None leaves the launch unproxied, which tools.py refuses for the calls that asked."""
+    if not _private_network_works(bwrap, empty_proc):
+        return None
+    # /tmp keeps the socket path under the AF_UNIX length limit.
+    directory = tempfile.mkdtemp(prefix = "us-egress-", dir = "/tmp" if os.path.isdir("/tmp") else None)
+    try:
+        shutil.copyfile(sandbox_egress.RELAY_SCRIPT, os.path.join(directory, "relay.py"))
+        sandbox_egress.write_empty_rc_files(directory)
+        return directory, sandbox_egress.EgressProxy(os.path.join(directory, "proxy.sock"))
+    except Exception:
+        logger.warning("Could not start the sandbox egress proxy", exc_info = True)
+        shutil.rmtree(directory, ignore_errors = True)
+        return None
+
+
+def profile_id() -> str:
+    return f"{PROFILE_ID}-emptyproc" if empty_proc_layout() else PROFILE_ID
+
+
+def limitations() -> tuple[str, ...]:
+    # /dev/fd and /dev/std{in,out,err} link into /proc/self/fd, so they dangle too (no `<(...)`).
+    if empty_proc_layout():
+        return (*LIMITATIONS, "no_process_filesystem", "no_dev_fd_links")
+    return LIMITATIONS
 
 
 def _host_mount_points() -> tuple[str, ...]:
@@ -344,7 +653,7 @@ def _runtime_paths_under(workdir: str) -> tuple[str, ...]:
             if candidate is sys.executable:
                 # Refuse: protecting this alias would expose its external target.
                 raise WorkdirUnsafeError(
-                    f"the session workdir holds a link to the Python that runs Studio: {written}"
+                    f"the session workdir holds a link to the Python that runs Unsloth: {written}"
                 )
             continue
         for path in (written, resolved):
@@ -403,7 +712,8 @@ def _runtime_read_paths(
         candidates.extend(os.path.join(prefix, "lib", multiarch) for prefix in prefixes)
 
     selected: list[str] = []
-    for candidate in candidates:
+    # sys.prefix == sys.exec_prefix in most venvs.
+    for candidate in dict.fromkeys(candidates):
         if not candidate or not os.path.isabs(candidate):
             continue
         # Check the candidate as WRITTEN, against both workdir spellings, or a symlinked venv/lib exposes its target.
@@ -423,14 +733,20 @@ def _runtime_read_paths(
     return tuple(selected)
 
 
-def _identity_files() -> tuple[str, str, str]:
+def _identity_files(home: str) -> tuple[str, str, str]:
     """Synthesise one-entry passwd and group so getpwuid() works without the host database."""
     directory = tempfile.mkdtemp(prefix = "unsloth-sandbox-identity-")
     uid, gid = os.getuid(), os.getgid()
+    # Reject passwd field and record separators.
+    if ":" in home or "\n" in home:
+        home = "/nonexistent"
     passwd, group = os.path.join(directory, "passwd"), os.path.join(directory, "group")
     try:
-        with open(passwd, "w", encoding = "utf-8") as stream:
-            stream.write(f"studio:x:{uid}:{gid}:Studio sandbox:/nonexistent:/bin/sh\n")
+        # Bytes: the workdir may hold non-UTF-8 filename bytes.
+        with open(passwd, "wb") as stream:
+            stream.write(
+                b"studio:x:%d:%d:Studio sandbox:%b:/bin/sh\n" % (uid, gid, os.fsencode(home))
+            )
         with open(group, "w", encoding = "utf-8") as stream:
             stream.write(f"studio:x:{gid}:\n")
         os.chmod(passwd, 0o600)
@@ -452,13 +768,13 @@ def _tmpdir(plan: ToolLaunchPlan, workdir: str) -> str:
 def _pythonpath(plan: ToolLaunchPlan, packages: str) -> str:
     """Appended, never prepended: a package must not shadow tools.py's sandbox_site shim."""
     inherited = plan.env.get("PYTHONPATH") or ""
-    return os.pathsep.join(part for part in (inherited, packages) if part)
+    return os.pathsep.join(part for part in (inherited, *session_package_paths(packages)) if part)
 
 
 def _path(plan: ToolLaunchPlan, packages: str) -> str:
     """Caller's PATH plus the writable package ``bin`` LAST, so a planted binary cannot shadow a safe command."""
     inherited = plan.env.get("PATH") or ""
-    return os.pathsep.join(part for part in (inherited, os.path.join(packages, "bin")) if part)
+    return os.pathsep.join(part for part in (inherited, *session_script_dirs(packages)) if part)
 
 
 # Bounded wait on a thread: NFS/FUSE can block isdir/scandir; an uninspected cache is not shared.
@@ -479,8 +795,11 @@ def _inspect_cache_component(
     return cache_share_hazard(path, witness)
 
 
-# Retain timed-out workers until they finish, preventing a thread leak on a wedged path.
-_cache_scan_pending: "dict[str, threading.Thread]" = {}
+CACHE_MISSING = "does not exist"
+CACHE_STILL_CHECKING = "is still being checked; it will be shared once the check finishes"
+
+# Kept until finished to avoid thread leaks; later launches join one only until give-up.
+_cache_scan_pending: "dict[str, tuple[threading.Thread, list, float]]" = {}
 # Request threads must reserve and remove workers atomically.
 _cache_scan_lock = threading.Lock()
 
@@ -516,25 +835,34 @@ def _cache_hazard_within_deadline(name: str, path: str) -> "str | None":
 
     with _cache_scan_lock:
         pending = _cache_scan_pending.get(path)
-        if pending is not None:
-            if pending.is_alive():
-                return "was still being inspected when a previous launch gave up (a wedged mount?)"
+        if pending is not None and not pending[0].is_alive():
             del _cache_scan_pending[path]
-        worker = threading.Thread(target = check, name = f"unsloth-cache-scan-{name}", daemon = True)
-        # Start under the lock, or another caller can replace the not-yet-alive worker.
-        _cache_scan_pending[path] = worker
-        worker.start()
-    worker.join(_CACHE_INSPECT_SECONDS)
+            pending = None
+        if pending is None:
+            worker = threading.Thread(target = check, name = f"unsloth-cache-scan-{name}", daemon = True)
+            # Start under the lock, or another caller can replace the not-yet-alive worker.
+            give_up = time.monotonic() + 2 * _CACHE_INSPECT_SECONDS
+            pending = _cache_scan_pending[path] = (worker, answer, give_up)
+            worker.start()
+    worker, answer, give_up = pending
+    worker.join(max(0.0, min(_CACHE_INSPECT_SECONDS, give_up - time.monotonic())))
     if not answer:
-        return f"could not be inspected within {_CACHE_INSPECT_SECONDS:.0f}s (a wedged mount?)"
+        return CACHE_STILL_CHECKING
     with _cache_scan_lock:
         # By identity: another caller may already have replaced it.
-        if _cache_scan_pending.get(path) is worker:
+        if _cache_scan_pending.get(path) is pending:
             del _cache_scan_pending[path]
     return answer[0]
 
 
 def _cache_hazard_memoized(name: str, path: str) -> "str | None":
+    if not os.path.lexists(path):
+        # A fresh HF home has no assets/ yet; create it so the sandbox shares it too.
+        try:
+            os.makedirs(path, exist_ok = True)
+        except OSError as exc:
+            logger.debug("could not create the %s cache at %s: %s", name, path, exc)
+            return CACHE_MISSING
     signature = _cache_component_signature(path)
     now = time.monotonic()
     with _cache_scan_lock:
@@ -556,15 +884,35 @@ def _cache_hazard_memoized(name: str, path: str) -> "str | None":
     return verdict
 
 
+_CACHE_WARNING_SECONDS = 60.0
+_cache_warned: "dict[tuple[str, str], float]" = {}
+
+
+def _warn_not_shared(name: str, hazard: str) -> None:
+    now = time.monotonic()
+    with _cache_scan_lock:
+        last = _cache_warned.get((name, hazard))
+        if last is not None and now - last < _CACHE_WARNING_SECONDS:
+            return
+        _cache_warned[(name, hazard)] = now
+    logger.warning("Not sharing the %s cache into the sandbox: it %s", name, hazard)
+
+
 def _model_cache_binds(workdir: str) -> dict[str, str]:
     """Inner cache subdirectory -> host directory, per component (HF_HUB_CACHE=/mnt/models is NOT /mnt/models/hub)."""
     binds: dict[str, str] = {}
     try:
-        from utils.hf_cache_settings import get_hf_cache_paths
+        from utils.hf_cache_settings import effective_cache_home, get_hf_cache_paths
 
         paths = get_hf_cache_paths()
-        home = os.path.abspath(str(paths.cache_home))
-        resolved = {"hub": str(paths.hub_cache), "xet": str(paths.xet_cache)}
+        # assets lives under the real HF home, not the display home (which can be the hub itself).
+        home = os.path.abspath(str(effective_cache_home()))
+        resolved = {
+            "hub": str(paths.hub_cache),
+            "xet": str(paths.xet_cache),
+            # Portable installs point this at their own root while HF_HOME stays the default.
+            "assets": os.path.expanduser(os.environ.get("HF_ASSETS_CACHE", "").strip()),
+        }
     except Exception:  # noqa: BLE001 - a launch never fails over a cache lookup
         logger.debug("could not resolve the configured Hugging Face cache", exc_info = True)
         user_home = os.path.expanduser("~")
@@ -589,14 +937,16 @@ def _model_cache_binds(workdir: str) -> dict[str, str]:
         if _holds_studio_state(path):
             logger.warning(
                 "Not sharing the %s cache into the sandbox: it is at or above "
-                "Studio's own state directory",
+                "Unsloth's own state directory",
                 name,
             )
             continue
         # Writable caches need the workdir's host-channel checks, including nested bind mounts.
         hazard = _cache_hazard_within_deadline(name, path)
+        if hazard == CACHE_MISSING:
+            continue
         if hazard is not None:
-            logger.warning("Not sharing the %s cache into the sandbox: it %s", name, hazard)
+            _warn_not_shared(name, hazard)
             continue
         binds[name] = path
     return binds
@@ -645,9 +995,18 @@ def prepare(plan: ToolLaunchPlan) -> PreparedSandboxLaunch:
     system_roots = _without_studio_state(
         tuple(path for path in _SYSTEM_ROOTS if os.path.isdir(path))
     )
-    if os.path.isdir(_NIX_STORE) and _within(os.path.realpath(sys.executable), _NIX_STORE):
+    # FHS envs (the AppImage and nixpkgs wrappers) link their system files into the store too.
+    current_system = None
+    if os.path.isdir(_NIX_STORE) and any(
+        path is not None and _within(path, _NIX_STORE)
+        for path in (os.path.realpath(sys.executable), _system_true())
+    ):
         system_roots += (_NIX_STORE,)
+        current_system = _nixos_current_system()
     runtime_paths = _without_state_inside(_runtime_read_paths(workdir, system_roots, inner))
+    if current_system:
+        # Reached through the link below; binding them would make /run/current-system a directory.
+        runtime_paths = tuple(p for p in runtime_paths if not _within(p, _NIXOS_CURRENT_SYSTEM))
     silent_roots = tuple(
         root
         for root in model_library_roots()
@@ -658,17 +1017,23 @@ def prepare(plan: ToolLaunchPlan) -> PreparedSandboxLaunch:
     tmp_runtime_paths = tuple(path for path in runtime_paths if _within(path, "/tmp"))
     workdir_runtime_paths = _runtime_paths_under(workdir)
 
-    disable_userns = _bwrap_supports(bwrap, "--disable-userns")
+    # --disable-userns writes /proc/sys/user/max_user_namespaces inside, which an empty /proc lacks:
+    # there the seccomp filter refuses nested user namespaces instead, as on bwrap 0.6.1.
+    # One read per launch: a reset between two reads could mix --disable-userns with an empty /proc.
+    empty_proc = empty_proc_layout(bwrap)
+    disable_userns = not empty_proc and _bwrap_supports(bwrap, "--disable-userns")
     try:
         seccomp = sandbox_seccomp.filter_file(block_userns = not disable_userns)
     except RuntimeError as exc:
         raise SandboxUnavailableError(str(exc)) from exc
     try:
-        identity_dir, passwd, group = _identity_files()
+        identity_dir, passwd, group = _identity_files(inner)
     except Exception:
         seccomp.close()
         raise
+    egress = None
     try:
+        egress = _start_egress(bwrap, empty_proc) if plan.egress_proxy else None
         argv: list[str] = [
             bwrap,
             "--die-with-parent",
@@ -679,14 +1044,20 @@ def prepare(plan: ToolLaunchPlan) -> PreparedSandboxLaunch:
             "--unshare-ipc",
             "--unshare-uts",
             "--unshare-cgroup",
+            # Proxied calls get loopback only: the relay below is their one way out.
+            *(("--unshare-net",) if egress else ()),
             # bwrap 0.6.1 lacks this; the seccomp filter refuses nested user namespaces there.
             *(("--disable-userns",) if disable_userns else ()),
             "--cap-drop",
             "ALL",
             "--seccomp",
             str(seccomp.fileno()),
-            "--proc",
-            "/proc",
+            # A root-run Studio leaves the tool at uid 0: host sysctls stay read-only. The empty layout keeps /proc empty.
+            *(
+                ("--tmpfs", "/proc")
+                if empty_proc
+                else ("--proc", "/proc", "--ro-bind-try", "/proc/sys", "/proc/sys")
+            ),
             "--dev",
             "/dev",
             "--dir",
@@ -699,23 +1070,34 @@ def prepare(plan: ToolLaunchPlan) -> PreparedSandboxLaunch:
         for root in system_roots:
             argv += ["--ro-bind-try", root, root]
         # -try: a missing model folder must not fail the launch.
+        # A root under /tmp or /dev/shm is bound after their tmpfs, which would otherwise hide it.
+        tmp_silent_roots = tuple(
+            root for root in silent_roots if _within(root, "/tmp") or _within(root, "/dev/shm")
+        )
         for root in silent_roots:
-            argv += ["--ro-bind-try", root, root]
+            if root not in tmp_silent_roots:
+                argv += ["--ro-bind-try", root, root]
         trusted = tuple(p for p in _ETC_FILES_IF_TRUSTED if _trusted_system_file(p))
-        for path in (*_ETC_FILES, *trusted, *_NETWORK_FILES):
+        for path in (*_ETC_FILES, *_etc_java_binds(), *trusted, *_NETWORK_FILES):
             argv += ["--ro-bind-try", path, path]
         argv += ["--ro-bind", passwd, "/etc/passwd", "--ro-bind", group, "/etc/group"]
         for path in runtime_paths:
             if path not in tmp_runtime_paths:
                 argv += ["--ro-bind", path, path]
+        if current_system:
+            argv += ["--symlink", current_system, _NIXOS_CURRENT_SYSTEM]
         # Mount points for both spellings must exist before / goes read-only.
         argv += ["--dir", workdir]
         if inner != workdir:
             argv += ["--dir", inner]
+        if egress:
+            argv += ["--ro-bind", egress[0], _EGRESS_INNER]
         argv += ["--remount-ro", "/"]
         argv += ["--tmpfs", "/dev/shm", "--tmpfs", "/tmp"]
         for path in tmp_runtime_paths:
             argv += ["--ro-bind", path, path]
+        for root in tmp_silent_roots:
+            argv += ["--ro-bind-try", root, root]
         argv += ["--bind", workdir, inner]
         if inner != workdir:
             argv += ["--bind", workdir, workdir]
@@ -741,16 +1123,32 @@ def prepare(plan: ToolLaunchPlan) -> PreparedSandboxLaunch:
             "TMPDIR",
             _tmpdir(plan, workdir),
             "--setenv",
-            "PIP_TARGET",
+            "PIP_PREFIX",
             packages,
+            "--setenv",
+            "PIP_IGNORE_INSTALLED",
+            "1",
             "--setenv",
             "PYTHONPATH",
             _pythonpath(plan, packages),
             "--setenv",
             "PATH",
             _path(plan, packages),
-            "--",
         ]
+        egress_url = f"http://127.0.0.1:{_EGRESS_PORT}" if egress else None
+        if egress_url:
+            for name, value in sandbox_egress.proxy_environment(egress_url, _EGRESS_INNER).items():
+                argv += ["--setenv", name, value]
+        argv += ["--"]
+        if egress:
+            argv += [
+                sys.executable,
+                "-I",
+                "-S",
+                f"{_EGRESS_INNER}/relay.py",
+                f"{_EGRESS_INNER}/proxy.sock",
+                str(_EGRESS_PORT),
+            ]
         argv += list(plan.argv)
 
         return PreparedSandboxLaunch(
@@ -758,19 +1156,24 @@ def prepare(plan: ToolLaunchPlan) -> PreparedSandboxLaunch:
             workdir = workdir,
             env = dict(plan.env),
             # --new-session covers the inner side only; tools.py's killpg still needs the outer setsid.
-            preexec_fn = sandbox_landlock.with_abstract_scope(plan.preexec_fn),
+            preexec_fn = sandbox_landlock.scoped_preexec(plan.preexec_fn),
             backend = BACKEND_NAME,
             pass_fds = (seccomp.fileno(),),
             owned_files = [seccomp],
-            cleanup_paths = [identity_dir],
+            cleanup_paths = [identity_dir, *((egress[0],) if egress else ())],
             timeout_seconds = plan.timeout_seconds,
             close_fds = plan.close_fds,
             terminate_descendants = plan.terminate_descendants,
+            cleanup_callbacks = [egress[1].close] if egress else [],
             launch_limitations = workdir_limitations,
+            egress_proxy = egress_url,
         )
     except Exception:
         seccomp.close()
         shutil.rmtree(identity_dir, ignore_errors = True)
+        if egress:
+            egress[1].close()
+            shutil.rmtree(egress[0], ignore_errors = True)
         raise
 
 

@@ -184,7 +184,8 @@ test("the main composer has one Dictate entry and does not gate it on draft text
   );
   const controlsStart = threadSource.indexOf("const ComposerRightControls:");
   const controls = threadSource.slice(controlsStart);
-  assert.equal((controls.match(/tooltip="Dictate"/g) ?? []).length, 1);
+  assert.equal((controls.match(/tooltip=\{micLabel\}/g) ?? []).length, 1);
+  assert.match(controls, /\? t\("settings\.voice\.dictation\.micRecordForModel"\)\s*: "Dictate";/);
   assert.doesNotMatch(controls, /Upload01Icon|DialogTrigger/);
 });
 
@@ -487,10 +488,12 @@ test("Compare queue setup preserves an upload until a queued send is accepted", 
   );
   assert.doesNotMatch(advanceQueue, /audioUpload\.cancel\(\)/);
 
-  const runListStart = sharedComposerSource.indexOf("onRunList={(items) => {");
+  assert.match(sharedComposerSource, /onRunList=\{runPromptList\}/);
+  const runListStart = sharedComposerSource.indexOf("const runPromptList = useCallback(");
+  assert.ok(runListStart >= 0);
   const runList = sharedComposerSource.slice(
     runListStart,
-    sharedComposerSource.indexOf("        }}", runListStart),
+    sharedComposerSource.indexOf("\n  );", runListStart),
   );
   const incompleteModelGuard = runList.indexOf(
     "if (hasCompareHandles && !isGeneralizedCompare)",
