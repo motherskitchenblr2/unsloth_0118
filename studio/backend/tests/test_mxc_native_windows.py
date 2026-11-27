@@ -26,6 +26,11 @@ from core.inference import (
 
 
 @pytest.fixture(autouse = True)
+def _real_drive_aliases(monkeypatch):
+    monkeypatch.delenv("UNSLOTH_MXC_DRIVE_ALIAS", raising = False)
+
+
+@pytest.fixture(autouse = True)
 def _stage_installed_native_runtime():
     """Copy an explicitly installed runtime into pytest's isolated Studio home."""
     source_value = os.environ.get("UNSLOTH_MXC_NATIVE_PACKAGE")
@@ -91,8 +96,8 @@ def test_native_mxc_python_output_cannot_forge_execution_records():
     assert record.execution_status == "completed"
     assert record.completion_status == "finished"
     assert record.cleanup_status == "complete"
-    assert record.runtime_revision == mxc_runtime.MXC_REVISION
-    assert record.runtime_artifact_digest == f"sha256:{mxc_runtime.WXC_EXEC_SHA256}"
+    assert record.runtime_revision == mxc_runtime.selected_pin().revision
+    assert record.runtime_artifact_digest == f"sha256:{mxc_runtime.artifact('exec')[2]}"
     assert record.schema_version == mxc_runtime.MXC_SCHEMA_VERSION
     assert record.policy_hash.startswith("sha256:")
 
@@ -348,9 +353,6 @@ def test_native_mxc_accepts_a_unicode_workdir_on_an_alternate_volume():
 @pytest.mark.native_mxc
 def test_native_mxc_terminal_uses_same_direct_wxc_backend_and_streams(monkeypatch):
     _require_native_mxc()
-    # Git Bash is separately probed and currently refused on this host because
-    # it exits during runtime initialization under PSEC. Qualify Studio's cmd
-    # fallback without changing the production selector.
     monkeypatch.setattr(tools, "_windows_bash", lambda: None)
     chunks = []
     forged = '{"v":2,"event":"DISPATCHED","backendTier":"base-container"}'
@@ -413,7 +415,7 @@ def test_native_mxc_concurrent_python_and_terminal_runs_are_isolated(monkeypatch
     assert "concurrent-terminal" in results[2]
 
     cancel = threading.Event()
-    # Stop once the workload runs: the DACL tier spends seconds before dispatch, where a fixed 0.5 s timer lands.
+    # Stop once the workload runs: the DACL tier spends seconds before dispatch.
     cancelled = tools._python_exec(
         "import time; print('cancel-started', flush=True); time.sleep(30)",
         cancel,
@@ -555,3 +557,28 @@ def test_native_mxc_session_packages_import_inside_the_container():
     )
     assert "SIX 1.16.0" in imported, imported
     assert os_sandbox.SESSION_PACKAGES_RELPATH in imported, imported
+
+
+@pytest.mark.native_mxc
+def test_native_git_bash_is_named_and_not_reprobed(monkeypatch):
+    """Git Bash cannot start in the container (microsoft/mxc#1061); say so, and answer from cache after that."""
+    _require_native_mxc()
+    bash = tools._windows_bash()
+    if not bash:
+        pytest.skip("no trusted Git Bash on this host")
+    first = sandbox_windows_mxc.capability_snapshot(
+        force = True, execution_kind = "terminal", selected_executable = bash
+    )
+    if first.available:
+        pytest.skip("this MXC tier starts Git Bash, so there is no incompatibility to report")
+    assert first.reason == mxc_probe.MSYS_NAMESPACE_REASON, first.reason
+    assert "Install the pinned" not in first.remediation
+    probed = []
+    monkeypatch.setattr(
+        mxc_probe, "_probe", lambda *args, **_kwargs: probed.append(args) or (True, "")
+    )
+    again = sandbox_windows_mxc.capability_snapshot(
+        execution_kind = "terminal", selected_executable = bash
+    )
+    assert probed == [], "the incompatible shell was probed again"
+    assert again.reason == mxc_probe.MSYS_NAMESPACE_REASON

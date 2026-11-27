@@ -11,7 +11,14 @@ import re
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
+
+from utils.prebuilt.freshness_flow import (
+    github_rate_limit_remaining,
+    hold_github_api,
+    rate_limit_wait,
+)
 from dataclasses import dataclass
 from typing import Any
 
@@ -19,10 +26,10 @@ from packaging.version import InvalidVersion, Version
 
 from .update_status import DISABLE_ENV_VAR, RELEASE_NOTES_URL
 
-# A release entry carries its whole body (~40 KiB lately), so per_page=100 would be ~4 MiB, twice the cap below, and the fetch would fail outright. 30 is ~1.2 MiB, newest first.
-RELEASES_API_URL = "https://api.github.com/repos/unslothai/unsloth/releases?per_page=30"
+# Entries carry full bodies and asset lists, so keep the page small (#17661); 10 still spans the asset-only releases (`Windows-ARM64`, `prebuilt-wheels-*`).
+RELEASES_API_URL = "https://api.github.com/repos/unslothai/unsloth/releases?per_page=10"
 RELEASES_URL_ENV_VAR = "UNSLOTH_RELEASES_URL"
-RELEASES_TIMEOUT_SECONDS = 3
+RELEASES_TIMEOUT_SECONDS = 10
 RELEASES_MAX_BYTES = 2 * 1024 * 1024
 _RELEASES_CHUNK_BYTES = 64 * 1024
 _RELEASES_MIN_READ_SECONDS = 0.05
@@ -39,9 +46,7 @@ _RELEASE_TAG_PATTERN = re.compile(r"^v\d+(?:\.\d+)+")
 
 # CommonMark needs a space, tab or line end after the hashes: a non-breaking space is text, and a bare `##` is an empty heading that still ends the section above.
 _HEADING_PATTERN = re.compile(r"^ {0,3}(?P<hashes>#{1,6})(?:[ \t]+(?P<title>.*?))?[ \t]*$")
-# A heading may close with its own run of hashes, which is not part of the title.
 _CLOSING_SEQUENCE = re.compile(r"(?:^|[ \t])#+[ \t]*$")
-# Inline markup the title carries but the words do not.
 _TITLE_MARKUP = re.compile(r"[`*_~]|\[|\]\([^)]*\)|<[^>]*>")
 _FULL_CHANGELOG_LINE = re.compile(r"^ {0,3}\*{0,2}full changelog\*{0,2}\s*:", re.IGNORECASE)
 _FENCE_PATTERN = re.compile(r"^ {0,3}(?P<marker>`{3,}|~{3,})(?P<rest>.*)$")
@@ -53,12 +58,10 @@ _RAW_BLOCKS = (
     (_RAW_HTML_OPEN, _RAW_HTML_CLOSE),
     (re.compile(r"^ {0,3}<\?"), re.compile(r"\?>")),
     (re.compile(r"^ {0,3}<!\[CDATA\["), re.compile(r"\]\]>")),
-    # A declaration needs an uppercase letter, so `<!note` stays ordinary text.
     (re.compile(r"^ {0,3}<![A-Z]"), re.compile(r">")),
 )
 # Type 6 runs to the next blank line, so `<details>` holds Markdown only after one. Open and close tags both start a block.
 _HTML_BLOCK_OPEN = re.compile(r"^ {0,3}</?([a-zA-Z][a-zA-Z0-9-]*)(?=[\s/>]|$)")
-# Blocks that break into an open paragraph, closing it rather than continuing it.
 _INTERRUPTS = re.compile(
     r"^ {0,3}(?:#{1,6}([ \t]|$)|(?:\*[ \t]*){3,}$|(?:-[ \t]*){3,}$|(?:_[ \t]*){3,}$)"
 )
@@ -310,7 +313,6 @@ def scan_blocks(text: str):
         if in_raw_html is not None:
             visible, in_raw_html = _strip_raw_html(line, in_raw_html)
         elif in_html_block:
-            # A blank line is the only thing that ends a type 6 block.
             in_html_block = line.strip() != ""
             visible = ""
         elif (fence := _FENCE_PATTERN.match(fence_line)) and not in_comment:
@@ -323,7 +325,6 @@ def scan_blocks(text: str):
         elif open_fence:
             visible = ""
         else:
-            # A block already open owns this line, so it is content.
             hidden = in_comment or in_raw_html is not None
             # A comment is an HTML block too, so it opens inside an item as a fence does: the opener is read past a marker on the same line.
             block_open = (
@@ -356,7 +357,6 @@ def scan_blocks(text: str):
                     visible = ""
         # A `##` inside a fenced block is sample markdown, not a real heading.
         match = _HEADING_PATTERN.match(visible) if visible else None
-        # `1.0` over a line of dashes is the same heading written setext style.
         setext = (
             after_paragraph
             and match is None
@@ -464,7 +464,6 @@ def _normalise_title(title: str) -> str:
     """A heading title as its words, for comparison against the known ones."""
     title = _CLOSING_SEQUENCE.sub("", title)
     title = _TITLE_MARKUP.sub("", title)
-    # A curly apostrophe is the same word as a straight one.
     title = title.replace("’", "'")
     return " ".join(title.split()).strip(" :.").lower()
 
@@ -587,6 +586,18 @@ def _fetch_latest_release() -> tuple[ReleaseSource, float]:
             RELEASES_FAILURE_TTL_SECONDS,
         )
 
+    if urllib.parse.urlparse(url).hostname == "api.github.com":
+        locked_out_for = github_rate_limit_remaining()
+        if locked_out_for > 0:
+            return (
+                ReleaseSource(
+                    release = None,
+                    source = None,
+                    error = "GitHub is rate limiting release note requests.",
+                ),
+                locked_out_for,
+            )
+
     headers = {
         "User-Agent": "unsloth-studio-update-check",
         "Accept": "application/vnd.github+json",
@@ -598,6 +609,11 @@ def _fetch_latest_release() -> tuple[ReleaseSource, float]:
         headers["If-None-Match"] = _remote_etag
 
     request = urllib.request.Request(url, headers = headers)
+    token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
+    parsed = urllib.parse.urlparse(url)
+    # https only (the override accepts http://); unredirected, so a redirect off the API host drops it.
+    if token and parsed.scheme == "https" and parsed.hostname == "api.github.com":
+        request.add_unredirected_header("Authorization", f"Bearer {token}")
     deadline = time.monotonic() + RELEASES_TIMEOUT_SECONDS
     try:
         with urllib.request.urlopen(request, timeout = RELEASES_TIMEOUT_SECONDS) as response:
@@ -634,7 +650,7 @@ def _fetch_latest_release() -> tuple[ReleaseSource, float]:
             )
         payload = json.loads(body.decode("utf-8", errors = "replace"))
     except urllib.error.HTTPError as error:
-        return _http_error_source(error)
+        return _http_error_source(error, url = url)
     except TimeoutError:
         return (
             ReleaseSource(
@@ -671,52 +687,33 @@ def _fetch_latest_release() -> tuple[ReleaseSource, float]:
     return source, RELEASES_SUCCESS_TTL_SECONDS
 
 
-def _http_error_source(error: urllib.error.HTTPError) -> tuple[ReleaseSource, float]:
-    """The answer and TTL for an HTTP status GitHub refused the request with."""
+def _http_error_source(
+    error: urllib.error.HTTPError, *, url: str = RELEASES_API_URL
+) -> tuple[ReleaseSource, float]:
     global _rate_limited_until
 
     if error.code == 304 and _remote_last_good is not None:
         # Nothing changed, so the release already held still stands.
         return _remote_last_good, RELEASES_SUCCESS_TTL_SECONDS
 
-    if error.code in (403, 429):
-        now = time.time()
-        # GitHub's order: Retry-After, which is how a secondary limit states its wait, then the primary limit's reset, then a plain back-off. Every one records a deadline, or Retry requests straight back into the limit.
-        after = _epoch_header(error.headers.get("Retry-After"))
-        reset = (
-            _epoch_header(error.headers.get("X-RateLimit-Reset"))
-            if error.headers.get("X-RateLimit-Remaining") == "0"
-            else None
-        )
-        if after is not None:
-            deadline = now + after
-        elif reset is not None:
-            deadline = reset
-        else:
-            deadline = now + RELEASES_RATE_LIMITED_TTL_SECONDS
-        # The deadline itself is bounded, not just the first wait on it: the next fetch answers from it, so capping only the TTL left a skewed header parking the popup for as long as it liked.
-        _rate_limited_until = min(deadline, now + RELEASES_RATE_LIMIT_MAX_SECONDS)
-        ttl = max(_rate_limited_until - now, 0.0)
+    wait = rate_limit_wait(error)
+    if wait is not None:
+        _rate_limited_until = time.time() + wait
+        if urllib.parse.urlparse(url).hostname == "api.github.com":
+            hold_github_api(wait)
         return (
             ReleaseSource(
                 release = None,
                 source = None,
                 error = "GitHub is rate limiting release note requests.",
             ),
-            ttl,
+            wait,
         )
 
     return (
         ReleaseSource(release = None, source = None, error = "Could not fetch release notes."),
         RELEASES_FAILURE_TTL_SECONDS,
     )
-
-
-def _epoch_header(value: str | None) -> float | None:
-    try:
-        return float((value or "").strip())
-    except ValueError:
-        return None
 
 
 def select_release(payload: Any) -> Release | None:
@@ -774,8 +771,7 @@ def _next_fence_state(open_fence: str | None, marker: str, rest: str) -> str | N
 
 
 def _code_span_ranges(line: str) -> list[tuple[int, int]]:
-    """Code span bounds. A run of backticks closes only on a run of its length."""
-    # Collected once: rescanning per opener is quadratic on a line of distinct unmatched runs, and notes are reparsed on every request.
+    """Collected once: rescanning per opener is quadratic on a line of many distinct unmatched runs, and notes are reparsed on every request."""
     runs: list[tuple[int, int]] = []
     index = 0
     while index < len(line):

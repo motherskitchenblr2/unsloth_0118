@@ -1,12 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
-"""Read hosted INT8 ``.pt`` pre-quants on torchao >= 0.18, which deleted the v1 int8 classes they pickle.
-
-Still ``weights_only = True``: inert stand-ins (dispatch raises) are registered under the deleted names
-only for that load, and each weight is validated as symmetric per-row int8, then rebuilt bit-identical
-as the installed torchao's ``Int8Tensor``. A torchao that still ships the classes loads as before.
-"""
+"""Loads INT8 .pt on torchao >= 0.18 via inert stand-ins for deleted classes; weights_only kept on."""
 
 from __future__ import annotations
 
@@ -250,3 +245,25 @@ def _rebuild_standins(ckpt: Any, standins: dict, api: tuple) -> Any:
         elif isinstance(value, stray):
             raise ValueError(f"legacy int8 weight {key!r} is not wrapped for activation quant")
     return ckpt
+
+
+def convert_legacy_int8_weights(module: Any) -> int:
+    """Rebuilds v1 int8 weights as pinnable Int8Tensor in place (torchao <= 0.17); all or nothing."""
+    import torch
+
+    api = _int8_tensor_api()
+    classes = {name: _resolve(name) for name in (*LEGACY_INT8_CLASS_NAMES, _ACT_QUANT)}
+    if api is None or any(value is None for value in classes.values()):
+        return 0
+    rebuilt = []
+    try:
+        for name, submodule in module.named_modules():
+            # Registered parameters only: PadToMinM forwards ``weight`` to its inner Linear.
+            weight = getattr(submodule, "_parameters", {}).get("weight")
+            if isinstance(weight, classes[_LAQT]):
+                rebuilt.append((submodule, _rebuild_weight(name, weight, classes, api)))
+    except Exception:  # noqa: BLE001 -- an unrecognised weight keeps the v1 class everywhere
+        return 0
+    for submodule, weight in rebuilt:
+        submodule.weight = torch.nn.Parameter(weight, requires_grad = False)
+    return len(rebuilt)

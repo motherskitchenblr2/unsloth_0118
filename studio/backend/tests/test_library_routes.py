@@ -222,7 +222,7 @@ def test_uploads_are_listed_and_typed_by_their_extension_not_the_client(client, 
         ("image/png", True),
         ("audio/mpeg", True),
         ("image/png; charset=binary", True),
-        # Served on the app origin, so markup never comes back as something a browser renders.
+        # Served on the app origin, so markup must never come back browser-renderable.
         ("text/html", False),
         ("image/svg+xml", False),
         ("audio/x, text/html", False),
@@ -254,7 +254,6 @@ def test_rename_favorite_and_folders_are_an_overlay(client):
     for missing in ("upload:gone", "sandbox:t-lib:gone.txt"):
         assert _post(client, "items/opened", id = missing).status_code == 404
     assert "upload:gone" not in library_db.list_entries()
-    # The type follows the file's own name, so a binary renamed to .txt never opens as text.
     assert item["fileName"] == "photo.png"
     _patch(client, id = image, favorite = False)
     assert _items(client)[0][image]["folderId"] == folder
@@ -262,7 +261,6 @@ def test_rename_favorite_and_folders_are_an_overlay(client):
     assert _items(client)[0][image]["folderId"] is None
     response = client.patch("/api/library/items", json = {"id": image, "folderId": "nope"})
     assert response.status_code == 404
-    # Folders nest; a folder never moves under itself, and a deleted one hands its contents up.
     inner = _folder(client, "Inner", folder)
     child = _folder(client, "Child", inner)
     for parent in (inner, folder):
@@ -321,6 +319,54 @@ def test_chat_attachments_holding_bytes_are_known_by_their_type_in_any_case(clie
     assert deleted == [("m:1", "voice")]
 
 
+def test_deleting_a_chat_attachment_from_the_library_sweeps_its_original(client, monkeypatch):
+    import storage.studio_db as studio_db
+    from core import chat_originals
+
+    sweeps = []
+    monkeypatch.setattr(chat_originals, "sweep", lambda force = False: sweeps.append(force))
+    monkeypatch.setattr(studio_db, "delete_chat_attachment", lambda *ids: True)
+    assert _delete(client, "attachment:m:doc") == 200
+    assert sweeps == [False]
+
+
+def test_an_original_sent_many_times_counts_once_toward_disk_usage(client, monkeypatch):
+    import storage.studio_db as studio_db
+
+    def sent(
+        attachment_id,
+        sha256,
+        has_original = True,
+    ):
+        return {
+            "messageId": "m",
+            "id": attachment_id,
+            "type": "document",
+            "contentType": "application/pdf",
+            "sizeBytes": 1000,
+            "originalSha256": sha256,
+            "textBytes": 50,
+            "hasOriginal": has_original,
+        }
+
+    monkeypatch.setattr(library, "_SOURCES", (library._attachment_items,))
+    monkeypatch.setattr(
+        studio_db,
+        "list_chat_attachments",
+        lambda: [
+            sent("a", "1" * 64),
+            sent("b", "1" * 64),
+            sent("c", "2" * 64),
+            sent("d", "1" * 64),
+            sent("e", "3" * 64, has_original = False),
+        ],
+    )
+    items = _items(client)[0]
+    usage = [items[f"attachment:m:{name}"]["storageBytes"] for name in "abcde"]
+    assert usage == [1050, 50, 1050, 50, 50]
+    assert all(items[f"attachment:m:{name}"]["sizeBytes"] == 1000 for name in "abcde")
+
+
 def test_a_chat_audio_part_is_typed_by_its_format_or_its_bytes():
     from storage.studio_db import _content_part_attachments
 
@@ -360,6 +406,153 @@ def test_a_sandbox_file_that_is_gone_takes_no_rename_a_later_file_would_inherit(
     assert _items(client)[0][_SANDBOX_A]["name"] == "a.txt"
 
 
+def test_a_sandbox_file_the_model_edits_keeps_its_name_star_and_folder(
+    client, signed_in, monkeypatch
+):
+    from core.inference.tools import execute_tool
+
+    monkeypatch.setattr(library, "_SOURCES", (library._sandbox_items,))
+    _directory, path = _sandbox_chat("report.txt", b"teh report\n")
+    folder = _folder(client, "Reports", None)
+    _patch(client, id = _SANDBOX_ID, name = "Q3 report", favorite = True, folderId = folder)
+    result = execute_tool(
+        "edit_file",
+        {"path": "report.txt", "edits": [{"old_string": "teh", "new_string": "the"}]},
+        session_id = "t-lib",
+    )
+    assert Path(path).read_bytes() == b"the report\n", result
+    library.invalidate_listing()
+    item = _items(client)[0][_SANDBOX_ID]
+    assert (item["name"], item["favorite"], item["folderId"]) == ("Q3 report", True, folder)
+    assert _favorites(client) == [_SANDBOX_ID]
+
+
+def test_a_listing_during_an_edit_does_not_drop_the_files_name_star_and_folder(
+    client, signed_in, monkeypatch
+):
+    import contextvars
+    import threading
+
+    from core.inference.tools import execute_tool
+
+    monkeypatch.setattr(library, "_SOURCES", (library._sandbox_items,))
+    _directory, path = _sandbox_chat("report.txt", b"teh report\n")
+    _patch(client, id = _SANDBOX_ID, name = "Q3 report", favorite = True)
+    carry = library_db.carry_fingerprint
+    listings = []
+
+    def list_then_carry(*args):
+        library.invalidate_listing()
+        listing = threading.Thread(
+            target = contextvars.copy_context().run, args = (library.list_items,)
+        )
+        listing.start()
+        listing.join(timeout = 1)
+        listings.append(listing)
+        carry(*args)
+
+    monkeypatch.setattr(library_db, "carry_fingerprint", list_then_carry)
+    execute_tool(
+        "edit_file",
+        {"path": "report.txt", "edits": [{"old_string": "teh", "new_string": "the"}]},
+        session_id = "t-lib",
+    )
+    for listing in listings:
+        listing.join(timeout = 10)
+    assert Path(path).read_bytes() == b"the report\n"
+    library.invalidate_listing()
+    item = _items(client)[0][_SANDBOX_ID]
+    assert (item["name"], item["favorite"]) == ("Q3 report", True)
+
+
+def test_a_folder_move_during_an_edit_keeps_the_files_name_and_star(client, signed_in, monkeypatch):
+    import threading
+
+    from core.inference.tools import execute_tool
+
+    monkeypatch.setattr(library, "_SOURCES", (library._sandbox_items,))
+    _sandbox_chat("report.txt", b"teh report\n")
+    _patch(client, id = _SANDBOX_ID, name = "Q3 report", favorite = True)
+    folder = _folder(client, "Reports", None)
+    carry = library_db.carry_fingerprint
+    moves = []
+
+    def move_then_carry(*args):
+        move = threading.Thread(
+            target = _patch, args = (client,), kwargs = {"id": _SANDBOX_ID, "folderId": folder}
+        )
+        move.start()
+        move.join(timeout = 1)
+        moves.append(move)
+        carry(*args)
+
+    monkeypatch.setattr(library_db, "carry_fingerprint", move_then_carry)
+    execute_tool(
+        "edit_file",
+        {"path": "report.txt", "edits": [{"old_string": "teh", "new_string": "the"}]},
+        session_id = "t-lib",
+    )
+    for move in moves:
+        move.join(timeout = 10)
+    library.invalidate_listing()
+    item = _items(client)[0][_SANDBOX_ID]
+    assert (item["name"], item["favorite"], item["folderId"]) == ("Q3 report", True, folder)
+
+
+def test_a_legacy_row_keeps_its_name_and_star_through_an_edit_a_cached_listing_saw(
+    client, signed_in, monkeypatch
+):
+    from core.inference.tools import execute_tool
+
+    monkeypatch.setattr(library, "_SOURCES", (library._remembered("_sandbox_items", 60.0),))
+    _sandbox_chat("report.txt", b"teh report\n")
+    _patch(client, id = _SANDBOX_ID, name = "Q3 report", favorite = True)
+    _items(client)
+    conn = library_db.get_connection()
+    conn.execute("UPDATE library_entries SET fingerprint = NULL WHERE item_id = ?", (_SANDBOX_ID,))
+    conn.commit()
+    conn.close()
+    execute_tool(
+        "edit_file",
+        {"path": "report.txt", "edits": [{"old_string": "teh", "new_string": "the"}]},
+        session_id = "t-lib",
+    )
+    _items(client)
+    library.invalidate_listing()
+    item = _items(client)[0][_SANDBOX_ID]
+    assert (item["name"], item["favorite"]) == ("Q3 report", True)
+
+
+def test_a_path_made_again_right_after_an_edit_starts_fresh(client, signed_in, monkeypatch):
+    from core.inference.tools import execute_tool
+
+    monkeypatch.setattr(library, "_SOURCES", (library._sandbox_items,))
+    directory, path = _sandbox_chat("report.txt", b"teh report\n")
+    _patch(client, id = _SANDBOX_ID, name = "Q3 report", favorite = True)
+    # Linux keeps no birth time, so a recreated file reusing a freed inode passes for it: keep both allocated.
+    os.link(path, os.path.join(directory, ".held"))
+    replace = os.replace
+
+    def replace_then_recreate(src, dst, **dir_fds):
+        replace(src, dst, **dir_fds)
+        if os.path.basename(dst) == "report.txt":
+            other = path + ".other"
+            Path(other).write_bytes(b"someone else\n")
+            replace(other, path)
+
+    monkeypatch.setattr(os, "replace", replace_then_recreate)
+    execute_tool(
+        "edit_file",
+        {"path": "report.txt", "edits": [{"old_string": "teh", "new_string": "the"}]},
+        session_id = "t-lib",
+    )
+    monkeypatch.setattr(os, "replace", replace)
+    assert Path(path).read_bytes() == b"someone else\n"
+    library.invalidate_listing()
+    item = _items(client)[0][_SANDBOX_ID]
+    assert (item["name"], item["favorite"]) == ("report.txt", False)
+
+
 def test_a_sandbox_delete_takes_only_the_file_it_was_listed_as(client, signed_in, monkeypatch):
     monkeypatch.setattr(library, "_SOURCES", (library._sandbox_items,))
     _directory, path = _sandbox_chat("a.txt", b"listed")
@@ -389,6 +582,28 @@ def test_a_sandbox_file_of_a_chat_whose_id_has_a_colon_is_reachable(client, sign
     assert _items(client)[0] == {}
 
 
+def test_a_chats_files_stay_listed_after_it_is_moved_into_a_project(
+    client, signed_in, monkeypatch, tmp_path
+):
+    from storage import studio_db
+
+    monkeypatch.setenv("UNSLOTH_STUDIO_PROJECTS_HOME", str(tmp_path / "Projects home"))
+    monkeypatch.setattr(library, "_SOURCES", (library._sandbox_items,))
+    _sandbox_chat("a.txt", b"mine")
+    folder = _folder(client, "Charts", None)
+    _patch(client, id = _SANDBOX_A, name = "Chart", favorite = True, folderId = folder)
+    studio_db.upsert_chat_project(
+        {"id": "p-lib", "name": "Research", "createdAt": 1, "updatedAt": 1}
+    )
+    studio_db.update_chat_thread("t-lib", {"projectId": "p-lib"})
+    library.invalidate_listing()
+    item = _items(client)[0][_SANDBOX_A]
+    assert (item["name"], item["favorite"], item["folderId"]) == ("Chart", True, folder)
+    assert item["threadId"] == "t-lib"
+    assert _download(client, _SANDBOX_A).content == b"mine"
+    assert _delete(client, _SANDBOX_A) == 200
+
+
 def test_a_sandbox_file_written_twice_in_a_second_is_a_new_version(client, signed_in, monkeypatch):
     monkeypatch.setattr(library, "_SOURCES", (library._sandbox_items,))
     _directory, path = _sandbox_chat("frame.png", b"one")
@@ -411,6 +626,74 @@ def test_a_clip_counts_its_recipe_toward_what_it_takes_on_disk(client, monkeypat
     assert item["sizeBytes"] == wav.stat().st_size
     assert item["storageBytes"] == wav.stat().st_size + wav.with_suffix(".json").stat().st_size
     assert "storageBytes" not in items[f"image:{image}"]
+
+
+def test_a_conversion_counts_the_recording_it_kept_toward_what_it_takes_on_disk(
+    client, monkeypatch, tmp_path
+):
+    from core.inference import audio_gallery
+
+    monkeypatch.setattr(library, "_SOURCES", (library._audio_items,))
+    source = tmp_path / "upload.wav"
+    source.write_bytes(b"S" * 1000)
+    meta = {"model": "sample-vc", "audio_type": "speech", "sample_rate": 24000, "duration_s": 1.0}
+    audio = audio_gallery.save(
+        b"RIFF0000WAVE", {**meta, "prompt": "Converted", "created_at": 1_700_000_000}, source
+    )["id"]
+    wav = audio_gallery.audio_path(audio)
+    item = _items(client)[0][f"audio:{audio}"]
+    assert item["sizeBytes"] == wav.stat().st_size
+    assert item["storageBytes"] == (
+        wav.stat().st_size + wav.with_suffix(".json").stat().st_size + 1000
+    )
+
+
+def test_listed_images_are_sized_without_resolving_each_but_links_are_still_checked(
+    client, monkeypatch, tmp_path
+):
+    from core.inference import image_gallery
+
+    monkeypatch.setattr(library, "_SOURCES", (library._image_items,))
+    plain, inside, outside = (_gallery_image(p) for p in ("Plain", "Inside", "Outside"))
+    folder = image_gallery.gallery_dir()
+    elsewhere = tmp_path / "elsewhere.png"
+    os.replace(folder / f"{outside}.png", elsewhere)
+    kept = folder / f"{inside}.png"
+    os.replace(kept, folder / "kept.bin")
+    try:
+        os.symlink(folder / "kept.bin", kept)
+        os.symlink(elsewhere, folder / f"{outside}.png")
+    except OSError:
+        pytest.skip("symlinks unavailable")
+    resolved = []
+    real = image_gallery.image_path
+    monkeypatch.setattr(image_gallery, "image_path", lambda i: resolved.append(i) or real(i))
+    items = _items(client)[0]
+    assert items[f"image:{plain}"]["sizeBytes"] == (folder / f"{plain}.png").stat().st_size
+    assert items[f"image:{inside}"]["sizeBytes"] == kept.stat().st_size
+    assert items[f"image:{outside}"]["sizeBytes"] is None
+    assert sorted(resolved) == sorted([inside, outside])
+
+
+def test_listed_images_are_sized_in_the_folder_in_use_after_listing(client, monkeypatch, tmp_path):
+    from core.inference import image_gallery
+
+    monkeypatch.setattr(library, "_SOURCES", (library._image_items,))
+    image = _gallery_image("Moved")
+    before, after = image_gallery.gallery_dir(), tmp_path / "moved"
+    after.mkdir()
+    (after / f"{image}.png").write_bytes(b"x" * 3)
+    moved = []
+    real = image_gallery.list_images
+
+    def list_then_move(**kwargs):
+        records = real(**kwargs)
+        moved.append(True)
+        return records
+
+    monkeypatch.setattr(image_gallery, "list_images", list_then_move)
+    monkeypatch.setattr(image_gallery, "gallery_dir", lambda: after if moved else before)
+    assert _items(client)[0][f"image:{image}"]["sizeBytes"] == 3
 
 
 def test_generated_audio_and_video_are_listed_and_deleted(client, monkeypatch):
@@ -441,6 +724,113 @@ def test_generated_audio_and_video_are_listed_and_deleted(client, monkeypatch):
     assert _delete(client, f"video:{video}") == 200
     assert video_gallery.video_path(video) is None
     assert forgotten == [video, video]
+
+
+def _audio_clip(prompt: str, **extra) -> str:
+    from core.inference import audio_gallery
+
+    meta = {"model": "htdemucs", "audio_type": "audiocpp_sep", "sample_rate": 44100}
+    meta |= {"duration_s": 2.5, "prompt": prompt, "created_at": 1_700_000_000}
+    return audio_gallery.save(b"RIFF0000WAVE", {**meta, **extra})["id"]
+
+
+def test_an_edit_source_recording_is_not_listed(client, monkeypatch):
+    monkeypatch.setattr(library, "_SOURCES", (library._audio_items,))
+    source = _audio_clip("The old words", workflow = "edit", role = "source")
+    edited = _audio_clip("The new words.", workflow = "edit", role = "output", source_clip_id = source)
+    items = _items(client)[0]
+    assert f"audio:{source}" not in items
+    assert items[f"audio:{edited}"]["name"] == "The new words.wav"
+    assert items[f"audio:{edited}"]["audio"]["workflow"] == "edit"
+
+
+def test_separated_stems_are_named_by_stem_and_carry_their_run(client, monkeypatch):
+    monkeypatch.setattr(library, "_SOURCES", (library._audio_items, library._upload_items))
+    vocals = _audio_clip("song.mp3", workflow = "separate", role = "vocals", group_id = "g1")
+    drums = _audio_clip("song.mp3", workflow = "separate", role = "drums", group_id = "g1")
+    (upload,) = _upload(client, ("notes.txt", b"hi", "text/plain"))
+    items = _items(client)[0]
+    assert (items[f"audio:{vocals}"]["name"], items[f"audio:{drums}"]["name"]) == (
+        "song - Vocals.wav",
+        "song - Drums.wav",
+    )
+    assert items[f"audio:{vocals}"]["audio"] == {
+        "workflow": "separate",
+        "role": "vocals",
+        "groupId": "g1",
+        "durationS": 2.5,
+        "model": "htdemucs",
+        "mode": None,
+        "variation": None,
+    }
+    assert items[upload]["audio"] is None
+
+
+def test_music_variations_and_edits_get_distinct_names(client, monkeypatch):
+    monkeypatch.setattr(library, "_SOURCES", (library._audio_items,))
+
+    def song(
+        role,
+        variation,
+        mode = "song",
+    ):
+        settings = {"mode": mode, "variation": variation}
+        return _audio_clip("Rainy jazz", workflow = "music", role = role, settings = settings)
+
+    first, second = song("variation", 1), song("variation", 2)
+    edit, sfx = song("edit", None, "edit"), song("output", None, "sfx")
+    items = _items(client)[0]
+    names = [items[f"audio:{clip}"]["name"] for clip in (first, second, edit, sfx)]
+    assert names == [
+        "Rainy jazz (1).wav",
+        "Rainy jazz (2).wav",
+        "Rainy jazz (edit).wav",
+        "Rainy jazz.wav",
+    ]
+    assert [items[f"audio:{clip}"]["audio"]["mode"] for clip in (first, sfx)] == ["song", "sfx"]
+    assert [items[f"audio:{clip}"]["audio"]["variation"] for clip in (second, edit)] == [2, None]
+
+
+def test_a_long_prompt_keeps_its_stem_suffix(client, monkeypatch):
+    monkeypatch.setattr(library, "_SOURCES", (library._audio_items,))
+    clip = _audio_clip("word " * 40 + ".wav", workflow = "separate", role = "vocals")
+    name = _items(client)[0][f"audio:{clip}"]["name"]
+    assert name.endswith(" - Vocals.wav") and len(name) <= 60 + len(" - Vocals.wav")
+
+
+def test_a_clip_made_with_a_local_model_hides_its_path_from_an_api_key(
+    client, monkeypatch, tmp_path
+):
+    monkeypatch.setattr(library, "_SOURCES", (library._audio_items,))
+    local = str(tmp_path / "models" / "my-tts.gguf")
+    clip = _audio_clip("Hi", workflow = "speak", model = local)
+    assert _items(client)[0][f"audio:{clip}"]["audio"]["model"] == local
+    client.app.dependency_overrides[authenticated_via_api_key] = lambda: True
+    keyed = client.get("/api/library").json()["items"]
+    assert local not in json.dumps(keyed)
+    assert keyed[0]["audio"]["workflow"] == "speak"
+
+
+def test_storage_counts_what_the_audio_page_keeps_outside_its_clips(client, monkeypatch):
+    from core.inference import audio_gallery, transcript_gallery
+
+    monkeypatch.setattr(library, "_SOURCES", (library._audio_items,))
+    listed = _audio_clip("Kept")
+    # An Edit's hidden original, a saved voice and a transcript: on disk, in no item.
+    _audio_clip("Original", workflow = "edit", role = "source")
+    voices = audio_gallery.gallery_dir() / "voices"
+    voices.mkdir()
+    (voices / "voice.wav").write_bytes(b"v" * 1000)
+    (transcript_gallery.gallery_dir() / "t.json").write_bytes(b"t" * 500)
+    body = client.get("/api/library").json()
+    (item,) = body["items"]
+    assert item["id"] == f"audio:{listed}"
+    hidden = sum(
+        path.stat().st_size
+        for path in audio_gallery.gallery_dir().iterdir()
+        if path.is_file() and listed not in path.name
+    )
+    assert body["unlistedBytes"] == {"audio": hidden + 1000 + 500}
 
 
 def test_the_listing_reports_the_library_disk_and_the_sources_on_it(client, monkeypatch):
@@ -544,6 +934,54 @@ def test_fine_tuned_models_are_listed_but_not_deleted_here(client, monkeypatch):
         shutil.rmtree(gguf, ignore_errors = True)
 
 
+def test_training_runs_map_only_folders_directly_under_outputs(monkeypatch):
+    """Only folders directly under outputs map to runs; a newer external or failed run cannot claim it."""
+    import sqlite3
+
+    from storage import studio_db
+    from utils.paths.storage_roots import outputs_root
+
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.execute(
+        "CREATE TABLE training_runs (id TEXT, output_dir TEXT, started_at TEXT, status TEXT)"
+    )
+    conn.executemany(
+        "INSERT INTO training_runs VALUES (?, ?, ?, ?)",
+        [
+            ("managed", str(outputs_root() / "my-run"), "2026-01-01", "completed"),
+            ("external", "/tmp/elsewhere/my-run", "2026-02-01", "completed"),
+            ("nested", str(outputs_root() / "group" / "other"), "2026-03-01", "completed"),
+            ("failed", str(outputs_root() / "my-run"), "2026-04-01", "error"),
+        ],
+    )
+    monkeypatch.setattr(studio_db, "get_connection", lambda: conn)
+    assert library._training_runs_by_dir() == {"my-run": "managed"}
+
+
+def test_an_export_links_to_its_run_only_through_studio_metadata(tmp_path, monkeypatch):
+    from utils.paths import storage_roots
+
+    outputs, exports = tmp_path / "outputs", tmp_path / "exports"
+    monkeypatch.setattr(storage_roots, "outputs_root", lambda: outputs)
+    monkeypatch.setattr(storage_roots, "exports_root", lambda: exports)
+    runs = {"foo": "run-foo", "bar": "run-bar"}
+    for name, meta in [
+        ("foo-GGUF", None),
+        ("foo-merged", '{"base_model": null}'),
+        ("renamed", json.dumps({"source_checkpoint": str(outputs / "bar" / "checkpoint-10")})),
+    ]:
+        (exports / name).mkdir(parents = True)
+        (exports / name / "model.gguf").write_bytes(b"x")
+        if meta:
+            (exports / name / "export_metadata.json").write_text(meta)
+    run_id = lambda name: library._model_run_id(
+        str(exports / name / "model.gguf"), "exported", runs
+    )
+    assert run_id("foo-GGUF") is None
+    assert (run_id("foo-merged"), run_id("renamed")) == ("run-foo", "run-bar")
+
+
 def test_an_api_key_lists_fine_tunes_by_reference_and_can_still_act_on_them(client, monkeypatch):
     import shutil
 
@@ -623,13 +1061,11 @@ def test_the_slow_sources_are_remembered_briefly_and_forgotten_on_a_write(client
 
     monkeypatch.setattr(library, "_sandbox_items", walked)
     monkeypatch.setattr(library, "_SOURCES", (library._remembered("_sandbox_items", 60), broken))
-    # Listed only, never written: the star is kept for the file it would find.
     monkeypatch.setattr(library, "fingerprint", lambda _item_id: "1:1")
     _patch(client, id = "sandbox:t:a.txt", favorite = True)
     for _ in range(2):
         assert _items(client)[0]["sandbox:t:a.txt"]["favorite"] is True
     assert len(calls) == 1
-    # Another account's listing is never this one's.
     monkeypatch.setattr(library, "_account_key", lambda: "other")
     _items(client)
     _items(client)
@@ -910,7 +1346,7 @@ def test_an_upload_is_copied_into_a_project_under_its_own_name(client, project, 
     assert add(note, "p1").json() == {"already": True}
     assert add(note, "missing").status_code == 404
     assert add("upload:0123456789abcdef0123456789abcdef", "p1").status_code == 404
-    assert add("attachment:m:a", "p1").status_code == 400
+    assert add("attachment:m:a", "p1").status_code == 404
     assert add("model:training:/tmp/run", "p1").status_code == 400
     source = _file(tmp_path / "x.txt", "x")
     for bad in ("a:b.txt", "CON.txt", "trailing.", "tab\there.txt"):
@@ -919,6 +1355,37 @@ def test_an_upload_is_copied_into_a_project_under_its_own_name(client, project, 
     with open(source, "rb") as handle:
         result = gallery_projects.copy_into_project(handle, "p1", "files", "x-1.txt")
     assert Path(result["path"]).read_text() == "x"
+
+
+def test_a_chat_image_is_copied_out_of_its_message_into_a_project(client, project, monkeypatch):
+    import base64
+
+    import storage.studio_db as studio_db
+
+    png = b"\x89PNG\r\n\x1a\nfake"
+    attachments = {
+        ("m:1", "pic"): {
+            "id": "pic",
+            "type": "image",
+            "name": "Chat image",
+            "content": [
+                {
+                    "type": "image",
+                    "image": "data:image/png;base64," + base64.b64encode(png).decode(),
+                }
+            ],
+        },
+        ("m:1", "words"): {"id": "words", "type": "file", "name": "a.txt", "content": []},
+    }
+    monkeypatch.setattr(studio_db, "get_chat_attachment", lambda *ids: attachments.get(ids))
+    add = lambda item_id: _post(client, "items/project", id = item_id, projectId = "p1")  # noqa: E731
+    assert add("attachment:m%3A1:pic").json() == {"already": False}
+    [copied] = (project / "images").iterdir()
+    assert copied.name.startswith("Chat image-") and copied.suffix == ".png"
+    assert copied.read_bytes() == png
+    assert add("attachment:m%3A1:pic").json() == {"already": True}
+    assert add("attachment:m%3A1:words").status_code == 404
+    assert add("attachment:m%3A1:gone").status_code == 404
 
 
 @pytest.mark.parametrize(
@@ -974,7 +1441,6 @@ def test_generated_media_download_under_their_prompt(client, signed_in, project)
     assert disposition(f"image:{image}").startswith('attachment; filename="A red fox at dawn.png"')
     image = _gallery_image("Café ☕ at noon")
     assert f"filename*=UTF-8''{quote('Café ☕ at noon.png')}" in disposition(f"image:{image}")
-    # No prompt: the id, never an empty name.
     image = _gallery_image("  ")
     assert f'filename="{image}.png"' in disposition(f"image:{image}")
     assert 'filename="Hello there.wav"' in disposition(f"audio:{_gallery_audio('Hello there')}")
@@ -1010,7 +1476,6 @@ def test_a_sandbox_file_is_reachable_by_id_only_as_the_listing_walks_it(
         raise AssertionError("a per-item route listed the sandboxes")
 
     with monkeypatch.context() as patched:
-        # A card's file never lists every chat, and its sandbox is walked once for every card.
         patched.setattr(library, "_sandbox_sessions", listed)
         response = _download(client, "sandbox:t-lib:a.txt")
         assert response.content == b"mine"
@@ -1051,7 +1516,6 @@ def test_a_file_swapped_for_a_fifo_is_refused_without_waiting_for_a_writer(tmp_p
     worker.start()
     worker.join(5)
     if worker.is_alive():
-        # Unblock the stuck open so the thread ends, then fail.
         os.close(os.open(fifo, os.O_WRONLY | os.O_NONBLOCK))
     assert outcome == ["refused"]
 
@@ -1092,7 +1556,6 @@ def test_a_projects_own_files_are_listed(client, monkeypatch, tmp_path):
     project = studio_db.upsert_chat_project(
         {"id": "p-lib", "name": "Research", "createdAt": 1, "updatedAt": 1}
     )
-    # Studio gives every project a folder of its own, so the column is never empty.
     assert project["rootPath"]
     directory = resolve_sandbox_workdir("project-p-lib")
     os.makedirs(os.path.join(directory, "files"), exist_ok = True)
@@ -1111,8 +1574,7 @@ def test_a_projects_own_files_are_listed(client, monkeypatch, tmp_path):
 
 @pytest.fixture(autouse = True)
 def _temp_folders_are_ordinary(monkeypatch):
-    # macOS keeps pytest's temp folders under /private/var, which the real checks refuse, and they
-    # are temporary folders, which Library moves refuse too.
+    # macOS tmp lives under /private/var, which the real path checks refuse
     monkeypatch.setattr(
         _scan_folders,
         "is_denied_system_path",
@@ -1313,7 +1775,6 @@ def test_a_flag_set_during_a_move_keeps_the_ones_set_before(client, tmp_path, mo
     image_gallery.set_flags(kept, archived = True)
     fresh = _gallery_image("archived during the move")
 
-    # The images first and the store last, the order that loses it (directory order is the OS's).
     def store_last(
         source,
         target,
@@ -1439,9 +1900,7 @@ def test_another_spelling_of_a_folder_is_that_folder(client, tmp_path, monkeypat
     if spelling == "case" and not (images.parent / images.name.upper()).is_dir():
         pytest.skip("this disk tells case apart")
     if spelling == "link":
-        # resolve() keeps the spelling it is given: a case alias on a case-insensitive disk, or a
-        # bind mount, names a folder by a path that is not its own. A link that resolve() is kept
-        # from following stands in for either on any disk.
+        # a link resolve() cannot follow stands in for a case alias or bind mount
         monkeypatch.setattr(library, "_move_target", lambda raw: Path(raw))
 
     def alias(folder):
@@ -1450,7 +1909,6 @@ def test_another_spelling_of_a_folder_is_that_folder(client, tmp_path, monkeypat
         (tmp_path / folder.name).symlink_to(folder, target_is_directory = True)
         return tmp_path / folder.name
 
-    # The current folder under another name: nothing moves (a move onto itself would empty it).
     assert _move(client, "images", str(alias(images))).status_code == 200
     assert _move(client, "images", str(alias(videos))).status_code == 400
     assert _files(images) == ["0.png", "1.png", "2.png"] and _files(videos) == ["v.mp4"]
@@ -1530,8 +1988,7 @@ def test_an_upload_finishing_during_a_move_lands_in_the_new_folder(client, tmp_p
 
 
 def _move_after_lookup(monkeypatch, new):
-    """The first lookup of an upload's file starts a move of the uploads folder, and gives it a
-    moment to finish, before answering with where the file was."""
+    """The first upload lookup starts moving the uploads folder, then waits briefly before answering."""
     import threading
 
     real = library.upload_path
@@ -1994,7 +2451,6 @@ def _os_named(name):
         ("linux", "posix", True, False, None, "explorer"),
         ("linux", "posix", False, False, None, None),
         ("linux", "posix", False, False, "WAYLAND_DISPLAY", "files"),
-        # Never in a container, even with a display.
         ("linux", "posix", False, True, "DISPLAY", None),
     ],
 )
@@ -2039,6 +2495,110 @@ def test_explorer_gets_the_documented_select_command(tmp_path, monkeypatch):
     assert calls == [["explorer.exe", "/select,", windows_path]]
 
 
+class _Launcher:
+    def __init__(self, status):
+        self.status = status
+
+    def wait(self, timeout = None):
+        if self.status is None:
+            import subprocess
+            raise subprocess.TimeoutExpired("xdg-open", timeout)
+        return self.status
+
+
+def _linux_desktop(
+    monkeypatch,
+    tmp_path,
+    answers,
+    xdg_status = 0,
+):
+    """D-Bus clients exit with their code in *answers* (absent: not installed), xdg-open with *xdg_status* (None: still running)."""
+    import subprocess
+    from types import SimpleNamespace
+
+    import utils.paths.path_utils as path_utils
+
+    target = tmp_path / "it's, here" / "cat.png"
+    target.parent.mkdir(parents = True)
+    target.write_bytes(b"png")
+    commands = []
+
+    def run(command, **_kwargs):
+        commands.append(command)
+        code = answers.get(command[0])
+        if code is None:
+            raise FileNotFoundError(2, "No such file or directory", command[0])
+        return SimpleNamespace(returncode = code)
+
+    def popen(command, **_kwargs):
+        commands.append(command)
+        return _Launcher(xdg_status)
+
+    monkeypatch.setattr(path_utils.sys, "platform", "linux")
+    monkeypatch.setattr(path_utils, "os", _os_named("posix"))
+    monkeypatch.setattr(path_utils, "_IS_WSL", False)
+    monkeypatch.setattr(subprocess, "run", run)
+    monkeypatch.setattr(subprocess, "Popen", popen)
+    return target, commands
+
+
+def test_linux_reveal_asks_the_file_manager_to_select_the_file(tmp_path, monkeypatch):
+    import utils.paths.path_utils as path_utils
+
+    target, commands = _linux_desktop(monkeypatch, tmp_path, {"gdbus": 0})
+    path_utils.reveal_in_file_manager(target)
+    [command] = commands
+    assert command[:2] == ["gdbus", "call"]
+    assert "org.freedesktop.FileManager1.ShowItems" in command
+    # The quote and comma in the folder name are percent-encoded, so the array literal holds.
+    assert f"['{target.as_uri()}']" in command
+    assert "'" not in target.as_uri() and "," not in target.as_uri()
+
+    commands.clear()
+    path_utils.reveal_in_file_manager(target.parent)
+    assert "org.freedesktop.FileManager1.ShowFolders" in commands[0]
+    assert f"['{target.parent.as_uri()}']" in commands[0]
+
+
+def test_linux_reveal_tries_dbus_send_then_xdg_open_on_the_folder(tmp_path, monkeypatch):
+    import utils.paths.path_utils as path_utils
+
+    target, commands = _linux_desktop(monkeypatch, tmp_path, {"dbus-send": 0})
+    path_utils.reveal_in_file_manager(target)
+    assert [command[0] for command in commands] == ["gdbus", "dbus-send"]
+    assert f"array:string:{target.as_uri()}" in commands[1]
+
+    target, commands = _linux_desktop(monkeypatch, tmp_path / "b", {"gdbus": 1, "dbus-send": 1})
+    path_utils.reveal_in_file_manager(target)
+    assert commands[-1] == ["xdg-open", str(target.parent)]
+
+
+def test_linux_reveal_reports_an_xdg_open_that_fails(tmp_path, monkeypatch):
+    """No FileManager1 and no handler for folders used to answer 200 with nothing on screen."""
+    import utils.paths.path_utils as path_utils
+
+    target, commands = _linux_desktop(monkeypatch, tmp_path, {}, xdg_status = 3)
+    with pytest.raises(RuntimeError, match = "status 3"):
+        path_utils.reveal_in_file_manager(target)
+
+    # Still running after the wait: a fallback that holds the window open, not a failure.
+    target, commands = _linux_desktop(monkeypatch, tmp_path / "b", {}, xdg_status = None)
+    path_utils.reveal_in_file_manager(target)
+    assert commands[-1] == ["xdg-open", str(target.parent)]
+
+
+def test_a_failed_linux_reveal_answers_with_an_error(client, monkeypatch, tmp_path):
+    import utils.paths.file_manager as file_manager
+    import utils.paths.path_utils as path_utils
+
+    [note] = _upload(client, ("plan.md", b"# plan", "text/markdown"))
+    monkeypatch.setattr(file_manager, "file_manager_kind", lambda: "files")
+    _linux_desktop(monkeypatch, tmp_path, {}, xdg_status = 4)
+    response = _post(client, "items/reveal", id = note)
+    assert response.status_code == 500
+    assert response.json()["detail"] == "Failed to open file manager"
+
+
 @pytest.mark.parametrize(
     "path, root, inside",
     [
@@ -2064,7 +2624,6 @@ def test_containment_ignores_the_windows_long_path_prefix(path, root, inside):
         ((3000, 2000), "RGB", (640, 427)),
         ((1000, 5000), "RGBA", (640, 960)),
         ((4000, 500), "RGB", (640, 427)),
-        # Never scaled up.
         ((100, 80), "RGB", (100, 80)),
     ],
 )
@@ -2117,7 +2676,6 @@ def test_what_is_not_a_small_raster_or_clip_has_no_thumbnail(client, monkeypatch
         client,
         ("huge.png", _png(101, 100, "RGB"), "image/png"),
         ("broken.png", b"not a png", "image/png"),
-        # A format Pillow knows but a card does not need is never handed to its decoder.
         ("pic.png", ppm.getvalue(), "image/png"),
         ("pic.jpg", eps, "image/jpeg"),
         ("broken.mp4", b"not a video", "video/mp4"),
@@ -2213,7 +2771,6 @@ def _stream_url(client, item_id):
 
 
 def _stream(item_id, token):
-    # The real dependencies: the stream route must not need the bearer the mint does.
     return _app(None).get("/api/library/items/stream", params = {"id": item_id, "token": token})
 
 
@@ -2274,7 +2831,6 @@ def test_only_audio_and_video_items_get_a_stream_link(client):
         client,
         ("note.md", b"# hi", "text/markdown"),
         ("pic.png", b"\x89PNG", "image/png"),
-        # A declared type the extension map does not know is stored, but never streamed.
         ("clip.xyz", b"x", "video/x-custom"),
     )
     _sandbox_chat("notes.txt", b"text")
@@ -2284,7 +2840,6 @@ def test_only_audio_and_video_items_get_a_stream_link(client):
     for item_id in ("model:training:/x", "elsewhere:x"):
         assert mint(item_id) == 400, item_id
     assert (mint("upload:" + "0" * 32), mint("video:nope")) == (404, 404)
-    # A link can never be made for one, so the stream refuses it even with a valid signature.
     response = _stream(note, library_routes._sign_stream_id(note))
     assert response.status_code == 404 and b"# hi" not in response.content
     assert _mint(_app(None), note).status_code in (401, 403)
@@ -2313,7 +2868,6 @@ def test_a_tampered_expired_foreign_or_other_kind_of_link_is_refused(client, mon
     response = _stream(other, token)
     assert response.status_code == 401 and b"other" not in response.content
 
-    # A Video page link never opens this route, nor one of these the Video page's.
     video = _gallery_video("A calm sea")
     app = FastAPI()
     app.include_router(video_routes.router, prefix = "/api/inference")
@@ -2383,3 +2937,24 @@ def test_a_stream_link_reads_only_its_own_accounts_item(client, two_accounts):
     assert response.status_code == 404 and b"bob" not in response.content
     assert _stream(theirs_id, sign(alice, mine_id)).status_code == 401
     assert _stream(mine_id, sign(OWNER, mine_id)).status_code == 404
+
+
+@pytest.mark.parametrize("in_project", [False, True])
+def test_a_chat_named_like_its_project_session_is_listed_once(
+    client, signed_in, monkeypatch, tmp_path, in_project
+):
+    from storage import studio_db
+
+    monkeypatch.setenv("UNSLOTH_STUDIO_PROJECTS_HOME", str(tmp_path / "Projects home"))
+    monkeypatch.setattr(library, "_SOURCES", (library._sandbox_items,))
+    studio_db.upsert_chat_project(
+        {"id": "p-lib", "name": "Research", "createdAt": 1, "updatedAt": 1}
+    )
+    _sandbox_chat("a.txt", b"mine", thread = "project-p-lib")
+    if in_project:
+        studio_db.update_chat_thread("project-p-lib", {"projectId": "p-lib"})
+    library.invalidate_listing()
+    body = client.get("/api/library").json()["items"]
+    ids = [item["id"] for item in body]
+    assert ids.count("sandbox:project-p-lib:a.txt") == 1
+    assert body[ids.index("sandbox:project-p-lib:a.txt")]["threadId"] == "project-p-lib"

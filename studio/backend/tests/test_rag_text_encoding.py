@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import codecs
 
+import pytest
+
 from core.rag import parsers
 
 GREETING = "Sehr geehrte Frau Müller,\nviele Grüße aus Köln – 5 €.\n"
@@ -51,6 +53,48 @@ def test_a_utf8_byte_order_mark_wins_over_a_damaged_byte_and_a_declared_charset(
 
 def test_a_utf16_file_is_read_by_its_byte_order_mark(tmp_path):
     assert _text(tmp_path, "wide.txt", GREETING.encode("utf-16")) == GREETING
+
+
+def test_a_utf16_file_without_a_byte_order_mark_still_reads_as_text(tmp_path):
+    for codec in ("utf-16-le", "utf-16-be"):
+        assert _text(tmp_path, f"no_bom_{codec}.txt", GREETING.encode(codec)) == GREETING, codec
+    assert _text(tmp_path, "tiny.txt", b"H\x00i\x00!\x00!\x00") == "Hi!!"
+
+
+def test_a_utf16_source_file_without_a_byte_order_mark_is_not_mistaken_for_binary(tmp_path):
+    table = "name,score\nalpha,1\nbeta,2\n"
+    assert _text(tmp_path, "scores.csv", table.encode("utf-16-le")) == table
+
+
+def test_utf16_detection_survives_an_astral_or_ideographic_character(tmp_path):
+    text = "first line 😀 second line, more text follows here. 次\u3000の行\n"
+    for codec in ("utf-16-le", "utf-16-be"):
+        assert _text(tmp_path, f"astral_{codec}.txt", text.encode(codec)) == text
+
+
+def test_a_jpeg_header_is_not_read_as_utf16(tmp_path):
+    jpeg = b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x01\x00\x48\x00\x48\x00\x00" + bytes(64)
+    assert "JFIF" in _text(tmp_path, "photo.txt", jpeg)
+
+
+def test_a_binary_file_is_still_refused_under_a_source_extension(tmp_path):
+    blob = bytes(range(256)) * 8
+    path = tmp_path / "blob.csv"
+    path.write_bytes(blob)
+    with pytest.raises(ValueError, match = "binary"):
+        parsers.parse(str(path))
+
+
+def test_a_nul_shaped_binary_is_still_refused_under_a_source_extension(tmp_path):
+    for name, blob in (("readings.csv", b"\x01\x00" * 300), ("flags.csv", b"\x80\x00" * 300)):
+        path = tmp_path / name
+        path.write_bytes(blob)
+        with pytest.raises(ValueError, match = "binary"):
+            parsers.parse(str(path))
+
+
+def test_a_short_utf16_fragment_is_left_to_the_existing_heuristics(tmp_path):
+    assert _text(tmp_path, "short.txt", b"H\x00i\x00") == "H\x00i\x00"
 
 
 def test_an_html_page_is_read_in_the_charset_it_declares(tmp_path):
@@ -108,3 +152,71 @@ def test_a_declared_charset_decodes_as_its_browser_superset(tmp_path):
     ):
         page = f'<html><head><meta charset="{charset}"></head><body><p>{text}</p></body></html>'
         assert _text(tmp_path, f"{charset}.html", page.encode(codec)) == text, charset
+
+
+def test_a_chinese_japanese_korean_or_russian_text_file_is_read_in_its_own_encoding(tmp_path):
+    for codec, text in (
+        ("gbk", "退货政策：收到商品后三十天内可以退货。请保留原始包装和发票。\n"),
+        ("shift_jis", "返品ポリシー：商品到着後三十日以内に返品できます。\n"),
+        ("euc_kr", "반품 정책: 상품 수령 후 30일 이내에 반품할 수 있습니다.\n"),
+        ("big5", "退貨政策：收到商品後三十天內可以退貨。請保留原始包裝和發票。\n"),
+        ("cp1251", "Политика возврата: товар можно вернуть в течение тридцати дней.\n"),
+        (
+            "cp1253",
+            "Πολιτική επιστροφών: μπορείτε να επιστρέψετε το προϊόν εντός τριάντα ημερών.\n",
+        ),
+        ("cp1255", "מדיניות החזרות: ניתן להחזיר את המוצר תוך שלושים יום.\n"),
+        ("cp1256", "سياسة الإرجاع: يمكنك إرجاع المنتج خلال ثلاثين يومًا.\n"),
+    ):
+        assert _text(tmp_path, f"{codec}.txt", text.encode(codec)) == text, codec
+
+
+def test_a_chinese_japanese_korean_or_russian_file_with_code_in_it_is_read_in_its_own_encoding(
+    tmp_path,
+):
+    for codec, text in (
+        (
+            "gbk",
+            "# Unsloth 微调指南\n\n本文档介绍如何使用 Unsloth 在单张 GPU 上微调 Llama 3 模型。\n\n```bash\npip install unsloth\npip install --upgrade transformers datasets\n```\n\n注意：如果显存不足，请将 `max_seq_length` 调小，或者使用 `load_in_4bit = True`。\n",
+        ),
+        (
+            "shift_jis",
+            "このドキュメントでは、Docker を使って PostgreSQL サーバーを起動する方法を説明します。\n```\ndocker run -d --name pg -e POSTGRES_PASSWORD=secret postgres:16\n```\n",
+        ),
+        (
+            "euc_kr",
+            "이 문서는 Kubernetes 클러스터에서 nginx ingress controller 를 설정하는 방법을 설명합니다.\n```yaml\napiVersion: networking.k8s.io/v1\nkind: Ingress\n```\n",
+        ),
+        (
+            "cp1251",
+            "Установите пакет командой `pip install requests` и выполните скрипт `python main.py --config config.yaml`.\n",
+        ),
+    ):
+        assert _text(tmp_path, f"{codec}.md", text.encode(codec)) == text, codec
+
+
+def test_a_short_windows_1252_line_is_not_mistaken_for_another_language(tmp_path):
+    for line in (
+        "Copyright © 2024 Acme Inc. All rights reserved ®",
+        "Price: 25 € – shipping included.",
+        "Temperature: 25°C ± 2°C",
+        "naïve résumé",
+        "Jürgen Weiß",
+        "São Paulo",
+        "café",
+        "é",
+        "€ 12,50",
+        "£50",
+        "½ ¼ ¾",
+        "“”",
+        "1. Ä\n2. Ö\n3. Ü",
+        "é" * 8,
+        "Ü Ö Ä ß ü ö ä é",
+        "° ± µ ½ ¼ ¾ © ®",
+        "é è ê ë à â ä ô ö û ü ç",
+        "Æ Ø Å æ ø å Æ Ø",
+        "élève, für, está, bênção, égalité, âgé, forêt, café",
+        "à é è ù â ê î ô û ë ï ü ç œ æ",
+        "À É È Ê Ë Ù Û Ü Ô Ö Î Ï Â Ä Ç Œ Æ à é è ê ë ù û ü ô ö î ï â ä ç œ æ",
+    ):
+        assert _text(tmp_path, "short.txt", line.encode("cp1252")) == line, line

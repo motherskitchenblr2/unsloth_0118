@@ -15,6 +15,12 @@ import {
   useTrainingResourceNotices,
   useTrainingTransformersUpgradeNotice,
 } from "@/features/training";
+import {
+  PARALLEL_MODE_LABEL_KEYS,
+  runGpuCount,
+  showsGpuSection,
+} from "@/features/training/lib/parallel-plan";
+import { useTrainingParallelStore } from "@/features/training/stores/training-parallel-store";
 import { useGpuInfo } from "@/hooks";
 import { type TranslationKey, useLocale, useT } from "@/i18n";
 import { cn } from "@/lib/utils";
@@ -60,10 +66,14 @@ function MetaRow({
   label,
   value,
   mono,
+  title,
+  wrap,
 }: {
   label: string;
   value: ReactNode;
   mono?: boolean;
+  title?: string;
+  wrap?: boolean;
 }): ReactElement {
   return (
     <div className="flex items-baseline justify-between gap-3">
@@ -72,9 +82,11 @@ function MetaRow({
       </span>
       <span
         className={cn(
-          "min-w-0 truncate text-ui-12p5 text-foreground/90",
+          "min-w-0 text-ui-12p5 text-foreground/90",
+          wrap ? "break-words text-right" : "truncate",
           mono && "font-mono text-ui-12",
         )}
+        title={title}
       >
         {value}
       </span>
@@ -144,7 +156,7 @@ function ResourceNoticeList({
   }
   return (
     <section className="flex flex-col gap-2">
-      <p className="text-ui-10p5 font-medium uppercase tracking-[0.05em] text-muted-foreground/60">
+      <p className="text-ui-11 font-medium tracking-nav text-muted-foreground">
         {t("studio.preview.files")}
       </p>
       {notices.map((notice) => (
@@ -163,13 +175,8 @@ function ResourceNoticeList({
   );
 }
 
-/** What the run will really do about transformers and precision.
- *
- * The method row above is what the user picked, not what the backend will run: a model
- * routed to the latest-transformers sidecar always loads 16-bit, so "QLoRA · 4-bit" for
- * one of those is a VRAM promise the run cannot keep. Stated here, before Start. When
- * the model also ships its own code the dialog offers both ways in and only one keeps
- * 4-bit, so the precision line names the action rather than asserting one answer. */
+/** The method row is what the user picked: a model routed to the latest-transformers sidecar
+ * always loads 16-bit, and with custom code only one dialog path keeps 4-bit. */
 function TransformersUpgradeNotice(): ReactElement | null {
   const t = useT();
   const { installVersion, fourBitUnavailable, installSwitchesTo16Bit } =
@@ -244,7 +251,7 @@ function PreviewResource({
   return (
     <div className="flex flex-col gap-1">
       {owner && (
-        <p className="font-mono text-ui-10p5 uppercase tracking-[0.04em] text-muted-foreground/70">
+        <p className="font-mono text-ui-10p5 text-muted-foreground/70">
           {owner}
         </p>
       )}
@@ -350,6 +357,7 @@ export function RunPreviewCard({
     gradientAccumulation,
     learningRate,
     contextLength,
+    isDecision,
   } = useTrainingConfigStore(
     useShallow((s) => ({
       selectedModel: s.selectedModel,
@@ -368,10 +376,35 @@ export function RunPreviewCard({
       gradientAccumulation: s.gradientAccumulation,
       learningRate: s.learningRate,
       contextLength: s.contextLength,
+      isDecision: s.modelType === "decision",
     })),
   );
 
-  const gpu = useGpuInfo();
+  const hostGpuInfo = useGpuInfo();
+  // Only where the GPUs section shows, so a single-GPU preview is unchanged.
+  const hostGpuCount = useTrainingParallelStore(
+    (s) => s.capabilities?.gpus.length ?? 1,
+  );
+  const parallelPlan = useTrainingParallelStore((s) =>
+    s.capabilities && showsGpuSection(s.capabilities.gpus.length) && !s.plan?.error
+      ? s.plan
+      : null,
+  );
+  const hostGpus = useTrainingParallelStore((s) => s.capabilities?.gpus);
+  // Only the plan's GPUs, so unticked cards do not count.
+  const runGpus =
+    parallelPlan && hostGpus
+      ? hostGpus.filter((g) => parallelPlan.gpuIds.includes(g.index))
+      : [];
+  const gpu =
+    runGpus.length > 0
+      ? {
+          ...hostGpuInfo,
+          name: runGpus[0].name,
+          deviceCount: runGpus.length,
+          memoryTotalGb: runGpus.reduce((sum, g) => sum + (g.totalGb ?? 0), 0),
+        }
+      : hostGpuInfo;
   const hfToken = useHfTokenStore((s) => s.token);
   const hasToken = hfApiToken(hfToken) !== undefined;
   const { isReady, hasModel, hasDataset } = useTrainingReadiness();
@@ -484,11 +517,13 @@ export function RunPreviewCard({
             />
           }
         />
-        <MetaRow
-          label={t("studio.preview.context")}
-          value={numberFormatter.format(contextLength)}
-          mono={true}
-        />
+        {!isDecision && (
+          <MetaRow
+            label={t("studio.preview.context")}
+            value={numberFormatter.format(contextLength)}
+            mono={true}
+          />
+        )}
         <MetaRow
           label={t("studio.preview.lr")}
           value={formatLearningRate(learningRate)}
@@ -511,18 +546,60 @@ export function RunPreviewCard({
       <section className="flex flex-col gap-3">
         <MetaRow
           label={t("studio.preview.hardware")}
+          wrap
           value={
-            gpu.available
-              ? `${gpu.name} · ${gpu.memoryTotalGb} GiB`
-              : t("studio.preview.noGpu")
+            gpu.available ? (
+              <>
+                {gpu.name}
+                {gpu.deviceCount > 1 ? (
+                  <span className="whitespace-nowrap text-muted-foreground">
+                    {" "}
+                    {t("onboarding.device.moreGpus", {
+                      count: gpu.deviceCount - 1,
+                    })}
+                  </span>
+                ) : null}
+              </>
+            ) : (
+              t("studio.preview.noGpu")
+            )
           }
         />
+        {gpu.available && (
+          // memoryTotalGb sums every visible GPU, so say so when there is more than one.
+          <MetaRow
+            label={t("studio.preview.vram")}
+            title={`${gpu.memoryTotalGb} GiB`}
+            value={
+              gpu.deviceCount > 1
+                ? t("studio.preview.vramTotal", {
+                    size: `${Math.round(gpu.memoryTotalGb)} GiB`,
+                  })
+                : `${Math.round(gpu.memoryTotalGb)} GiB`
+            }
+          />
+        )}
         <MetaRow
           label={t("studio.preview.hfToken")}
           value={
             hasToken ? t("studio.preview.saved") : t("studio.preview.notSet")
           }
         />
+        {parallelPlan && (
+          <MetaRow
+            label={t("studio.preview.gpus")}
+            value={
+              runGpuCount(parallelPlan, hostGpuCount) === 1
+                ? t(PARALLEL_MODE_LABEL_KEYS[parallelPlan.mode])
+                : t("studio.gpus.runChip", {
+                    mode: t(PARALLEL_MODE_LABEL_KEYS[parallelPlan.mode]),
+                    count: numberFormatter.format(
+                      runGpuCount(parallelPlan, hostGpuCount),
+                    ),
+                  })
+            }
+          />
+        )}
       </section>
 
       <ResourceNoticeList notices={resourceNotices} />

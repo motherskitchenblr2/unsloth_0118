@@ -4,7 +4,7 @@
 import { useEffect, useSyncExternalStore } from "react";
 import {
   ensureLoginMode,
-  getFullAccessAllowed,
+  getConfirmedLoginMode,
   getLoginMode,
   subscribeLoginMode,
 } from "./login-client";
@@ -15,8 +15,7 @@ import {
 } from "./session";
 
 /** Display policy only; the server validates the token and enforces owner access. */
-// The owner's login id, reserved rather than chosen: validate_account_username
-// rejects it, so no managed account can take it and the owner cannot rename off it.
+// Reserved: validate_account_username rejects it, so no managed account can take it.
 export const OWNER_USERNAME = "unsloth";
 
 export function sessionAccount(
@@ -50,11 +49,18 @@ function subscribeSession(listener: () => void): () => void {
     for (const event of events) window.removeEventListener(event, listener);
   };
 }
+export function isAccountOwner(): boolean {
+  return sessionAccount(getAuthToken())?.isOwner ?? false;
+}
+
 export function useIsAccountOwner(): boolean {
+  return useSyncExternalStore(subscribeSession, isAccountOwner, () => false);
+}
+export function useConfirmedLoginMode() {
   return useSyncExternalStore(
-    subscribeSession,
-    () => sessionAccount(getAuthToken())?.isOwner ?? false,
-    () => false,
+    subscribeLoginMode,
+    getConfirmedLoginMode,
+    () => null,
   );
 }
 export function useLoginMode() {
@@ -66,13 +72,7 @@ export function useLoginMode() {
   useEffect(ensureLoginMode, []);
   return mode;
 }
-/** Whether Full access may be offered; false whenever another account exists, active or not. */
+/** The server enforces the same owner-only rule for unsandboxed tool calls. */
 export function useFullAccessAllowed(): boolean {
-  const allowed = useSyncExternalStore(
-    subscribeLoginMode,
-    getFullAccessAllowed,
-    () => true,
-  );
-  useEffect(ensureLoginMode, []);
-  return allowed;
+  return useIsAccountOwner();
 }

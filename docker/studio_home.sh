@@ -16,8 +16,7 @@ LEGACY_NAME=".unsloth-studio-legacy"
 log() { echo "[unsloth-studio] $*" >&2; }
 die() { log "ERROR: $*"; exit 1; }
 
-# mkdir -p, rm -rf and mv all follow a link planted at the legacy name (into the app
-# dir, say); refuse rather than write through it.
+# Refuse a link at the legacy name: mkdir, rm and mv would otherwise write through it.
 check_legacy() {
     if [ -L "$1" ] || { [ -e "$1" ] && [ ! -d "$1" ]; }; then
         die "$1 must be a directory, not a link or a file; move or remove it, then start the container again"
@@ -30,8 +29,7 @@ if [ "${1:-}" = "--restore" ]; then
     check_legacy "$legacy"
     shopt -s dotglob nullglob
     if [ ! -d "$legacy" ]; then
-        # No kept copy (first used after the split, or deleted): a pre-split image finds its
-        # own tree hidden under the mount and links to nothing, so give it real copies.
+        # A pre-split image sees its own tree hidden under the mount, so it needs real copies.
         [ -d "$APP" ] || die "no $legacy to restore and no $APP on this image: run --restore under an image that has the Unsloth Studio code in $APP (the one that last ran this volume), it copies that code into the home for an older image"
         copied=()
         for target in "$HOME_DIR"/*; do
@@ -41,8 +39,7 @@ if [ "${1:-}" = "--restore" ]; then
             name="${target##*/}"
             # the uv cache is this image's scratch (9 GB); no image before the split reads it
             if [ -e "$link" ] && [ "$name" != "uv-cache" ]; then
-                # copy beside the link and swap only once whole: a half-written real
-                # $target is skipped by this symlink-only loop on the rerun
+                # Swap only once whole: a half-written real $target is skipped on rerun.
                 tmp="$target.restore-tmp"
                 rm -rf -- "$tmp"
                 cp -a -- "$link" "$tmp" || {
@@ -122,9 +119,8 @@ set_aside() {
 
 shopt -s dotglob nullglob
 
-# unsloth-studio-update renames src to .src-prev.* and the staged tree into place; a kill
-# between the two leaves the previous tree as the only copy, so put it back before the
-# loop below prunes the home's src link as dangling.
+# A killed unsloth-studio-update can leave .src-prev.* as the only copy; restore it before
+# the loop prunes the src link.
 if [ ! -e "$APP/src" ]; then
     prev=("$APP"/.src-prev.*)
     if [ "${#prev[@]}" -eq 1 ] && [ -d "${prev[0]}" ]; then
@@ -165,10 +161,7 @@ for target in "$HOME_DIR"/*; do
     esac
 done
 
-# A killed update (docker stop ends in SIGKILL) can leave its previous tree beside src
-# and half-replaced packages; unsloth-studio-update keeps a record beside src until the
-# update is committed. Finish that restore here, before supervisord starts Studio on the
-# unverified tree. The home is linked by now, so the updater finds the venv.
+# Finish a killed update's rollback before supervisord starts Studio.
 if [ -s "$APP/.src-update.rollback" ]; then
     updater="${UNSLOTH_STUDIO_UPDATER:-/usr/local/bin/unsloth-studio-update}"
     if [ -x "$updater" ]; then
@@ -181,6 +174,22 @@ if [ -s "$APP/.src-update.rollback" ]; then
         fi
     else
         log "WARNING: an update was interrupted (record at $APP/.src-update.rollback) and $updater is not here to finish the restore"
+    fi
+fi
+
+# Skills stay on the volume; ~/.agents/skills, used by other agents, points there.
+skills="${UNSLOTH_STUDIO_SKILLS_HOME:-}"
+if [ -n "$skills" ]; then
+    (umask 077 && mkdir -p -- "$skills") || log "WARNING: cannot create $skills"
+    agents="${HOME:-/root}/.agents/skills"
+    current="$(readlink -- "$agents" || true)"
+    if [ "$current" = "$skills" ]; then
+        :
+    elif { [ ! -e "$agents" ] && [ ! -L "$agents" ]; } || [ "$current" = "$HOME_DIR/skills" ]; then
+        { (umask 077 && mkdir -p -- "${agents%/*}") && ln -sfnT -- "$skills" "$agents"; } \
+            || log "WARNING: cannot link $agents to $skills"
+    else
+        log "WARNING: Unsloth Studio lists and saves skills in $skills, not in $agents"
     fi
 fi
 
