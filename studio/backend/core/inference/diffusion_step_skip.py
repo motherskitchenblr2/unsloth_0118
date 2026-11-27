@@ -1,14 +1,15 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
-"""Opt-in static step skip (``transformer_cache="static"``): a schedule fixed per generation, decided outside the
-forward, so compile fullgraph and the CUDA graph are kept. A GraphedForward installed later goes under this layer."""
+"""Opt-in static step skip (transformer_cache=static): schedule fixed per generation outside the
+forward, keeps fullgraph compile and CUDA graph; GraphedForward installed later goes under it"""
 
 from __future__ import annotations
 
 import contextlib
 import inspect
 import os
+import sys
 from functools import update_wrapper
 from typing import Any, Optional
 
@@ -32,6 +33,8 @@ ENV_MODE = "UNSLOTH_STATIC_SKIP_MODE"
 ENV_HEAD = "UNSLOTH_STATIC_SKIP_HEAD"
 ENV_TAIL = "UNSLOTH_STATIC_SKIP_TAIL"
 ENV_EVERY = "UNSLOTH_STATIC_SKIP_EVERY"
+# Kill switch for the measured per-step masks: 0 keeps the family's interval schedule.
+ENV_MASK = "UNSLOTH_STATIC_SKIP_MASK"
 
 _SLOT = "_unsloth_static_skip"
 
@@ -49,20 +52,58 @@ def _is_tensor(obj: Any) -> bool:
     return bool(callable(is_tensor) and is_tensor(obj))
 
 
+def parse_mask(mask: Any) -> tuple:
+    """Per-step mask ('1' compute, '0' skip, or bools) as a tuple of bools, () if malformed; a
+    usable one computes its first MIN_HEAD_STEPS and last step (taylor1 needs two)."""
+    if isinstance(mask, str):
+        text = mask.strip()
+        if not text or set(text) - {"0", "1"}:
+            return ()
+        out = tuple(c == "1" for c in text)
+    elif isinstance(mask, (tuple, list)) and all(isinstance(c, bool) for c in mask):
+        out = tuple(mask)
+    else:
+        return ()
+    if len(out) < STATIC_MIN_STEPS or not all(out[:MIN_HEAD_STEPS]) or not out[-1]:
+        return ()
+    return out
+
+
+def _mask_for(masks: Any, n: int) -> tuple:
+    if not masks:
+        return ()
+    try:
+        raw = masks.get(n)
+    except AttributeError:
+        return ()
+    out = parse_mask(raw) if raw is not None else ()
+    return out if len(out) == n else ()
+
+
 def static_schedule(
     steps: Optional[int],
     *,
     head: float = DEFAULT_HEAD,
     tail: float = DEFAULT_TAIL,
     every: int = DEFAULT_EVERY,
+    min_steps: int = STATIC_MIN_STEPS,
+    masks: Optional[dict] = None,
 ) -> tuple:
-    """Per step, compute (True) or skip (False); empty (compute all) below ``STATIC_MIN_STEPS``."""
+    """Per step: True computes, False skips; empty below min_steps (never below STATIC_MIN_STEPS). A
+    measured mask applies at its step count even below min_steps, else interval schedule."""
     try:
         n = int(steps)  # type: ignore[arg-type]
         every = int(every)
+        floor = max(STATIC_MIN_STEPS, int(min_steps))
     except (TypeError, ValueError):
         return ()
-    if n < STATIC_MIN_STEPS or every < 2:
+    # Measured masks apply below the floor; parse_mask keeps them at STATIC_MIN_STEPS or more.
+    mask = _mask_for(masks, n)
+    if mask:
+        return mask
+    if n < floor:
+        return ()
+    if every < 2:
         return ()
     first = max(MIN_HEAD_STEPS, round(n * float(head)))
     last = max(1, round(n * float(tail)))
@@ -109,9 +150,38 @@ def static_skip_settings(env: Optional[dict] = None, logger: Any = None) -> dict
     return out
 
 
+def _every_override_valid(env: dict) -> bool:
+    try:
+        return int(env.get(ENV_EVERY)) >= 2
+    except (TypeError, ValueError):
+        return False
+
+
+def auto_static_settings(
+    plan: dict,
+    env: Optional[dict] = None,
+    logger: Any = None,
+) -> dict:
+    """Measured every and min_steps beat defaults; explicit UNSLOTH_STATIC_SKIP settings win."""
+    env = os.environ if env is None else env
+    out = static_skip_settings(env, logger)
+    every_override = _every_override_valid(env)
+    if out["every"] == DEFAULT_EVERY and plan.get("every") and not every_override:
+        out["every"] = int(plan["every"])
+    out["min_steps"] = int(plan.get("min_steps") or STATIC_MIN_STEPS)
+    masks = plan.get("masks")
+    mask_off = str(env.get(ENV_MASK, "") or "").strip().lower() in ("0", "false", "off", "no")
+    # An explicit interval / head / tail (benchmarking) or the kill switch keeps the interval schedule.
+    forced = every_override or out["head"] != DEFAULT_HEAD or out["tail"] != DEFAULT_TAIL
+    if masks and not forced and not mask_off:
+        out["masks"] = dict(masks)
+    out["auto"] = True
+    return out
+
+
 def _call_signature(args: tuple, kwargs: dict) -> tuple:
-    """Reuse key: latent shape, prefix-KV mode (an ``extract`` call returns a longer sequence), container."""
-    hidden = kwargs.get("hidden_states", args[0] if args else None)
+    """Reuse key: latent shape, prefix-KV mode (extract returns a longer sequence), container."""
+    hidden = kwargs.get("hidden_states", kwargs.get("sample", args[0] if args else None))
     if _is_tensor(hidden):
         shape = tuple(hidden.shape)
     elif isinstance(hidden, (list, tuple)) and hidden and all(_is_tensor(h) for h in hidden):
@@ -141,6 +211,9 @@ def _split_output(out: Any) -> tuple:
             return out[0], lambda v: (v,)
         if len(out) == 1 and type(out[0]) is list and _same_shape_tensors(out[0]):
             return _torch().stack(out[0]), lambda v: (list(v.unbind(0)),)
+        # Joint (video, audio) predictions (MiniMax-H3), per stream; a non-tensor member (klein KV cache) declines.
+        if len(out) >= 2 and all(_is_tensor(v) for v in out):
+            return _Joint(out), lambda v: tuple(v.parts)
         return None, None
     keys = getattr(out, "keys", None)
     if callable(keys) and callable(getattr(out, "to_tuple", None)):
@@ -160,6 +233,25 @@ def _split_output(out: Any) -> tuple:
             return _torch().stack(value), lambda v: cls(**{name: list(v.unbind(0))})
         return None, None
     return None, None
+
+
+class _Joint:
+    """Several predictions from one call, stored and extrapolated stream by stream."""
+
+    __slots__ = ("parts",)
+
+    def __init__(self, parts: Any) -> None:
+        self.parts = tuple(parts)
+
+    @property
+    def shape(self) -> tuple:
+        return tuple(tuple(p.shape) for p in self.parts)
+
+    def detach(self) -> "_Joint":
+        return _Joint(p.detach() for p in self.parts)
+
+    def clone(self) -> "_Joint":
+        return _Joint(p.clone() for p in self.parts)
 
 
 _TIMESTEP_NAMES = ("timestep", "timesteps", "t")
@@ -187,9 +279,8 @@ def _timestep_of(
     kwargs: dict,
     slot: tuple = ("timestep", None),
 ) -> Any:
-    """The call's timestep as a one-element float32 tensor on its own device (no host sync).
-
-    The max: a per-token ``mask * t`` (Wan2.2 TI2V, LTX) is 0 on conditioned tokens; taylor1 would silently reuse."""
+    """Timestep as a one-element float32 tensor (no host sync), taken as the max over tokens: a
+    per-token mask times t is 0 on conditioned tokens, and taylor1 would silently reuse."""
     name, index = slot
     t = kwargs.get(name)
     if t is None and index is not None and index < len(args):
@@ -204,13 +295,50 @@ def _timestep_of(
     return None
 
 
+# MiniMax-H3 token_tags of the (video, audio) output streams; each stream steps its own shifted schedule.
+_JOINT_STREAM_TAGS = (0, 2)
+
+
+def _stream_timesteps(kwargs: dict) -> Optional[tuple]:
+    """Per-stream target timestep: min over the stream's rows (conditioning rows sit at or above it); no host sync."""
+    torch = _torch()
+    ts, idx, tags = kwargs.get("timestep"), kwargs.get("timestep_indices"), kwargs.get("token_tags")
+    if not (_is_tensor(ts) and _is_tensor(idx) and _is_tensor(tags)):
+        return None
+    try:
+        rows = ts.detach().reshape(-1).float().index_select(0, idx.detach().reshape(-1).long())
+        tags = tags.detach().reshape(-1).to(rows.device)
+        inf = torch.full_like(rows, float("inf"))
+        return tuple(
+            torch.where(tags == tag, rows, inf).amin().reshape(1).clone()
+            for tag in _JOINT_STREAM_TAGS
+        )
+    except Exception:  # noqa: BLE001 - shared timestep instead
+        return None
+
+
+def _pick_t(t: Any, i: int, n: int) -> Any:
+    if isinstance(t, tuple):
+        return t[i] if len(t) == n else _torch().stack(t).amax().reshape(1)
+    return t
+
+
 def _extrapolate(v0: Any, t0: Any, v1: Any, t1: Any, t: Any) -> Any:
+    if isinstance(v1, _Joint):
+        n = len(v1.parts)
+        return _Joint(
+            _extrapolate(a, _pick_t(t0, i, n), b, _pick_t(t1, i, n), _pick_t(t, i, n))
+            for i, (a, b) in enumerate(zip(v0.parts, v1.parts))
+        )
+    t0, t1, t = (_pick_t(x, 0, 0) for x in (t0, t1, t))
     torch = _torch()
     device = v1.device
     t0, t1, t = t0.to(device), t1.to(device), t.to(device)
     step = t1 - t0
     safe = torch.where(step != 0, step, torch.ones_like(step))
     ratio = torch.where(step != 0, (t - t1) / safe, torch.zeros_like(step))
+    # A stream with no rows in the call reads inf: reuse instead of a NaN.
+    ratio = torch.where(torch.isfinite(ratio), ratio, torch.zeros_like(ratio))
     ratio = ratio.reshape([1] * v1.ndim) if v1.ndim else ratio.reshape(())
     v1f = v1.float()
     return (v1f + (v1f - v0.float()) * ratio).to(v1.dtype)
@@ -237,6 +365,9 @@ class StaticStepSkip:
         head: float = DEFAULT_HEAD,
         tail: float = DEFAULT_TAIL,
         every: int = DEFAULT_EVERY,
+        min_steps: int = STATIC_MIN_STEPS,
+        auto: bool = False,
+        masks: Optional[dict] = None,
         logger: Any = None,
     ) -> None:
         # First, so nothing update_wrapper copies over can shadow the state set below.
@@ -256,6 +387,10 @@ class StaticStepSkip:
         self.inner = inner
         self.mode = mode if mode in SKIP_MODES else DEFAULT_MODE
         self.head, self.tail, self.every = float(head), float(tail), int(every)
+        self.min_steps = int(min_steps)
+        self.auto = bool(auto)
+        self.masks = dict(masks) if masks else None
+        self.masked = False
         self.logger = logger
         self.armed = True
         self.context: Any = None
@@ -266,6 +401,9 @@ class StaticStepSkip:
         self.owner: Optional[str] = None
         # Of the last armed forward: the post-render reset empties the plan but status still reports it.
         self.planned_skips = 0
+        # Set while fronting a whole-module compiled call (front_compiled_call): computes run through it.
+        self.compiled_call: Any = None
+        self._inside = False
         self.reset(None)
 
     def reset(
@@ -275,18 +413,28 @@ class StaticStepSkip:
         step_signal: bool = False,
         keep_stats: bool = False,
         owner: Optional[str] = None,
+        compute_all: bool = False,
     ) -> "StaticStepSkip":
-        """Start a forward of ``steps`` denoise steps (None: compute all); ``keep_stats`` sums across chunks.
-        ``owner`` (arming only) rebinds the counters; a new owner never inherits the previous one's."""
+        """steps None computes all; keep_stats sums across chunks; a new owner never inherits
+        counts; compute_all counts but skips nothing (an auto skip on an unmeasured workflow)."""
         self.plan = (
-            static_schedule(steps, head = self.head, tail = self.tail, every = self.every)
-            if self.armed
+            static_schedule(
+                steps,
+                head = self.head,
+                tail = self.tail,
+                every = self.every,
+                min_steps = self.min_steps,
+                masks = self.masks,
+            )
+            if self.armed and not compute_all
             else ()
         )
         skips = [i for i, compute in enumerate(self.plan) if not compute]
         self.last_skip = skips[-1] if skips else -1
         if steps is not None:
             self.planned_skips = len(skips)
+            # Whether this generation's plan is a measured mask (status survives the post-render reset).
+            self.masked = bool(self.plan) and bool(_mask_for(self.masks, len(self.plan)))
         self.step_signal = bool(step_signal)
         # An empty schedule still counts, so status never reports the previous generation's skips.
         self.counting = steps is not None
@@ -316,6 +464,10 @@ class StaticStepSkip:
             "head": self.head,
             "tail": self.tail,
             "every": self.every,
+            "min_steps": self.min_steps,
+            "auto": self.auto,
+            "mask_steps": sorted(self.masks) if self.masks else [],
+            "masked": self.masked,
             "armed": bool(self.armed),
             "planned_skips": self.planned_skips,
             "stats": dict(self.stats if self.stats["calls"] else self.last_stats),
@@ -328,11 +480,28 @@ class StaticStepSkip:
         return inner(*args, **kwargs)
 
     def __call__(self, *args, **kwargs):
+        if self._inside:
+            # The compiled call this layer fronts reads ``forward`` (this layer): run what it wraps.
+            return self._forward(args, kwargs)
+        return self._dispatch(args, kwargs)
+
+    def _compute(self, args: tuple, kwargs: dict) -> Any:
+        call = self.compiled_call
+        if call is None or _eager_forced():
+            # force_eager: compute eagerly; the graphed call must not be entered at a new size.
+            return self._forward(args, kwargs)
+        self._inside = True
+        try:
+            return call(*args, **kwargs)
+        finally:
+            self._inside = False
+
+    def _dispatch(self, args: tuple, kwargs: dict) -> Any:
         if not self.plan:
             if self.counting:
                 self.stats["calls"] += 1
                 self.stats["computed"] += 1
-            return self._forward(args, kwargs)
+            return self._compute(args, kwargs)
         if self.context is not None:
             key = self.context
         else:
@@ -361,7 +530,7 @@ class StaticStepSkip:
             if out is not None:
                 self.stats["skipped"] += 1
                 return out
-        out = self._forward(args, kwargs)
+        out = self._compute(args, kwargs)
         self.stats["computed"] += 1
         if step < self.last_skip:
             self._remember(key, sig, args, kwargs, out)
@@ -381,9 +550,10 @@ class StaticStepSkip:
                 )
             return
         # Cloned: the pipeline may keep or modify the tensor it was handed.
-        stored = _Stored(
-            sig, _timestep_of(args, kwargs, self._t_slot), value.detach().clone(), rebuild
+        t = (_stream_timesteps(kwargs) if isinstance(value, _Joint) else None) or _timestep_of(
+            args, kwargs, self._t_slot
         )
+        stored = _Stored(sig, t, value.detach().clone(), rebuild)
         keep = 2 if self.mode == MODE_TAYLOR1 else 1
         history = self.history.setdefault(key, [])
         history.append(stored)
@@ -394,7 +564,9 @@ class StaticStepSkip:
         value = None
         if self.mode == MODE_TAYLOR1 and len(history) >= 2:
             prev = history[-2]
-            t = _timestep_of(args, kwargs, self._t_slot)
+            t = (
+                _stream_timesteps(kwargs) if isinstance(last.value, _Joint) else None
+            ) or _timestep_of(args, kwargs, self._t_slot)
             # Only same-shape outputs combine: a prefix-KV step 0 is longer than every later step.
             if (
                 prev.sig == last.sig
@@ -429,13 +601,95 @@ def _context_wrapper(skip: StaticStepSkip, module: Any, prior: Any) -> Any:
     return cache_context
 
 
-def _find(pipe: Any) -> Optional[StaticStepSkip]:
+def _denoiser(pipe: Any) -> Any:
+    """The step denoiser: ``pipe.transformer``, else a U-Net pipeline's ``pipe.unet`` (SDXL)."""
     transformer = getattr(pipe, "transformer", None)
+    return transformer if transformer is not None else getattr(pipe, "unet", None)
+
+
+_OPAQUE = False
+
+
+def _opaque_to_dynamo() -> None:
+    """A whole-module compile (``nn.Module.compile``: the SDXL U-Net) traces ``_call_impl`` into the forward slot,
+    i.e. into this layer: dynamo then guards on its step counters and recompiles every step until the recompile
+    limit drops the compile. The schedule's frames run outside dynamo; only ``_forward`` (the wrapped forward) is
+    traced, as its own frame, so the denoiser is compiled exactly as without the layer."""
+    global _OPAQUE
+    if _OPAQUE:
+        return
+    try:
+        disable = getattr(getattr(_torch(), "compiler", None), "disable", None)
+        if not callable(disable):
+            return
+        _OPAQUE = True
+        # Frames that reach the forward: skipped themselves, their callees still traced (recursive=False).
+        for name in ("__call__", "_dispatch", "_compute"):
+            setattr(StaticStepSkip, name, disable(getattr(StaticStepSkip, name), recursive = False))
+        # Pure bookkeeping: never traced at all.
+        for name in ("_remember", "_skipped"):
+            setattr(StaticStepSkip, name, disable(getattr(StaticStepSkip, name)))
+        module = sys.modules[__name__]
+        for name in (
+            "_call_signature",
+            "_split_output",
+            "_timestep_of",
+            "_stream_timesteps",
+            "_eager_forced",
+        ):
+            setattr(module, name, disable(getattr(module, name)))
+    except Exception:  # noqa: BLE001 - an old torch keeps the plain call
+        pass
+
+
+def _find(pipe: Any) -> Optional[StaticStepSkip]:
+    transformer = _denoiser(pipe)
     try:
         skip = transformer.__dict__.get(_SLOT) if transformer is not None else None
     except Exception:  # noqa: BLE001 - no instance dict
         return None
     return skip if isinstance(skip, StaticStepSkip) else None
+
+
+def front_compiled_call(module: Any) -> bool:
+    """Put ``module``'s skip layer in front of its whole-module compiled call (``Module.compile``).
+
+    ``Module.__call__`` serves such a module from ``_compiled_call_impl``, which reads ``forward`` (this layer)
+    inside the compiled region: a CUDA graph captured around that call (GraphedCompiledCall) would bake one
+    computed step in and replay it on every step, bypassing the schedule. In front, the layer decides first and
+    computes through the call; the call's own read of ``forward`` passes straight through."""
+    skip = getattr(module, "__dict__", {}).get(_SLOT)
+    if not isinstance(skip, StaticStepSkip) or skip.module is not module:
+        return False
+    call = getattr(module, "_compiled_call_impl", None)
+    if call is None:
+        return False
+    if call is not skip:
+        skip.compiled_call = call
+        module._compiled_call_impl = skip
+    return True
+
+
+def fronting_skip(module: Any) -> Optional[StaticStepSkip]:
+    """The skip layer sitting at ``module._compiled_call_impl`` (``front_compiled_call``), else None."""
+    call = getattr(module, "_compiled_call_impl", None)
+    return call if isinstance(call, StaticStepSkip) and call.module is module else None
+
+
+def _eager_forced() -> bool:
+    try:
+        from .diffusion_bg_compile import eager_forced
+    except Exception:  # noqa: BLE001 - no background compile layer: never forced
+        return False
+    return bool(eager_forced())
+
+
+def unfront_compiled_call(module: Any, call: Any, restore: Any) -> None:
+    skip = getattr(module, "__dict__", {}).get(_SLOT)
+    if isinstance(skip, StaticStepSkip) and skip.compiled_call is call:
+        skip.compiled_call = restore
+        if restore is None and getattr(module, "_compiled_call_impl", None) is skip:
+            module._compiled_call_impl = None
 
 
 def install_static_step_skip(
@@ -445,9 +699,9 @@ def install_static_step_skip(
     logger: Any = None,
 ) -> Optional[str]:
     """``TC_STATIC`` or None (uncached). Never sets ``_unsloth_step_cache``, which runs the CUDA graph eager."""
-    transformer = getattr(pipe, "transformer", None)
+    transformer = _denoiser(pipe)
     if transformer is None:
-        _warn(logger, "pipeline has no transformer")
+        _warn(logger, "pipeline has no transformer or unet")
         return None
     # A second denoiser takes part of the CFG trajectory this layer would not see.
     for attr in ("transformer_2", "unconditional_transformer"):
@@ -459,6 +713,7 @@ def install_static_step_skip(
         _warn(logger, "transformer has no forward")
         return None
     knobs = settings if settings is not None else static_skip_settings(logger = logger)
+    _opaque_to_dynamo()
     existing = _find(pipe)
     if existing is not None:
         existing.armed = True
@@ -466,6 +721,10 @@ def install_static_step_skip(
         existing.head = float(knobs.get("head", existing.head))
         existing.tail = float(knobs.get("tail", existing.tail))
         existing.every = int(knobs.get("every", existing.every))
+        existing.min_steps = int(knobs.get("min_steps", STATIC_MIN_STEPS))
+        existing.auto = bool(knobs.get("auto", False))
+        masks = knobs.get("masks")
+        existing.masks = dict(masks) if masks else None
         existing.reset(None)
         return TC_STATIC
     try:
@@ -477,6 +736,9 @@ def install_static_step_skip(
             head = knobs.get("head", DEFAULT_HEAD),
             tail = knobs.get("tail", DEFAULT_TAIL),
             every = knobs.get("every", DEFAULT_EVERY),
+            min_steps = knobs.get("min_steps", STATIC_MIN_STEPS),
+            auto = knobs.get("auto", False),
+            masks = knobs.get("masks"),
             logger = logger,
         )
         prior_ctx = slots.get("cache_context")
@@ -488,16 +750,21 @@ def install_static_step_skip(
         # Written into the instance dict, like GraphedForward: nn.Module.__setattr__ would inspect it.
         slots["forward"] = skip
         slots[_SLOT] = skip
+        # Already whole-module compiled: decide in front of the compiled call, never inside its trace.
+        front_compiled_call(transformer)
     except Exception as exc:  # noqa: BLE001 - best-effort, the load proceeds uncached
         _warn(logger, str(exc))
         return None
     if logger is not None:
         logger.info(
-            "diffusion.step_skip: static engaged (mode=%s head=%s tail=%s every=%s)",
+            "diffusion.step_skip: static engaged (mode=%s head=%s tail=%s every=%s min_steps=%s%s%s)",
             skip.mode,
             skip.head,
             skip.tail,
             skip.every,
+            skip.min_steps,
+            ", auto" if skip.auto else "",
+            f", masks for {sorted(skip.masks)} steps" if skip.masks else "",
         )
     return TC_STATIC
 
@@ -509,11 +776,18 @@ def reset_static_step_skip(
     step_signal: bool = False,
     keep_stats: bool = False,
     owner: Optional[str] = None,
+    compute_all: bool = False,
 ) -> bool:
     skip = _find(pipe)
     if skip is None:
         return False
-    skip.reset(steps, step_signal = step_signal, keep_stats = keep_stats, owner = owner)
+    skip.reset(
+        steps,
+        step_signal = step_signal,
+        keep_stats = keep_stats,
+        owner = owner,
+        compute_all = compute_all,
+    )
     return True
 
 
@@ -521,6 +795,12 @@ def mark_step_end(pipe: Any) -> None:
     skip = _find(pipe)
     if skip is not None:
         skip.step_end()
+
+
+def static_skip_is_auto(pipe: Any) -> bool:
+    """Whether the installed layer came from the auto policy (measured per workflow) rather than an explicit ask."""
+    skip = _find(pipe)
+    return bool(skip is not None and skip.auto)
 
 
 def static_skip_stats(pipe: Any) -> Optional[dict]:
@@ -546,6 +826,9 @@ def uninstall_static_step_skip(pipe: Any) -> bool:
     skip.reset(None)
     try:
         slots = skip.module.__dict__
+        if getattr(skip.module, "_compiled_call_impl", None) is skip:
+            skip.module._compiled_call_impl = skip.compiled_call
+        skip.compiled_call = None
         if slots.get("forward") is skip:
             if skip.inner is None:
                 slots.pop("forward", None)

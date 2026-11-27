@@ -18,20 +18,12 @@ import types
 from unittest.mock import MagicMock
 
 
-# This file reaches core/inference/inference.py, which imports unsloth at module scope, from
-# inside a helper, so test_backend_tests_stub_heavy_imports.py's source scan never saw it. The
-# import only ever worked when another file on the same xdist worker had already stubbed
-# unsloth; sharding changed who shares a worker, so the stub is explicit here now.
+# inference.py imports unsloth; stub explicitly, the source scan misses this path.
 _STUBBED: list[str] = []
 
 
 def _stub_if_missing(name, attrs):
-    """Stub a dep the backend pytest matrix does not install, as test_trainer_stdout_quiet.py does.
-
-    That matrix stops at studio.txt plus torch and transformers; repo-cpu-tests is the job that
-    installs unsloth_zoo. Unstubbed, this module fails COLLECTION and takes the job down. A real
-    install is left alone, and __spec__ = None keeps the namespace-shadow guard a no-op here.
-    """
+    """Stub a dep the backend test matrix does not install, or collection fails and takes the job down."""
     if name in sys.modules:
         return
     try:
@@ -68,11 +60,7 @@ from core.inference.native_audio import (
     native_audio_type_from_local_path,
 )
 
-# Bind the dependency while the stubs stand, then drop them, as test_trainer_stdout_quiet.py
-# does. Left in place they outlive this module, and a later file's _stub_if_missing returns
-# before recording ownership, so nobody can clean them up. Concretely, _shared_policy branches
-# on `"unsloth" in sys.modules` and returns None off the stub instead of reaching its disk
-# fallback. A real install stubs nothing, so this is a no-op there.
+# Bind under the stubs, then drop them: leftover stubs make _shared_policy return None.
 import core.inference.inference  # noqa: F401,E402 - imported to bind it under the stubs
 
 for _name in reversed(_STUBBED):
@@ -276,6 +264,120 @@ def test_minimax_download_plan_excludes_unreferenced_legacy_weights(monkeypatch)
     assert plan["required_bytes"] == 110
 
 
+def _hub_repo(monkeypatch, siblings):
+    api = SimpleNamespace(
+        model_info = lambda *_args, **_kwargs: SimpleNamespace(sha = "current", siblings = siblings)
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "huggingface_hub",
+        SimpleNamespace(HfApi = lambda **_kwargs: api),
+    )
+    monkeypatch.setattr(
+        "core.inference.native_audio._native_audio_file_is_cached", lambda *_args: False
+    )
+
+
+def test_download_plan_refuses_every_quant_of_an_unknown_gguf_repo(monkeypatch):
+    _hub_repo(
+        monkeypatch,
+        [
+            SimpleNamespace(rfilename = "README.md", size = 1),
+            SimpleNamespace(rfilename = "UD-IQ1_M/Big-UD-IQ1_M-00001-of-00005.gguf", size = 10**12),
+            SimpleNamespace(rfilename = "Q8_0/Big-Q8_0-00001-of-00009.gguf", size = 10**12),
+        ],
+    )
+    with pytest.raises(ValueError, match = "publishes several GGUF quants"):
+        native_audio_download_plan("unsloth/Big-Chat-GGUF")
+
+
+def test_download_plan_still_lists_one_quant_beside_a_companion_gguf(monkeypatch):
+    _hub_repo(
+        monkeypatch,
+        [
+            SimpleNamespace(rfilename = "yue2-3b-q4_k_m.gguf", size = 20),
+            SimpleNamespace(rfilename = "yue2-vae-f16.gguf", size = 5),
+        ],
+    )
+    plan = native_audio_download_plan("someone/yue2-GGUF")
+    assert sorted(plan["entries"][0]["files"]) == ["yue2-3b-q4_k_m.gguf", "yue2-vae-f16.gguf"]
+    assert plan["required_bytes"] == 25
+
+
+@pytest.mark.parametrize(
+    "files",
+    [
+        ["Q4_K_M/Big-00001-of-00002.gguf", "Q8_0/Big-00001-of-00002.gguf"],
+        ["Q4_K_M.gguf", "Q8_0.gguf"],
+        ["Big-Q4_K_M-imat.gguf", "Big-Q8_0-imat.gguf"],
+        ["Big-fp16.gguf", "Big-Q8_0.gguf"],
+        ["Foo-PQ2_0.gguf", "Foo-Q2_0.gguf"],
+        ["Q6_K/model-3.5bpw.gguf", "Q6_K/model-4.0bpw.gguf"],
+        ["Q4_K_M/Foo-001-of-002.gguf", "Q8_0/Foo-001-of-003.gguf"],
+    ],
+)
+def test_download_plan_refuses_quants_named_by_folder_or_bare_label(monkeypatch, files):
+    _hub_repo(monkeypatch, [SimpleNamespace(rfilename = f, size = 10) for f in files])
+    with pytest.raises(ValueError, match = "publishes several GGUF quants"):
+        native_audio_download_plan("someone/Big-GGUF")
+
+
+def test_download_plan_skips_a_projector_folder_when_counting_quants(monkeypatch):
+    _hub_repo(
+        monkeypatch,
+        [
+            SimpleNamespace(rfilename = "Q4_K_M/model.gguf", size = 20),
+            SimpleNamespace(rfilename = "mmproj/model.gguf", size = 5),
+        ],
+    )
+    plan = native_audio_download_plan("someone/Vision-GGUF")
+    assert plan["required_bytes"] == 25
+
+
+def test_download_plan_still_lists_a_gguf_repo_with_one_quant(monkeypatch):
+    _hub_repo(
+        monkeypatch,
+        [
+            SimpleNamespace(rfilename = "Voice-Q8_0-00001-of-00002.gguf", size = 10),
+            SimpleNamespace(rfilename = "Voice-Q8_0-00002-of-00002.gguf", size = 10),
+            SimpleNamespace(rfilename = "mmproj-F16.gguf", size = 5),
+        ],
+    )
+    plan = native_audio_download_plan("someone/voice-GGUF")
+    assert plan["required_bytes"] == 25
+
+
+def test_download_plan_refuses_quants_beside_a_cached_checkpoint(monkeypatch):
+    # The loader picks a GGUF here, so a zero-byte checkpoint-only plan would fetch an unplanned quant.
+    _hub_repo(
+        monkeypatch,
+        [
+            SimpleNamespace(rfilename = "model.safetensors", size = 100),
+            SimpleNamespace(rfilename = "gguf/tts-Q4_K_M.gguf", size = 10),
+            SimpleNamespace(rfilename = "gguf/tts-Q8_0.gguf", size = 20),
+        ],
+    )
+    monkeypatch.setattr(
+        "core.inference.native_audio._native_audio_file_is_cached",
+        lambda _repo, filename, *_args: filename == "model.safetensors",
+    )
+    with pytest.raises(ValueError, match = "publishes several GGUF quants"):
+        native_audio_download_plan("someone/tts-with-quants")
+
+
+def test_download_plan_still_lists_an_unknown_safetensors_repo(monkeypatch):
+    _hub_repo(
+        monkeypatch,
+        [
+            SimpleNamespace(rfilename = "config.json", size = 1),
+            SimpleNamespace(rfilename = "model.safetensors", size = 100),
+        ],
+    )
+    plan = native_audio_download_plan("someone/some-tts")
+    assert plan["entries"][0]["files"] == ["config.json", "model.safetensors"]
+    assert plan["required_bytes"] == 101
+
+
 def test_higgs_tts2_download_plan_includes_audio_tokenizer(monkeypatch):
     calls = []
     siblings = [SimpleNamespace(rfilename = "model.safetensors", size = 100)]
@@ -469,6 +571,9 @@ def test_moss_cuda_sdpa_disables_the_broken_cudnn_backend(monkeypatch):
 
 
 def test_moss_nano_overrides_flash_attention_on_cpu(monkeypatch):
+    # Windows disables SentencePiece by default (utils/sentencepiece_guard.py), which makes the MOSS load refuse
+    # before it reaches the attention kwargs; that refusal has its own test in test_moss_sentencepiece_preflight.py.
+    monkeypatch.delitem(sys.modules, "sentencepiece", raising = False)
     seen = {}
 
     def load_model(*_args, **kwargs):

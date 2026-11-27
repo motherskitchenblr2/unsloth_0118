@@ -1,22 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
-"""Every backend shape this accounting can be handed, and every old caller of it.
-
-Re-costing changes how a tool loop is admitted, so every install that does NOT get the new
-path must behave exactly as it did. Budget and slot count are both derived from the loaded
-backend, and that derivation differs per platform and per device:
-
-  * ``capacity`` is ``effective_parallel_slots``, reduced to fit VRAM and forced to 1 on a
-    CPU-only or small-VRAM load. A 1-slot backend must be untouched by this change.
-  * ``budget`` is ``_kv_cache_context_total``: ``n_ctx`` under ``--kv-unified``,
-    ``n_ctx * slots`` without it, None when the context length cannot be read back from
-    ``/props``. None means slot-only admission, the pre-#9392 behaviour.
-
-The matrix below is the real portability surface, not a stand-in for other operating
-systems: the code added here is stdlib threading and ``time.monotonic`` with no
-OS-specific branch, and what varies per platform is which of these numbers arrives.
-"""
+"""Installs off the new path must admit exactly as before; a None budget means slot-only admission."""
 
 from __future__ import annotations
 
@@ -72,7 +57,7 @@ def _lease(
     return reservation.lease_nowait()
 
 
-# (label, slots, n_ctx, kv_unified) -- the shapes a real load actually produces.
+# (label, slots, n_ctx, kv_unified)
 BACKENDS = [
     ("cpu-only, 1 slot", 1, 4096, True),
     ("small vram, downshifted", 1, 8192, True),
@@ -85,8 +70,7 @@ BACKENDS = [
 
 
 def _budget(n_ctx, slots, kv_unified):
-    """Mirrors _reconcile_effective_ctx_with_server: unified reports one shared cache,
-    non-unified reports the aggregate across per-slot windows."""
+    """Mirrors _reconcile_effective_ctx_with_server: one shared cache if unified, else the sum."""
     return n_ctx * (1 if kv_unified else slots)
 
 
@@ -99,8 +83,7 @@ def test_a_tool_loop_is_never_charged_more_than_the_cache(label, slots, n_ctx, k
 
 @pytest.mark.parametrize("label,slots,n_ctx,kv_unified", BACKENDS)
 def test_a_single_slot_backend_behaves_as_it_always_did(label, slots, n_ctx, kv_unified):
-    """capacity 1 means share == budget, so a tool loop is charged the whole cache just as
-    #9392 charged it. The common shape on CPU-only and on a VRAM-downshifted load."""
+    """Capacity 1 makes share equal budget, so a tool loop pays the whole cache as #9392 did."""
     if slots != 1:
         pytest.skip("covered by the multi-slot cases")
     budget = _budget(n_ctx, slots, kv_unified)
@@ -110,8 +93,7 @@ def test_a_single_slot_backend_behaves_as_it_always_did(label, slots, n_ctx, kv_
 @pytest.mark.parametrize("label,slots,n_ctx,kv_unified", BACKENDS)
 @pytest.mark.asyncio
 async def test_the_slots_a_backend_reports_can_all_be_filled(label, slots, n_ctx, kv_unified):
-    """On any multi-slot backend, ordinary tool chats fill the slots the backend
-    advertises rather than running one at a time."""
+    """Multi-slot backends: ordinary tool chats fill every advertised slot, not one at a time."""
     budget = _budget(n_ctx, slots, kv_unified)
     cost = _tokens(_payload(), budget = budget, capacity = slots, tool_loop = True)
     queue = LlamaAdmissionQueue(label)
@@ -137,8 +119,7 @@ def test_max_tokens_on_max_is_not_treated_as_a_promise_to_use_it(label, slots, n
 
 
 class TestNothingChangesWhenTheBudgetIsUnknown:
-    """``budget`` is None when the context length cannot be read back: the pre-#9392
-    slot-only path, which has to stay bit-for-bit what it was."""
+    """budget None (context length unreadable) keeps the pre-#9392 slot-only path bit-for-bit."""
 
     def test_no_budget_means_no_token_cost_at_all(self):
         for tool_loop in (True, False):
@@ -173,8 +154,7 @@ class TestNothingChangesWhenTheBudgetIsUnknown:
 
     @pytest.mark.asyncio
     async def test_the_kv_budget_escape_hatch_still_overcommits(self):
-        """UNSLOTH_LLAMA_ADMISSION_KV_BUDGET=0, the documented way out for a backend whose
-        reported context length does not match the cache it allocated."""
+        """UNSLOTH_LLAMA_ADMISSION_KV_BUDGET=0: documented escape for a wrong context length."""
         queue = LlamaAdmissionQueue("escape")
         config = LlamaAdmissionConfig(kv_budget = False)
         first = _lease(queue, tokens = 1500, budget = 2048, config = config)
@@ -184,8 +164,8 @@ class TestNothingChangesWhenTheBudgetIsUnknown:
         assert queue._reparking == 0
 
 
-# In the order they were added, so older positional callers keep their meaning.
-_TOOL_LOOP_HOOKS = ("on_conversation_grew", "on_decode_slot")
+# in the order they were added, so older positional callers keep their meaning
+_TOOL_LOOP_HOOKS = ("on_conversation_grew", "on_decode_slot", "thinking_budget_tokens")
 
 
 class TestOldCallers:
@@ -209,7 +189,6 @@ class TestOldCallers:
         assert queue._reparking == 0, "the non-blocking path must never touch the wait line"
 
     def test_the_route_recost_helper_accepts_no_cancel_event(self):
-        # Reservation None is the "not admitted yet" case every call site can hit.
         import routes.inference as routes_inference
         routes_inference._openai_llama_admission_recost(
             None,
@@ -228,9 +207,7 @@ class TestOldCallers:
             assert signature.parameters[name].default is None, f"{name} must be optional"
 
     def test_the_hook_was_appended_rather_than_inserted(self):
-        """No bare ``*`` in this signature, so every parameter is positional-or-keyword and
-        inserting one silently rebinds the arguments after it for positional callers, with
-        no exception to report it."""
+        """No bare * allowed: inserting one rebinds arguments after it for positional callers."""
         import inspect
 
         from core.inference.llama_cpp import LlamaCppBackend
@@ -238,8 +215,30 @@ class TestOldCallers:
         names = list(
             inspect.signature(LlamaCppBackend.generate_chat_completion_with_tools).parameters
         )
-        tail = names[-len(_TOOL_LOOP_HOOKS) :]
-        assert tail == list(_TOOL_LOOP_HOOKS), f"the hooks must stay at the tail, got {tail}"
+        start = names.index(_TOOL_LOOP_HOOKS[0])
+        hooks = names[start : start + len(_TOOL_LOOP_HOOKS)]
+        assert hooks == list(
+            _TOOL_LOOP_HOOKS
+        ), f"the hooks must stay together in order, got {hooks}"
+
+    def test_the_sandbox_level_was_appended_rather_than_inserted(self):
+        import inspect
+
+        from core.inference.llama_cpp import LlamaCppBackend
+
+        names = list(
+            inspect.signature(LlamaCppBackend.generate_chat_completion_with_tools).parameters
+        )
+        assert names.index("sandbox_level") == names.index("instruction_anchor_ids") + 1
+        assert names[-6:] == [
+            "compact_context",
+            "website_policy",
+            "live_permissions",
+            "chat_template_kwargs",
+            "mcp_match_exchange",
+            "record_cut_thought",
+        ]
+        assert names.index("promote_reasoning_only") == names.index("permission_mode") + 1
 
     def test_the_wait_timeout_has_a_sane_default(self):
         import inspect
@@ -261,7 +260,6 @@ class TestNoPersistentStateChanged:
 
         from core.inference.llama_admission import llama_admission_config_from_env
 
-        # A completely bare environment must still produce a usable config.
         saved = {k: v for k, v in os.environ.items() if k.startswith("UNSLOTH_")}
         try:
             for key in list(saved):
@@ -273,24 +271,14 @@ class TestNoPersistentStateChanged:
         assert config.kv_budget is True
 
     def test_the_queue_carries_no_serialised_state(self):
-        """Nothing about a queue is written to disk, and the slots are the whole of its
-        state, so a new field cannot break an old install's stored data."""
+        """Queue state is slots only, never on disk, so a new field cannot break stored data."""
         assert "_reparking" in LlamaAdmissionQueue.__slots__
         queue = LlamaAdmissionQueue("fresh")
         assert queue._reparking == 0, "a fresh queue must start with the line open"
 
 
 class TestTheInjectedToolCatalogueIsCharged:
-    """The regression that a live run caught and every unit test missed.
-
-    ``payload.tools`` is what the CLIENT sent. Unsloth's own tool loop resolves Web Search
-    and the rest server-side and renders them into the prompt AFTER admission has priced
-    the request, so pricing from the payload alone undercounts by the whole catalogue.
-    Measured on Qwen3.5-4B-MTP-GGUF, the same user turn is 1716 prompt tokens with tools
-    off and 2969 with them on. At ``-c 4096`` that gap is fatal: priced at an equal share
-    four tool chats were all admitted and llama.cpp answered every one with ``Context size
-    has been exceeded``.
-    """
+    """Price the server-injected tool catalogue, since payload.tools holds only what the client sent."""
 
     CATALOG = [
         {
@@ -312,12 +300,11 @@ class TestTheInjectedToolCatalogueIsCharged:
     ]
 
     def test_the_catalogue_is_added_to_the_estimate(self):
-        """Checked on a wide pool, where the floor is small enough that the catalogue sets
-        the price. On a narrow one the floor already exceeds the whole request, so masking
-        it there is correct."""
+        """Catalogue sets the price on wide pools; narrow pools mask a floor above the request."""
         import routes.inference as routes_inference
 
-        budget, capacity = 8192, 16  # share 512, smaller than the catalogue
+        # share 512, smaller than the catalogue
+        budget, capacity = 8192, 16
         payload = _payload(text = "hi")
         without = _tokens(payload, budget = budget, capacity = capacity, tool_loop = True)
         with_catalog = routes_inference._openai_llama_admission_tokens(
@@ -338,8 +325,7 @@ class TestTheInjectedToolCatalogueIsCharged:
 
     @pytest.mark.asyncio
     async def test_four_tool_chats_are_not_admitted_past_a_small_cache(self):
-        """The live failure at unit level: four short prompts with a real catalogue cannot
-        share 4096 tokens, and admitting all four produced four 500s."""
+        """Live failure: four tool chats overflowed a 4096-token cache, and all four got 500s."""
         import routes.inference as routes_inference
 
         budget = 4096
@@ -370,5 +356,5 @@ class TestTheInjectedToolCatalogueIsCharged:
             def __repr__(self):
                 raise RuntimeError("no")
 
-        # default=str still reaches __repr__, so this must be caught rather than raised.
+        # default=str still reaches __repr__, so this must be caught rather than raised
         assert routes_inference._openai_llama_admission_injected_tool_tokens([Awkward()]) >= 0

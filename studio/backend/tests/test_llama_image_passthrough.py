@@ -113,19 +113,67 @@ def test_other_formats_are_still_reencoded_to_png(raw):
     assert Image.open(BytesIO(out)).mode == "RGB"
 
 
+@pytest.mark.parametrize(
+    "fmt, mode, kw",
+    [
+        ("PNG", "RGBA", {}),
+        ("PNG", "LA", {}),
+        ("WEBP", "RGBA", {"lossless": True, "exact": True}),
+        ("GIF", "RGBA", {}),
+    ],
+    ids = ["png", "grey-alpha-png", "webp", "gif"],
+)
+def test_dark_strokes_on_a_transparent_background_stay_visible(fmt, mode, kw):
+    img = Image.new("RGBA", (64, 48), (0, 0, 0, 0))
+    img.paste((0, 0, 0, 255), (8, 20, 56, 28))
+    head, out = _split(_llama_image_data_url(_encode(img.convert(mode), fmt, **kw)))
+    assert head == "data:image/png;base64"
+    stb_view = Image.open(BytesIO(out)).convert("RGBA").convert("RGB")
+    assert stb_view.getpixel((2, 2)) == (255, 255, 255)
+    assert max(stb_view.getpixel((32, 24))) < 64
+
+
+def test_light_strokes_on_a_transparent_background_stay_visible():
+    img = Image.new("RGBA", (64, 48), (0, 0, 0, 0))
+    img.paste((255, 255, 255, 255), (8, 20, 56, 28))
+    head, out = _split(_llama_image_data_url(_encode(img, "PNG")))
+    stb_view = Image.open(BytesIO(out)).convert("RGBA").convert("RGB")
+    assert stb_view.getpixel((2, 2)) == (0, 0, 0)
+    assert min(stb_view.getpixel((32, 24))) > 192
+
+
+def test_a_faint_light_halo_does_not_black_out_dark_content():
+    img = Image.new("RGBA", (64, 48), (255, 255, 255, 3))
+    img.paste((0, 0, 0, 255), (8, 20, 56, 28))
+    head, out = _split(_llama_image_data_url(_encode(img, "PNG")))
+    stb_view = Image.open(BytesIO(out)).convert("RGBA").convert("RGB")
+    assert min(stb_view.getpixel((2, 2))) > 192
+    assert max(stb_view.getpixel((32, 24))) < 64
+
+
+@pytest.mark.parametrize("mode, key", [("RGB", (0, 0, 0)), ("L", 0)], ids = ["rgb", "grey"])
+def test_colour_keyed_png_background_is_composited(mode, key):
+    img = Image.new(mode, (64, 48), key)
+    img.paste((16,) * len(img.getbands()), (8, 20, 56, 28))
+    head, out = _split(_llama_image_data_url(_encode(img, "PNG", transparency = key)))
+    assert head == "data:image/png;base64"
+    stb_view = Image.open(BytesIO(out)).convert("RGBA").convert("RGB")
+    assert stb_view.getpixel((2, 2)) == (255, 255, 255)
+    assert max(stb_view.getpixel((32, 24))) < 64
+
+
 def test_jpeg_frames_stb_rejects_are_not_passed_through():
     raw = _encode(_photo(), "JPEG")
     assert _stb_reads_jpeg(raw)
-    assert _stb_reads_jpeg(_patched_frame(raw, marker = 0xC1))  # Extended sequential.
-    assert not _stb_reads_jpeg(_patched_frame(raw, marker = 0xC3))  # Lossless.
-    assert not _stb_reads_jpeg(_patched_frame(raw, marker = 0xC9))  # Arithmetic.
+    assert _stb_reads_jpeg(_patched_frame(raw, marker = 0xC1))
+    assert not _stb_reads_jpeg(_patched_frame(raw, marker = 0xC3))
+    assert not _stb_reads_jpeg(_patched_frame(raw, marker = 0xC9))
     assert not _stb_reads_jpeg(_patched_frame(raw, precision = 12))
     assert not _stb_reads_jpeg(_encode(_photo("CMYK"), "JPEG"))
-    assert not _stb_reads_jpeg(raw[:20])  # Ends before any frame header.
+    assert not _stb_reads_jpeg(raw[:20])
 
 
-# The 64x64 PNG from the GGUF vision smoke test: its deflate stream is cut short and it has no
-# IEND. Pillow decodes it; stb_image rejects it.
+# Truncated deflate, no IEND: Pillow decodes it, stb_image rejects it.
 _UNTERMINATED_PNG = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAIAAAAlC+aJAAAAYklEQVR4nO3PMQ0AIADAMEAI/k"
     "UhBhEcDcmqYJtn7/GzpQNeNaA1oDWgNaA1oDWgNaA1oDWgNaA1oDWgNaA1oDWgNaA1oDWgNaA"
@@ -136,7 +184,7 @@ _UNTERMINATED_PNG = base64.b64decode(
 def test_png_chunks_stb_rejects_are_reencoded():
     raw = _encode(_photo(), "PNG")
     assert _stb_reads_png(raw)
-    assert not _stb_reads_png(raw[: raw.rindex(b"IEND") - 4])  # No IEND.
+    assert not _stb_reads_png(raw[: raw.rindex(b"IEND") - 4])
     assert not _stb_reads_png(_UNTERMINATED_PNG)
     head, out = _split(_llama_image_data_url(_UNTERMINATED_PNG))
     assert head == "data:image/png;base64"
@@ -145,7 +193,6 @@ def test_png_chunks_stb_rejects_are_reencoded():
 
 
 def test_png_with_a_compressed_tail_past_its_rows_is_not_inflated_to_the_end():
-    # 1x1 greyscale: Pillow stops after its two-byte row, a megabyte of zeros follows it.
     deflate = zlib.compressobj(9)
     body = deflate.compress(b"\0\0") + deflate.compress(bytes(1 << 20)) + deflate.flush()
     raw = _encode(Image.new("L", (1, 1)), "PNG")
@@ -162,7 +209,6 @@ def test_png_with_a_compressed_tail_past_its_rows_is_not_inflated_to_the_end():
         b"not an image",
         b"\x89PNG\r\n\x1a\n" + b"\0" * 32,
         b"\xff\xd8\xff\xe0garbage",
-        # Reject truncated data even when stb_image would accept it.
         _encode(_photo(size = (640, 480)), "JPEG", quality = 90)[:4000],
         _encode(_photo(size = (640, 480)), "PNG")[:4000],
     ],
@@ -197,3 +243,11 @@ def test_legacy_image_base64_jpeg_is_forwarded_unchanged():
     messages = _openai_messages_for_passthrough(payload, vision = True)
     parts = [p for p in messages[-1]["content"] if p.get("type") == "image_url"]
     assert [p["image_url"]["url"] for p in parts] == [f"data:image/jpeg;base64,{b64}"]
+
+
+def test_sixteen_bit_colour_keyed_png_still_passes_through():
+    img = Image.new("I;16", (16, 16), 30000)
+    img.putpixel((0, 0), 100)
+    raw = _encode(img, "PNG", transparency = 100)
+    head, out = _split(_llama_image_data_url(raw))
+    assert (head, out) == ("data:image/png;base64", raw)
