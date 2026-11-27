@@ -95,14 +95,10 @@ test("recovery replay keeps literal think text when the turn stamped it", () => 
     stored,
   );
   assert.deepEqual(restoreCarriedPartsFromRaw(raw, [], { parseThink: false }), [
-    { type: "text", text: raw },
+    { type: "text", text: "Use <think>x</think> tags then <think>" },
   ]);
-  assert.equal(
-    restoreCarriedPartsFromRaw(raw, carried).some(
-      (part) => part.type === "reasoning",
-    ),
-    true,
-  );
+  // Saved text parts are already parsed, so their tags stay literal even with think parsing on.
+  assert.deepEqual(restoreCarriedPartsFromRaw(raw, carried), stored);
 });
 
 test("a recovery before the first client save reads the choice from the request", () => {
@@ -119,6 +115,32 @@ test("a recovery before the first client save reads the choice from the request"
   );
   assert.equal(requestParsesThinkTags({ reasoning_effort: "low" }), true);
   assert.equal(requestParsesThinkTags({}), true);
+  for (const model of [
+    "claude-sonnet-5-5",
+    "claude-sonnet-5-5-20261001",
+    "CLAUDE-SONNET-5-5",
+  ]) {
+    assert.equal(
+      requestParsesThinkTags({
+        provider_type: "anthropic",
+        external_model: model,
+        reasoning_effort: "none",
+      }),
+      true,
+      model,
+    );
+  }
+  for (const model of ["claude-opus-5-5", "claude-sonnet-5-50"]) {
+    assert.equal(
+      requestParsesThinkTags({
+        provider_type: "anthropic",
+        external_model: model,
+        reasoning_effort: "none",
+      }),
+      false,
+      model,
+    );
+  }
 
   const { raw, carried } = generationRawContent([]);
   const replayed = `${raw}Use <think>hi</think> in your prompt.`;
@@ -165,7 +187,8 @@ test("the adapter and recovery follow the turn's think parse state", () => {
   assert.match(adapter, /parseThink && thinkTags\.endsInsideThink\(\)/);
   assert.match(
     adapter,
-    /setParseThink\(\s*isExternalRequest\s*\? requestParsesThinkTags\(externalReasoningFields\)\s*: reasoningAlwaysOn \|\| requestParsesThinkTags\(localReasoningFields\),\s*\);/,
+    // A resumed thought is reasoning whatever the request's own setting says.
+    /setParseThink\(\s*isExternalRequest\s*\? requestParsesThinkTags\(\{\s*\.\.\.externalReasoningFields,\s*provider_type: externalProvider\?\.providerType,\s*external_model: externalSelection\?\.modelId,\s*\}\)\s*: reasoningAlwaysOn \|\|\s*Boolean\(resumedThought\) \|\|\s*requestParsesThinkTags\(localReasoningFields\),\s*\);/,
     "the live stream and recovery must read thinking off from the same request fields",
   );
   assert.match(adapter, /\.\.\.externalReasoningFields,/);
@@ -192,6 +215,10 @@ test("the adapter and recovery follow the turn's think parse state", () => {
   );
   assert.match(
     recovery,
-    /if \(!parseThink && \(reasoning \|\| hasStructuredReasoning\)\) \{\s*parseThink = true;\s*currentMetadata = \{ \.\.\.currentMetadata, parseThinkTags: true \};/,
+    /if \(parseThink && !wasParsing\) \{\s*currentMetadata = \{ \.\.\.currentMetadata, parseThinkTags: true \};/,
+  );
+  assert.match(
+    readSrc("features/chat/utils/chat-generation-recovery.ts"),
+    /if \(reasoning \|\| hasStructuredReasoning\) parseThink = true;/,
   );
 });

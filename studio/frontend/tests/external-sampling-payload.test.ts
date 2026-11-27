@@ -1,13 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
-// The external body never spread min_p / repetition_penalty, so the sliders did nothing.
-// Its function is too large to call here, so the gated spreads are extracted and evaluated.
-
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import ts from "typescript";
+import ts from "@typescript/typescript6";
 
 import { readSrc, registerBundlerResolver } from "./helpers/kit.ts";
 
@@ -68,7 +65,7 @@ const gatedSpreads = externalBodyLiteral()
   .map((property) => property.expression.getText())
   .filter((text) => text.includes("externalCapabilities"));
 
-// Without this, an extraction that matched nothing would pass every assertion vacuously.
+// Guards against an extraction that matched nothing passing vacuously.
 assert.ok(
   gatedSpreads.length >= 4,
   `only ${gatedSpreads.length} gated spreads`,
@@ -166,6 +163,27 @@ test("ollama is sent none of the three its /v1 layer drops", () => {
   assert.equal(body.temperature, PARAMS.temperature);
 });
 
+test("Gemini 4 and 3.7/3.8 Flash omit presence_penalty from the request body", () => {
+  for (const model of [
+    "gemini-3.7-flash",
+    "gemini-3.8-flash",
+    "gemini-4-argon",
+    "gemini-4-carbon",
+    "gemini-4-neon",
+    "gemini-4-hydrogen",
+  ]) {
+    const body = bodyFor("gemini", PARAMS, undefined, model);
+    assert.ok(!("presence_penalty" in body), model);
+    assert.equal(body.temperature, PARAMS.temperature, model);
+    assert.equal(body.top_p, PARAMS.topP, model);
+    assert.equal(body.top_k, PARAMS.topK, model);
+  }
+  assert.equal(
+    bodyFor("gemini", PARAMS, undefined, "gemini-2.5-flash").presence_penalty,
+    PARAMS.presencePenalty,
+  );
+});
+
 test("a hosted provider's body is unchanged by the new rows", () => {
   for (const providerType of [
     "anthropic",
@@ -185,7 +203,6 @@ test("a hosted provider's body is unchanged by the new rows", () => {
 });
 
 test("an unknown provider stays on the OpenAI-compatible shape", () => {
-  // A connection saved by a newer build lands here, and a strict endpoint 400s on extensions.
   const body = bodyFor("some-provider-this-build-never-heard-of");
   assert.ok(!("min_p" in body));
   assert.ok(!("repetition_penalty" in body));
@@ -194,7 +211,6 @@ test("an unknown provider stays on the OpenAI-compatible shape", () => {
 
 test("the panel and the request read the same capability flags", () => {
   const sheet = readSrc("features/chat/chat-settings-sheet.tsx");
-  // Gating the body on anything but these flags is how panel and request drifted apart.
   assert.match(sheet, /Boolean\(providerCapabilities\?\.minP\)/);
   assert.match(sheet, /Boolean\(providerCapabilities\?\.repetitionPenalty\)/);
   assert.ok(
@@ -207,7 +223,6 @@ test("the panel and the request read the same capability flags", () => {
   );
 });
 
-// The proxy drops the usage chunk for a caller that did not opt in, which hid the usage bar.
 test("the external body opts into the stream usage chunk", () => {
   const optIn = externalBodyLiteral().properties.find(
     (property) =>
@@ -218,4 +233,74 @@ test("the external body opts into the stream usage chunk", () => {
   assert.deepEqual(new Function(`return (${optIn.initializer.getText()});`)(), {
     include_usage: true,
   });
+});
+
+const {
+  isPromptCacheTtl,
+  promptCacheTtlAppliesToModel,
+  promptCachingAppliesToModel,
+  supportsProviderPromptCacheTtl,
+  supportsProviderPromptCaching,
+} = await import("../src/features/chat/external-providers.ts");
+
+const buildCacheFields = new Function(
+  "externalProvider",
+  "resolvedThreadId",
+  "supportsProviderPromptCaching",
+  "supportsProviderPromptCacheTtl",
+  "isPromptCacheTtl",
+  `return Object.assign({}, ${externalBodyLiteral()
+    .properties.filter(ts.isSpreadAssignment)
+    .map((property) => property.expression.getText())
+    .filter((text) => /PromptCach|^\(resolvedThreadId/.test(text))
+    .join(", ")});`,
+);
+
+function cacheFieldsFor(provider: Record<string, unknown>, threadId?: string) {
+  return buildCacheFields(
+    provider,
+    threadId,
+    supportsProviderPromptCaching,
+    supportsProviderPromptCacheTtl,
+    isPromptCacheTtl,
+  ) as Record<string, unknown>;
+}
+
+test("OpenRouter sends the caching toggle, its TTL and the thread on every external request", () => {
+  assert.deepEqual(cacheFieldsFor({ providerType: "openrouter" }, "thread-1"), {
+    enable_prompt_caching: true,
+    thread_id: "thread-1",
+  });
+  assert.deepEqual(
+    cacheFieldsFor({ providerType: "openrouter", promptCacheTtl: "1h" }),
+    { enable_prompt_caching: true, prompt_cache_ttl: "1h" },
+  );
+  assert.deepEqual(
+    cacheFieldsFor({ providerType: "openrouter", enablePromptCaching: false, promptCacheTtl: "1h" }),
+    { enable_prompt_caching: false },
+  );
+});
+
+test("the cache controls show for OpenRouter only on Claude models", () => {
+  for (const applies of [promptCachingAppliesToModel, promptCacheTtlAppliesToModel]) {
+    assert.equal(applies("anthropic", "claude-opus-5"), true);
+    assert.equal(applies("openrouter", "anthropic/claude-sonnet-4.6"), true);
+    assert.equal(applies("openrouter", "~anthropic/claude-opus-latest"), true);
+    assert.equal(applies("openrouter", "deepseek/deepseek-v3.2"), false);
+    assert.equal(applies("openrouter", undefined), false);
+    assert.equal(applies("gemini", "gemini-3-pro"), false);
+  }
+  assert.equal(promptCachingAppliesToModel("openai", "gpt-5.5"), true);
+  assert.equal(promptCacheTtlAppliesToModel("openai", "gpt-5.5"), false);
+  const sheet = readSrc("features/chat/chat-settings-sheet.tsx");
+  for (const name of ["promptCachingAppliesToModel", "promptCacheTtlAppliesToModel"]) {
+    assert.match(
+      sheet,
+      new RegExp(`${name}\\(\\s*activeExternalProvider\\.providerType,\\s*externalSelection\\?\\.modelId,?\\s*\\)`),
+    );
+  }
+});
+
+test("the live stream reads cache writes through the shared usage rule", () => {
+  assert.match(source, /const cacheWriteTokens = usageCacheWriteTokens\(meta\?\.usage\);/);
 });

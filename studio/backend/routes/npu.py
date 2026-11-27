@@ -1,16 +1,15 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
-"""NPU detection, setup and model management.
-
-Loading and chat use the inference routes. All routes here except status are owner-only.
-"""
+"""NPU detection, setup and models; all routes but status are owner-only; chat uses inference routes."""
 
 from __future__ import annotations
 
 import asyncio
 import json
 import threading
+from contextlib import contextmanager
+from typing import Iterable, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
@@ -18,10 +17,12 @@ from starlette.concurrency import iterate_in_threadpool
 
 from auth import policy
 from auth.authentication import get_current_subject
-from core.inference.npu_backend import NpuError, get_npu_backend
+from core.inference.npu_backend import NpuBusy, NpuDownloadCancelled, NpuError, get_npu_backend
 from hub.services.models import account_access
+from loggers import get_logger
 
 router = APIRouter()
+logger = get_logger(__name__)
 
 _MANAGED_ACCOUNT_STATUS = {
     "supported": False,
@@ -36,6 +37,8 @@ _MANAGED_ACCOUNT_STATUS = {
     "loaded_model": None,
     "context_length": None,
     "loading_model": None,
+    "versions": {"lemonade": None, "fastflowlm": None},
+    "memory_window_gb": None,
 }
 
 
@@ -50,14 +53,21 @@ class _Download:
         self.events: list[dict] = []
         self.finished = False
         self.changed = threading.Condition()
+        self.cancel = threading.Event()
 
     def publish(self, event: dict) -> None:
         with self.changed:
             self.events.append(event)
             self.changed.notify_all()
 
+    def percent(self) -> Optional[float]:
+        with self.changed:
+            for event in reversed(self.events):
+                if isinstance(event.get("percent"), (int, float)):
+                    return event["percent"]
+        return None
+
     def follow(self):
-        """Every event so far, then each new one, until the pull ends."""
         seen = 0
         while True:
             with self.changed:
@@ -74,27 +84,75 @@ _downloads: dict[str, _Download] = {}
 _downloads_lock = threading.Lock()
 
 
+# Each running delete's model ids; None reserves every model (Storage's Clear).
+_deleting: list[Optional[frozenset[str]]] = []
+
+
+@contextmanager
+def downloads_held(model_ids: Optional[Iterable[str]] = None):
+    """Refuse, not block, pulls of model_ids (all if None) during a delete; NpuBusy if pulling."""
+    ids = None if model_ids is None else frozenset(model_ids)
+    with _downloads_lock:
+        for model_id, job in _downloads.items():
+            if not job.finished and (ids is None or model_id in ids):
+                raise NpuBusy(f"Cancel the download of {model_id} before deleting it.")
+        _deleting.append(ids)
+    try:
+        yield
+    finally:
+        with _downloads_lock:
+            _deleting.remove(ids)
+
+
+def _delete_checkpoint(checkpoint: str) -> str:
+    return get_npu_backend().delete_checkpoint(checkpoint, downloads_held)
+
+
+def _forget_storage_size() -> None:
+    """Settings > Storage remembers folder sizes for a minute; a pull or delete changes this one."""
+    from utils.cache_inventory import invalidate_cache_size
+    invalidate_cache_size("npu_models")
+
+
 def _start_download(npu, model_id: str) -> _Download:
     """The model's running pull, or a new one; a second request follows the first."""
     with _downloads_lock:
         job = _downloads.get(model_id)
         if job is not None and not job.finished:
             return job
+        if any(ids is None or model_id in ids for ids in _deleting):
+            raise NpuBusy(f"{model_id} is being deleted. Download it again once that finishes.")
         job = _Download()
         _downloads[model_id] = job
 
+    def _progress() -> str:
+        percent = job.percent()
+        return "" if percent is None else f" at {percent}%"
+
     def _run() -> None:
+        logger.info(f"Downloading NPU model {model_id}")
         try:
-            for event in npu.download(model_id):
+            for event in npu.download(model_id, cancel = job.cancel):
                 job.publish(event)
+            logger.info(f"Downloaded NPU model {model_id}")
+        except NpuDownloadCancelled:
+            logger.info(f"NPU model download of {model_id} cancelled{_progress()}")
+            job.publish({"event": "cancelled", "model": model_id})
         except NpuError as exc:
+            logger.warning(f"NPU model download of {model_id} failed{_progress()}: {exc}")
             job.publish({"event": "error", "error": str(exc)})
         except Exception as exc:  # noqa: BLE001 -- reported on the stream, not lost in a thread
+            logger.exception(f"NPU model download of {model_id} failed{_progress()}")
             job.publish({"event": "error", "error": f"Downloading {model_id} failed: {exc}"})
         finally:
+            _forget_storage_size()
             with job.changed:
                 job.finished = True
                 job.changed.notify_all()
+            # Followers hold their own reference; nothing else reads a finished pull.
+            with _downloads_lock:
+                if _downloads.get(model_id) is job:
+                    del _downloads[model_id]
 
     threading.Thread(target = _run, daemon = True, name = "npu-pull").start()
     return job
@@ -106,6 +164,14 @@ async def npu_status(current_subject: str = Depends(get_current_subject)):
     if account_access.managed_account():
         return dict(_MANAGED_ACCOUNT_STATUS)
     return await asyncio.to_thread(get_npu_backend().status)
+
+
+@router.get("/compat", dependencies = [Depends(_require_installation_owner)])
+async def npu_compat():
+    """What the installed FastFlowLM runs and the Q4NX converter converts, per architecture and
+    shape. Never starts the runtime; on a supported NPU, installs the pinned converter source if missing."""
+    from core.inference.npu_compat import current
+    return await asyncio.to_thread(current)
 
 
 @router.post("/enable", dependencies = [Depends(_require_installation_owner)])
@@ -126,14 +192,17 @@ async def list_npu_models():
     return {"models": [model.to_json() for model in models]}
 
 
-@router.post("/models/{model_id}/download", dependencies = [Depends(_require_installation_owner)])
-async def download_npu_model(model_id: str):
-    """Stream download progress through a final complete or error event.
+@router.get("/downloads", dependencies = [Depends(_require_installation_owner)])
+async def list_npu_downloads():
+    """Pulls still running, so a reopened page can follow them again."""
+    with _downloads_lock:
+        running = [(model_id, job) for model_id, job in _downloads.items() if not job.finished]
+    return {
+        "downloads": [{"model": model_id, "percent": job.percent()} for model_id, job in running]
+    }
 
-    Disconnecting stops progress updates, not the download.
-    """
-    job = _start_download(get_npu_backend(), model_id)
 
+def _event_stream(job: _Download) -> StreamingResponse:
     def _events():
         for event in job.follow():
             yield f"data: {json.dumps(event)}\n\n"
@@ -145,10 +214,60 @@ async def download_npu_model(model_id: str):
     )
 
 
+@router.post("/models/{model_id}/download", dependencies = [Depends(_require_installation_owner)])
+async def download_npu_model(model_id: str):
+    """Stream download progress through a final complete or error event.
+
+    Disconnecting stops progress updates, not the download.
+    """
+    try:
+        job = _start_download(get_npu_backend(), model_id)
+    except NpuBusy as exc:
+        raise HTTPException(status_code = 409, detail = str(exc)) from None
+    return _event_stream(job)
+
+
+@router.get("/models/{model_id}/download", dependencies = [Depends(_require_installation_owner)])
+async def follow_npu_download(model_id: str):
+    """The running pull's progress, from its first event. Never starts or retries one."""
+    with _downloads_lock:
+        job = _downloads.get(model_id)
+    if job is None or job.finished:
+        raise HTTPException(status_code = 404, detail = f"{model_id} is not downloading.")
+    return _event_stream(job)
+
+
+@router.post(
+    "/models/{model_id}/download/cancel", dependencies = [Depends(_require_installation_owner)]
+)
+async def cancel_npu_download(model_id: str):
+    """Stop the running pull at its next chunk; its partial files stay, so Download resumes."""
+    with _downloads_lock:
+        job = _downloads.get(model_id)
+    if job is None or job.finished:
+        raise HTTPException(status_code = 404, detail = f"{model_id} is not downloading.")
+    job.cancel.set()
+    return {"status": "cancelling", "model": model_id}
+
+
 @router.delete("/models/{model_id}", dependencies = [Depends(_require_installation_owner)])
 async def delete_npu_model(model_id: str):
     try:
         await asyncio.to_thread(get_npu_backend().delete, model_id)
     except NpuError as exc:
         raise HTTPException(status_code = 409, detail = str(exc)) from None
+    finally:
+        _forget_storage_size()
+    return {"status": "deleted", "model": model_id}
+
+
+@router.delete("/checkpoints/{checkpoint}", dependencies = [Depends(_require_installation_owner)])
+async def delete_npu_checkpoint(checkpoint: str):
+    """Settings > Storage's delete: its folders know their FastFlowLM checkpoint, not lemond's id."""
+    try:
+        model_id = await asyncio.to_thread(_delete_checkpoint, checkpoint)
+    except NpuError as exc:
+        raise HTTPException(status_code = 409, detail = str(exc)) from None
+    finally:
+        _forget_storage_size()
     return {"status": "deleted", "model": model_id}

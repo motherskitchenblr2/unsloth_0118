@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Annotated, Literal, Optional
 
 from fastapi import APIRouter, Body, Depends, File, Form, Query, UploadFile
 
@@ -18,6 +18,8 @@ from hub.schemas.datasets import (
     CheckFormatRequest,
     CheckFormatResponse,
     DeleteCachedDatasetResponse,
+    HubDatasetOptionsRequest,
+    HubDatasetOptionsResponse,
     LocalDatasetOptionsRequest,
     LocalDatasetOptionsResponse,
     LocalDatasetsResponse,
@@ -44,8 +46,12 @@ async def upload_dataset(
     file: UploadFile | None = File(None),
     native_path_lease: str | None = Form(None, alias = "nativePathLease"),
     current_subject: str = Depends(get_current_subject),
+    json_columns: Annotated[bool, Form()] = False,
+    csv_delimiter: Annotated[Literal[",", ";"], Form()] = ",",
 ) -> UploadDatasetResponse:
-    return await local.upload_dataset_response(file, native_path_lease)
+    return await local.upload_dataset_response(
+        file, native_path_lease, json_columns = json_columns, csv_delimiter = csv_delimiter
+    )
 
 
 @router.get("/local", response_model = LocalDatasetsResponse)
@@ -53,6 +59,14 @@ def list_local_datasets(
     current_subject: str = Depends(get_current_subject),
 ) -> LocalDatasetsResponse:
     return local.list_local_datasets_response()
+
+
+@router.delete("/local/upload")
+def delete_uploaded_dataset(
+    dataset_id: str = Body(..., embed = True, alias = "id"),
+    current_subject: str = Depends(get_current_subject),
+) -> dict:
+    return local.delete_uploaded_dataset_response(dataset_id)
 
 
 @router.get(
@@ -69,6 +83,15 @@ def get_local_dataset_options(
     request: LocalDatasetOptionsRequest, current_subject: str = Depends(get_current_subject)
 ) -> LocalDatasetOptionsResponse:
     return local_options.local_dataset_options(request)
+
+
+@router.post("/hub-options", response_model = HubDatasetOptionsResponse)
+def get_hub_dataset_options(
+    request: HubDatasetOptionsRequest,
+    hf_token: HfTokenArg = Depends(get_request_hf_token),
+    current_subject: str = Depends(get_current_subject),
+) -> HubDatasetOptionsResponse:
+    return local_options.hub_dataset_options(request, hf_token)
 
 
 @router.delete("/cached", response_model = DeleteCachedDatasetResponse)

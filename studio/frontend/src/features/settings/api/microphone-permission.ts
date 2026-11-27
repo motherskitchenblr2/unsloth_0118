@@ -4,14 +4,7 @@
 import { isTauri } from "@/lib/api-base";
 
 /**
- * Forget a saved "Don't allow" so the next getUserMedia can prompt again.
- *
- * WebView2 keeps that answer in its profile and offers no site-settings UI, so without
- * this an accidental deny blocked dictation permanently (#9001). The command only clears
- * the stored answer; access still comes from the prompt.
- *
- * Best effort by design: a browser tab has no command to call, and an older WebView2
- * runtime has no permission API, but getUserMedia is still worth trying in both.
+ * Forgets a saved "Don't allow" (no UI in WebView2); best effort: older runtimes lack the command.
  */
 export async function resetMicrophonePermission(): Promise<void> {
   if (!isTauri) return;

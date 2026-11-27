@@ -9,21 +9,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Can bitsandbytes actually run a 4bit kernel here? A successful import does not say.
-
-From 0.46 a wheel whose native library never loaded still imports and hands back a
-`throw_on_call` closure for every symbol, so attribute reads alone see a healthy wheel,
-`ALLOW_BITSANDBYTES` stays true and 4bit dies inside a kernel instead of falling back to
-16bit up front. A real handle is a ctypes function pointer and carries `restype`; a
-deferred failure is a plain Python function and does not. That is the whole test, applied
-to every probed handle: the same verdict gates the module-scope binds in kernels/utils.py,
-where one bad symbol is the crash this exists to prevent.
-
-Decides the capability flags only, never importability - a CPU-only install is exactly
-this shape and its Python side works. A leaf module: imports nothing from unsloth
-(device_type.py imports it very early, so anything else is a cycle) and takes the
-device type as an argument.
-"""
+"""Leaf module (imports nothing from unsloth) for capability flags, never importability: a dead
+native lib still imports (throw_on_call stubs, bnb 0.46+); real ctypes handles have restype."""
 
 __all__ = [
     "bitsandbytes_symbols",
@@ -36,9 +23,9 @@ _C_SYMBOLS = (
     "cdequantize_blockwise_fp32",
     "cdequantize_blockwise_fp16_nf4",
     "cdequantize_blockwise_bf16_nf4",
+    "cdequantize_blockwise_fp32_nf4",
 )
-# 4bit inference is a gemv on xpu and a naive gemm elsewhere; probing the wrong pair would write off
-# a perfectly good wheel.
+# 4bit inference is gemv on XPU, gemm elsewhere; the wrong pair would reject a good wheel.
 _C_SYMBOLS_XPU = (
     "cgemv_4bit_inference_fp16",
     "cgemv_4bit_inference_bf16",
@@ -67,8 +54,7 @@ def check_native_kernels(bnb, device_type):
         raise ImportError("Unsloth: `bitsandbytes` is not installed.")
     functional = getattr(bnb, "functional", None)
     if functional is None:
-        # A part-initialised bitsandbytes leaves the parent without the attribute while the submodule stays
-        # in sys.modules, which `import x.y as z` reads directly.
+        # Half-init bnb lacks .functional but sys.modules has it; import x.y as z reads it.
         import bitsandbytes.functional as functional
 
     lib = functional.lib
