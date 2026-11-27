@@ -3,12 +3,7 @@
 
 import { Skeleton } from "@/components/ui/skeleton";
 
-/**
- * Placeholder for the stats panel.
- *
- * Its own module so the lazy wrapper can render it as a Suspense fallback
- * without pulling the chart-bearing content chunk into the main bundle.
- */
+/** Separate module so the Suspense fallback does not pull in the chart chunk. */
 export function StatsSkeleton() {
   return (
     <div className="flex flex-col gap-4">

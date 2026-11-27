@@ -2,7 +2,7 @@
 // Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
 import { authFetch } from "@/features/auth";
-import { hubTokenHeader } from "@/features/hub";
+import { hubTokenHeader } from "@/features/hub/lib/hub-token-header";
 import { readFastApiError } from "@/lib/format-fastapi-error";
 import type {
   CheckFormatResponse,
@@ -99,20 +99,34 @@ export async function checkDatasetFormat({
   return res.json();
 }
 
+export type DatasetImportOptions = {
+  jsonColumns?: boolean;
+  csvDelimiter?: "," | ";";
+};
+
+function appendImportOptions(form: FormData, options: DatasetImportOptions) {
+  if (options.jsonColumns) form.append("json_columns", "true");
+  if (options.csvDelimiter === ";") form.append("csv_delimiter", ";");
+}
+
 export function uploadTrainingDataset(
   file: File,
+  options: DatasetImportOptions = {},
 ): Promise<UploadDatasetResponse> {
   const form = new FormData();
   form.append("file", file);
+  appendImportOptions(form, options);
 
   return uploadTrainingDatasetForm(form);
 }
 
 export function uploadNativeTrainingDataset(
   nativePathLease: string,
+  options: DatasetImportOptions = {},
 ): Promise<UploadDatasetResponse> {
   const form = new FormData();
   form.append("nativePathLease", nativePathLease);
+  appendImportOptions(form, options);
 
   return uploadTrainingDatasetForm(form);
 }
@@ -138,7 +152,7 @@ type AiAssistMappingArgs = {
   datasetName?: string | null;
   hfToken?: string | null;
   modelName?: string | null;
-  modelType?: "text" | "vision" | "audio" | "embeddings" | null;
+  modelType?: "text" | "vision" | "audio" | "embeddings" | "decision" | null;
   signal?: AbortSignal;
 };
 
@@ -146,7 +160,6 @@ export type AiAssistMappingResponse = {
   success: boolean;
   suggested_mapping?: Record<string, string> | null;
   warning?: string | null;
-  // Conversion advisor fields
   system_prompt?: string | null;
   label_mapping?: Record<string, Record<string, string>> | null;
   dataset_type?: string | null;

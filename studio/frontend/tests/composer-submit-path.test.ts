@@ -1,8 +1,13 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import ts from "typescript";
+import ts from "@typescript/typescript6";
 import { readSrc } from "./helpers/kit.ts";
-import { composerSubmitIntent } from "../src/features/chat/utils/composer-preferences.ts";
+import {
+  composerKeyEventForImeSubmit,
+  composerSubmitIntent,
+  imeKeydownBlocksComposerSubmit,
+  parkedSendSteer,
+} from "../src/features/chat/utils/composer-preferences.ts";
 
 const text = readSrc("components/assistant-ui/thread.tsx");
 const source = ts.createSourceFile(
@@ -49,6 +54,11 @@ const reservedSendCallback = lift(
     n.getText(source).startsWith("(...alsoGuard: string[]) =>") &&
     n.getText(source).includes("reservePreStreamRun"),
 );
+const steerParkedSendCallback = lift(
+  (n) =>
+    ts.isArrowFunction(n) &&
+    n.getText(source).startsWith("(state: Omit<ParkedSendSteerState"),
+);
 function createCallback(
   code: string,
   deps: Record<string, unknown>,
@@ -60,13 +70,18 @@ test("the shipped main composer key handler protects IME and mention selection",
   let submits = 0;
   let prevented = 0;
   const composingRef = { current: false };
+  const imeSessionOpenRef = { current: false };
   const skipEnterRef = { current: false };
   const deps = {
     composerSubmitIntent,
+    composerKeyEventForImeSubmit,
+    imeKeydownBlocksComposerSubmit,
     sendShortcut: "mod-enter",
     submitOnEnter: true,
     skipEnterRef,
     composingRef,
+    imeSessionOpenRef,
+    compositionEndedAtRef: { current: -Infinity },
     justSentRef: undefined,
     refreshStuckTimer: () => undefined,
     setCompositionState: (value: boolean) => {
@@ -106,6 +121,58 @@ test("the shipped main composer key handler protects IME and mention selection",
   assert.ok(prevented > 0);
 });
 
+test("idle IME Enter sends, the WebKit candidate-confirming Enter does not (#12137)", () => {
+  let submits = 0;
+  const composingRef = { current: false };
+  const imeSessionOpenRef = { current: false };
+  const compositionEndedAtRef = { current: -Infinity };
+  const deps = {
+    composerSubmitIntent,
+    composerKeyEventForImeSubmit,
+    imeKeydownBlocksComposerSubmit,
+    sendShortcut: "enter",
+    submitOnEnter: true,
+    skipEnterRef: { current: false },
+    composingRef,
+    imeSessionOpenRef,
+    compositionEndedAtRef,
+    justSentRef: undefined,
+    refreshStuckTimer: () => undefined,
+    setCompositionState: (value: boolean) => {
+      composingRef.current = value;
+    },
+    onSubmitKey: () => {
+      submits += 1;
+    },
+  };
+  const onKey = createCallback(keyCallback, deps) as unknown as (
+    event: Record<string, unknown>,
+  ) => void;
+  const imeEnter = (timeStamp: number) => ({
+    key: "Enter",
+    metaKey: false,
+    ctrlKey: false,
+    shiftKey: false,
+    altKey: false,
+    keyCode: 229,
+    timeStamp,
+    nativeEvent: { isComposing: false },
+    preventDefault: () => undefined,
+  });
+  imeSessionOpenRef.current = true;
+  onKey({ ...imeEnter(1000), nativeEvent: { isComposing: true } });
+  assert.equal(submits, 0);
+  imeSessionOpenRef.current = false;
+  composingRef.current = false;
+  compositionEndedAtRef.current = 1995;
+  onKey(imeEnter(2000));
+  assert.equal(submits, 0);
+  assert.equal(composingRef.current, true);
+  onKey(imeEnter(2100));
+  assert.equal(submits, 1);
+  assert.equal(composingRef.current, false);
+});
+
 for (const active of ["runtime", "pre-stream", "queue", "idle"]) {
   test(`parked send retains the submitted follow-up choice with ${active} state at release`, () => {
     const calls: unknown[] = [];
@@ -117,6 +184,9 @@ for (const active of ["runtime", "pre-stream", "queue", "idle"]) {
       pendingFollowUpBehaviorRef,
       indexingActive: false,
       threadScopedSettingsPending: false,
+      threadIsRunning: false,
+      promptQueueThreadIds: ["own-chat"],
+      attachmentsAreQueueableText: false,
       hasMaterializingImageAttachments: false,
       hasMaterializingAudioAttachments: false,
       hasMaterializingVideoAttachments: false,
@@ -139,7 +209,7 @@ for (const active of ["runtime", "pre-stream", "queue", "idle"]) {
       canQueueCurrentPrompt: true,
       queueComposerText: (wait: boolean, behavior: string) =>
         calls.push([wait, behavior]),
-      canQueuePastedTextPrompt: false,
+      canQueueTextAttachmentsPrompt: false,
       overlay: false,
       hasAttachments: false,
       hasPendingAudio: false,
@@ -148,14 +218,92 @@ for (const active of ["runtime", "pre-stream", "queue", "idle"]) {
     };
     const release = createCallback(releaseCallback, deps);
     release();
-    release(); // An old render cannot release a cancelled/consumed send twice.
+    release(); // stale renders cannot release a consumed or cancelled send twice.
     assert.deepEqual(
       calls,
-      active === "idle"
-        ? ["clear", "send"]
-        : [[active !== "queue", "steer"]],
+      active === "idle" ? ["clear", "send"] : [[active !== "queue", "steer"]],
     );
     assert.equal(pendingSendRef.current, false);
+  });
+}
+
+for (const [active, behavior] of ["runtime", "pre-stream", "queue"].flatMap(
+  (a) => [
+    [a, "queue"],
+    [a, "steer"],
+  ],
+)) {
+  test(`a ${behavior} attachment stays parked through ${active} state and sends once (#9210)`, () => {
+    const calls: string[] = [];
+    const state = { active: true };
+    const pendingSendRef = { current: true };
+    const pendingFollowUpBehaviorRef = { current: behavior };
+    const deps = {
+      pendingSend: true,
+      pendingSendRef,
+      pendingFollowUpBehaviorRef,
+      indexingActive: false,
+      threadScopedSettingsPending: false,
+      threadIsRunning: false,
+      promptQueueThreadIds: ["own-chat"],
+      attachmentsAreQueueableText: false,
+      hasMaterializingImageAttachments: false,
+      hasMaterializingAudioAttachments: false,
+      hasMaterializingVideoAttachments: false,
+      aui: {
+        composer: () => ({
+          getState: () => ({ text: "", attachments: [{ id: "image-1" }] }),
+        }),
+        thread: () => ({
+          getState: () => ({
+            isRunning: state.active && active === "runtime",
+          }),
+          cancelRun: () => calls.push("cancel-run") && (state.active = false),
+        }),
+      },
+      setPendingSend: () => undefined,
+      dismissWaitToast: () => calls.push("dismiss"),
+      hasPreStreamRunReservation: () => state.active && active === "pre-stream",
+      preStreamThreadIds: ["own-chat"],
+      isResearchActive: false,
+      findPromptQueueEntry: () => state.active && active === "queue",
+      hasPendingQueueStart: () => false,
+      usePromptQueueUI: { getState: () => ({}) },
+      disableQueue: false,
+      canQueueCurrentPrompt: false,
+      queueComposerText: () => calls.push("queue-text"),
+      canQueueTextAttachmentsPrompt: false,
+      queueTextAttachmentsPrompt: () => calls.push("queue-paste"),
+      overlay: false,
+      hasAttachments: true,
+      hasPendingAudio: false,
+      clearStoredDraft: () => calls.push("clear"),
+      sendReservedComposer: () => calls.push("send"),
+      toast: { error: () => calls.push("error") },
+    };
+    const steerParkedSend = createCallback(steerParkedSendCallback, {
+      ...deps,
+      parkedSendSteer,
+      cancelPreStreamRunForThreadIds: () => calls.push("cancel-pre-stream"),
+    });
+    const release = createCallback(releaseCallback, {
+      ...deps,
+      steerParkedSend,
+    });
+    release();
+    // queued prompts stay ahead of the image.
+    const cancels =
+      behavior === "queue" || active === "queue"
+        ? []
+        : active === "runtime"
+          ? ["cancel-pre-stream", "cancel-run"]
+          : ["cancel-pre-stream"];
+    assert.deepEqual(calls, cancels);
+    assert.equal(pendingSendRef.current, true);
+    state.active = false;
+    release();
+    release();
+    assert.deepEqual(calls, [...cancels, "dismiss", "clear", "send"]);
   });
 }
 
@@ -204,6 +352,21 @@ test("main cancels an audio upload only after a normal send reservation succeeds
   ]);
 });
 
+test("the composer's right controls keep their element across keystrokes", () => {
+  const memo = text.slice(
+    text.indexOf("const rightControls = useMemo("),
+    text.indexOf("const documentsBar = useMemo("),
+  );
+  assert.match(memo, /<ComposerRightControls/);
+  for (const prop of ["onSendClick", "onDictateClick", "onQueueClick"]) {
+    assert.match(memo, new RegExp(`${prop}=\\{onRightControls\\w+\\}`));
+  }
+  assert.match(memo, /audioUploadBusy=\{audioUploadBusy\}/);
+  assert.doesNotMatch(memo, /audioUpload=\{|=\{\(\) =>|=\{handleSubmit\}|=\{startDictation\}/);
+  assert.match(text, /rightControlHandlersRef\.current = \{ handleSubmit, startDictation \};/);
+  assert.match(text, /\{rightControls\}/);
+});
+
 test("main, edit and comparison composers use the setting and expose settings access", () => {
   assert.match(text, /submitMode="none"/);
   assert.match(
@@ -212,12 +375,19 @@ test("main, edit and comparison composers use the setting and expose settings ac
   );
   assert.match(
     text,
-    /onQueueClick=\{\(\) => formRef.current\?\.requestSubmit\(\)\}/,
+    /const onRightControlsQueue = useCallback\(\s*\(\) => formRef\.current\?\.requestSubmit\(\),/,
   );
+  assert.match(text, /onQueueClick=\{onRightControlsQueue\}/);
   assert.match(text, /scrollTarget: "chat-composer"/);
   const compare = readSrc("features/chat/shared-composer.tsx");
-  assert.match(compare, /composerSubmitIntent\(e, sendShortcut, text\)/);
+  assert.match(
+    compare,
+    /composerSubmitIntent\(\s*imeKey \? composerKeyEventForImeSubmit\(e\) : e,\s*sendShortcut,\s*text,?\s*\)/,
+  );
   assert.match(compare, /scrollTarget: "chat-composer"/);
   const page = readSrc("features/chat/chat-page.tsx");
-  assert.match(page, /showContextWindowUsage &&\s*view.mode === "single"/);
+  assert.match(
+    page,
+    /showContextWindowUsage &&[\s\S]{0,100}view\.mode === "project" && activeThreadId != null/,
+  );
 });

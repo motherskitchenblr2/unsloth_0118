@@ -1,12 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
-"""Vision-model helpers for ingestion: figure captioning and scanned-page OCR.
-
-Both turn pixels into indexable text and are a no-op (never raise) without a loaded
-vision model. They reuse the chat model's vision endpoint, so it must be served with
-``--ubatch-size`` >= one image's tokens (some encoders, e.g. Gemma, attend
-non-causally and abort otherwise); Unsloth's vision chat already requires this."""
+"""Figure captioning and scanned-page OCR for ingestion; no-op (never raises) without a loaded
+vision model; chat endpoint needs --ubatch-size >= the tokens of one image."""
 
 from __future__ import annotations
 
@@ -45,9 +41,7 @@ def _collapse_runaway(
     max_repeat: int = 3,
     max_total: int = 8,
 ) -> str:
-    """Cap runaway repetition: vision models sometimes loop a line many times. Keep
-    each distinct line to ``max_repeat`` in a row and ``max_total`` total, and collapse
-    blank-line floods, so a degenerate page cannot flood the index."""
+    """Caps repeated lines: ``max_repeat`` in a row, ``max_total`` per line; blank runs collapsed."""
     out: list[str] = []
     seen: dict[str, int] = {}
     prev: str | None = None
@@ -82,8 +76,7 @@ def vision_endpoint() -> tuple[str, str] | None:
 
 
 def _vision_auth_headers() -> dict | None:
-    """Bearer header for the backend's API, or None. Vision calls share the chat
-    endpoint, so they need the same key under direct-stream (``--api-key``) mode."""
+    """Bearer header or None. Vision calls need that key under direct-stream (--api-key) mode."""
     try:
         from routes.inference import get_llama_cpp_backend
         return get_llama_cpp_backend()._auth_headers or None
@@ -92,8 +85,7 @@ def _vision_auth_headers() -> dict | None:
 
 
 def _direct_llama_slot():
-    """Count this call against the chat backend's slots for its duration: it reaches
-    llama-server directly, so nothing else makes the slot readout show it as busy."""
+    """Holds a chat slot for the call; it goes straight to llama-server, unseen by the readout."""
     try:
         from routes.inference import _direct_llama_request
         return _direct_llama_request()
@@ -111,8 +103,7 @@ def _vision_complete(
     max_tokens: int,
     temperature: float = 0.0,
 ) -> str | None:
-    """One image-in / text-out call to the loaded vision model's OpenAI-compatible
-    endpoint. Returns the stripped text or ``None`` on empty/failure (non-fatal)."""
+    """Vision call (image in, text out); returns stripped text, or None on empty or failure."""
     import httpx
 
     data_url = "data:image/png;base64," + base64.b64encode(image_bytes).decode("ascii")
@@ -213,9 +204,7 @@ def ocr_pages(
     endpoint: tuple[str, str] | None = None,
     on_progress: Callable[[int, int], None] | None = None,
 ) -> dict[int, str]:
-    """OCR rendered page PNGs (keyed by 1-based page number) to text; ``{}`` when there
-    is no vision model or no pages. The caller (`ingestion._ocr_scanned_pages`) owns the
-    on/off policy. Bounded by ``OCR_MAX_PAGES``."""
+    """OCR via vision model; 1-based page keys; {} if none; caller gates; cap at OCR_MAX_PAGES."""
     if not page_pngs:
         return {}
     ep = endpoint or vision_endpoint()
@@ -235,9 +224,7 @@ def ocr_pages(
 
 
 def merge_page_captions(captions: dict[int, list[str]]) -> dict[int, list[str]]:
-    """Merge a page's per-tile captions into one deduped block: drop lines repeated
-    across overlapping tiles (first kept, order preserved), then ``_collapse_runaway``,
-    so ``splice_captions`` adds a single figure block per page."""
+    """Dedupes overlapping tile captions per page, keeping first occurrences, then collapses runaways."""
     out: dict[int, list[str]] = {}
     for page, caps in captions.items():
         seen: set[str] = set()
@@ -257,8 +244,7 @@ def merge_page_captions(captions: dict[int, list[str]]) -> dict[int, list[str]]:
 
 
 def splice_captions(pages: list, captions: dict[int, list[str]]) -> list:
-    """Append captions to their page's text so the chunker indexes them, keeping
-    figures attributable in retrieved chunks. Returns new ``Page`` objects."""
+    """Appends captions to page text so chunks keep figures attributable; returns new Pages."""
     if not captions:
         return pages
     from .parsers import Page

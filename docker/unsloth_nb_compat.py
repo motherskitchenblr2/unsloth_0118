@@ -17,8 +17,7 @@ import os, sys, glob, json, re, shlex
 SIDECAR_ROOT = os.environ.get("UNSLOTH_TF_SIDECAR_ROOT", "/opt/unsloth-venv/tf-sidecars")
 MARKER = os.environ.get("UNSLOTH_NB_TF_MARKER", "/tmp/unsloth_nb/requested_transformers")
 
-# Lowest transformers the baked vLLM can import. Written by the Dockerfile's sidecar
-# verification step, so it tracks the vLLM the image bakes rather than a literal.
+# The baked vLLM's lowest importable transformers, written by the Dockerfile, not a literal.
 FLOOR_FILE = os.path.join(SIDECAR_ROOT, ".vllm_min_transformers")
 
 
@@ -107,10 +106,8 @@ def tier_for_model(model_name: str):
 
 
 def sidecar_for(version: str):
-    """FLOOR then CEILING: a sidecar the baked vLLM cannot import is never eligible
-    whatever the notebook pinned, so a request below the floor clamps UP; among the
-    eligible ones take the smallest >= the request, since a model added in X needs at
-    least X. Above every eligible sidecar returns None, i.e. the base venv."""
+    """Sidecars the baked vLLM cannot import are never eligible; requests below the floor clamp up;
+    the smallest eligible sidecar >= request wins (a model added in X needs X), else None."""
     if not version:
         return None
     rows = _eligible()
@@ -144,19 +141,10 @@ def requested_version():
         return None
 
 
-# --- install-cell pin scanning -------------------------------------------------
-# Lives here rather than in unsloth_run because this module is the one copied into
-# site-packages, so it is the only one a kernel can import; unsloth_run reads these
-# back out. One implementation, so the headless path and the IPython hook cannot
-# disagree about what an install line is.
+# Pin scanning lives here (copied to site-packages) and unsloth_run imports it, so both agree.
 
-# The requirement NAME is matched loosely and normalised afterwards, because pip
-# accepts every PEP 503 spelling of it and unsloth_pip_shim canonicalises before it
-# decides what to drop. `Transformers==5.5.0` and `transformers[torch]==5.5.0` install
-# exactly what the canonical spelling installs and the shim drops all three, so a
-# scanner that only knew the canonical form left the pin unseen while the install was
-# still suppressed. The cell then imported the base version, and that import freezes
-# the sidecar choice for the life of the kernel with nothing left to correct it.
+# The name is matched loosely and normalised (PEP 503), like unsloth_pip_shim, or
+# `Transformers[torch]==X` pins go unseen while the install is still suppressed.
 _PIN_RE = re.compile(
     r"(?<![\w.\-])([A-Za-z0-9][A-Za-z0-9._\-]*)[ \t]*(?:\[[^\]]*\])?[ \t]*=="
     r"[ \t]*([0-9][0-9A-Za-z.\-]*)"
@@ -214,9 +202,7 @@ def pin_from(text):
     return None
 
 
-# Only an actual install invocation may supply the pin: the pin outranks the model
-# tier, so a commented-out install line would pick the wrong sidecar with nothing
-# running afterwards to correct it.
+# Only an actual install line may supply the pin: it outranks the model tier.
 _INSTALL_RE = re.compile(
     r"""^[ \t]*(?![ \t]*\#)[!%]?[ \t]*
         (?: uv (?:[ \t]+-{1,2}\S+)* [ \t]+ )?
@@ -243,14 +229,12 @@ def _strip_comment(line):
     return line
 
 
-# A triple-quoted body is data, not code. Blanked keeping newlines, so the
-# continuation logic below is unaffected.
+# Blank triple-quoted data keeping newlines, so the continuation logic below is unaffected.
 _TRIPLE_RE = re.compile(r'("""|\'\'\')(?:.|\n)*?\1')
 
 
 def _live_source(src):
-    """Triple-quoted bodies and comments blanked out. Single-quoted strings stay
-    intact: the model name unsloth_run scans for lives inside one."""
+    """Blank triple-quoted bodies and comments; single-quoted strings stay for the model name."""
     blanked = _TRIPLE_RE.sub(lambda m: re.sub(r"[^\n]", " ", m.group(0)), src)
     return "\n".join(_strip_comment(line) for line in blanked.splitlines())
 
@@ -268,12 +252,9 @@ def _install_lines(src):
 
 
 def pin_in_cell(source):
-    """transformers version pinned by an install command IN this cell, else None.
-
-    Same scan unsloth_run runs over a whole notebook, applied to one cell. Anything
-    that installs nothing has to lose: once transformers is imported the sidecar
-    choice is frozen for the life of the kernel, so a wrong guess is unrecoverable
-    while no guess merely leaves the base venv."""
+    """Returns the transformers version pinned by an install in this cell (same scan as
+    unsloth_run), else None; a wrong guess is unrecoverable since transformers freezes the
+    sidecar choice on import, while no guess just uses the base venv."""
     if not source:
         return None
     return pin_from(_live_source(source))
@@ -296,9 +277,7 @@ def activate(version: str | None, *, quiet: bool = False):
         return None
     if d not in sys.path:
         sys.path.insert(0, d)
-    # guarded like the sys.path insert above: the hook runs on EVERY cell until
-    # transformers is imported, so an unconditional prepend grows PYTHONPATH by one
-    # copy per cell and every child process inherits the pile
+    # Guarded: the hook runs on every cell until transformers is imported.
     _pp = os.environ.get("PYTHONPATH", "")
     if d not in _pp.split(os.pathsep):
         os.environ["PYTHONPATH"] = d + os.pathsep + _pp
@@ -322,11 +301,7 @@ def _pre_run_cell(info = None):
     and every later cell got "already imported; cannot switch"."""
     if "transformers" in sys.modules:
         return
-    # The cell's own pin outranks the marker, which is a record of an install that has
-    # ALREADY run. Within one notebook a later cell can pin a different version, and
-    # the marker still holds the earlier one; the marker path also falls back to
-    # pid-<pid> when the ipykernel connection file cannot be read, and /tmp is never
-    # swept, so a recycled pid inherits someone else's pin.
+    # The cell's own pin outranks the marker, which may be stale or from a recycled pid.
     v = pin_in_cell(getattr(info, "raw_cell", None)) or requested_version()
     if v:
         activate(v)
