@@ -17,7 +17,6 @@ class _RemoteModel(SimpleNamespace):
     pass
 
 
-# The Teacher's model class comes from the checkpoint's own modeling file.
 _RemoteModel.__module__ = "transformers_modules.teacher.modeling_nemotron_h"
 
 
@@ -112,11 +111,15 @@ def test_omni_config_with_nested_towers_is_untouched():
     assert omni._hf_hook.execution_device == 0
 
 
-@pytest.mark.parametrize("tower", ["vision_encoder_config", "audio_encoder_config", "encoder_config"])
+@pytest.mark.parametrize(
+    "tower", ["vision_encoder_config", "audio_encoder_config", "encoder_config"]
+)
 def test_encoder_spelled_tower_configs_are_untouched(tower):
     """The same spellings _uses_flash_attention_for_generation already treats as non-language."""
     align = _helper()
     split = {"model.layers.1": 2, "model.embeddings": 1, "lm_head": 2, "model.layers.0": 0}
-    multimodal = _model(split, 0, torch.device("cuda", 1), config = SimpleNamespace(**{tower: SimpleNamespace()}))
+    multimodal = _model(
+        split, 0, torch.device("cuda", 1), config = SimpleNamespace(**{tower: SimpleNamespace()})
+    )
     assert align(multimodal) is None
     assert multimodal._hf_hook.execution_device == 0

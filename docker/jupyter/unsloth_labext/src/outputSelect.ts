@@ -7,9 +7,8 @@ import {
 } from '@jupyterlab/application';
 
 /**
- * Colab-style Ctrl/Cmd+A inside a cell output: clicking an output leaves the
- * notebook in command mode, so the chord otherwise fires `notebook:select-all`.
- * Keyed off the target or last pointer-down, never the stale selection anchor.
+ * Colab-style Ctrl/Cmd+A in an output: clicks leave command mode, so the chord would fire
+ * notebook:select-all; keyed off the target or last pointer-down, never the stale selection anchor.
  */
 
 const OUTPUT_SELECTORS = ['.jp-OutputArea-output', '.jp-Cell-outputWrapper'];
@@ -56,9 +55,7 @@ const outputSelectPlugin: JupyterFrontEndPlugin<void> = {
   activate: (_app: JupyterFrontEnd): void => {
     // a click on an image/widget output leaves no text selection
     let lastPointerOutput: HTMLElement | null = null;
-    // ...but only while it is still in the document AND in the ACTIVE cell: J/K
-    // navigation fires no pointer event, so a stale value selects an earlier cell's
-    // output, and a re-executed cell leaves a detached range that selects nothing
+    // Only while still attached and in the ACTIVE cell: J/K navigation fires no pointer event.
     const rememberedOutput = (): HTMLElement | null => {
       const output = lastPointerOutput;
       if (!output || !output.isConnected) {

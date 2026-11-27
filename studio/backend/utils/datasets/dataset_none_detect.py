@@ -23,9 +23,7 @@ add a FORMAT_REGISTRY entry only for a genuinely new column/turn shape.
 from datasets import Dataset
 
 
-# Conversation column probing (shared by detection + scanning)
-# Candidate column names for conversational datasets, checked in priority order.
-
+# Candidate conversation column names, checked in priority order; shared by detection and scanning.
 CONVERSATION_COLUMNS = ("messages", "conversations", "texts")
 
 # Minimum turn key sets identifying a column as conversational (not e.g. messages=[{"id":1}]).
@@ -33,23 +31,10 @@ _CHAT_KEY_SETS = (frozenset({"role", "content"}), frozenset({"from", "value"}))
 
 
 def _probe_conversation(dataset: Dataset, candidates = None):
-    """
-    Probe a dataset for its conversation column and turn structure.
-
-    candidates - column names to try, in priority order.
-                 Defaults to CONVERSATION_COLUMNS when None.
-
-    Returns a dict with:
-        column    - conversation column found
-        turn_keys - keys present in the first turn dict
-        roles     - all role values seen across the first few samples
-
-    Returns None if no conversation column is found.
-    """
+    """Returns the conversation column with its turn keys and roles seen, or None when no column matches."""
     if candidates is None:
         candidates = CONVERSATION_COLUMNS
     columns = set(dataset.column_names)
-    # Remember the first all-corrupt candidate.
     all_corrupt_fallback = None
     for col in candidates:
         if col not in columns:
@@ -60,15 +45,12 @@ def _probe_conversation(dataset: Dataset, candidates = None):
             sample = dataset[i][col]
             if not isinstance(sample, list) or len(sample) == 0:
                 continue
-            # Skip non-dict leading turns (e.g. [None, {"role": ...}]).
             first_turn = next((t for t in sample if isinstance(t, dict)), None)
             if first_turn is not None:
                 first = first_turn
                 break
         if first is None:
-            # No usable dict turn in 100 rows. Record an all_corrupt fallback,
-            # plausible only with turn-shaped data (None cell or list of dict/None
-            # turns); a later plausible candidate upgrades a non-plausible one.
+            # All-corrupt fallback is recorded only if turn-shaped; a later plausible candidate upgrades it.
             if all_corrupt_fallback is None or not all_corrupt_fallback.get("has_plausible_turns"):
                 has_plausible_turns = False
                 for i in range(min(len(dataset), 100)):
@@ -76,12 +58,9 @@ def _probe_conversation(dataset: Dataset, candidates = None):
                     if cell is None:
                         has_plausible_turns = True
                         break
-                    # A struct-typed cell (single dict, not a list) is metadata,
-                    # not chat: leave it for "unknown format", matching
-                    # format_detection.py.
+                    # Single-dict (struct) cells are metadata, not chat; leave them unknown, as format_detection.py.
                     if isinstance(cell, list):
-                        # Plausible only if the list holds a dict/None turn;
-                        # empty lists and list-of-strings are not chat data.
+                        # Plausible only if the list holds a dict/None turn; empty lists and list-of-strings are not chat.
                         if any(t is None or isinstance(t, dict) for t in cell):
                             has_plausible_turns = True
                             break
@@ -106,9 +85,7 @@ def _probe_conversation(dataset: Dataset, candidates = None):
                         r = t.get("role") or t.get("from")
                         if r:
                             roles.add(str(r))
-        # Column lacks a full chat key pair. If it has a conversational key (role/from/content/value) it is a corrupt-
-        # but-real chat column, so save a plausible fallback for find_none_chatml to flag. Pure metadata is not
-        # plausible, so a later real-but-corrupt column can still win.
+        # Lacking a chat key pair, a conversational key marks corrupt-but-real chat; pure metadata does not.
         _CONV_KEYS = {"role", "from", "content", "value"}
         if not any(keys <= turn_keys for keys in _CHAT_KEY_SETS):
             schema_less_plausible = bool(turn_keys & _CONV_KEYS)
@@ -127,23 +104,17 @@ def _probe_conversation(dataset: Dataset, candidates = None):
 
 
 # None-detection helpers
-
-
 def is_none_or_empty(value) -> bool:
     """True if value is None, empty string, whitespace-only, or an empty/whitespace-only VLM content block list."""
     if value is None:
         return True
     if isinstance(value, str):
-        # Treat zero-width/BOM chars (U+FEFF/200B/200C/200D/2060) as empty;
-        # they render invisibly. Two-pass strip (ws, invisibles, ws) catches
-        # mixed cases like "\u200b \u200b".
+        # Zero-width/BOM chars count as empty; the two-pass strip (ws, invisibles, ws) catches mixed cases like a zero-width space next to a space.
         stripped = value.strip().strip("\ufeff\u200b\u200c\u200d\u2060").strip()
         if not stripped:
             return True
     if isinstance(value, list):
-        # A non-text block (image/audio/tool) is real content, so flag only when every text block is blank and no such
-        # block exists: an image-only turn is valid.
-        # VLM content blocks, e.g. [{"type":"text",...}, {"type":"image",...}]; an empty list is empty.
+        # A non-text block is real content: an image-only turn is valid.
         if len(value) == 0:
             return True
         # No dict blocks (e.g. [None], ['  ']) -> malformed/empty.
@@ -166,7 +137,6 @@ def is_none_or_empty(value) -> bool:
 
 
 def _classify_empty(value) -> str:
-    """Return a human-readable label for why this value is considered empty."""
     if value is None:
         return "None"
     if isinstance(value, str):
@@ -183,14 +153,8 @@ def _classify_empty(value) -> str:
     return "valid"  # unreachable if is_none_or_empty was True
 
 
-# Alpaca detection
-
-
 def find_none_alpaca(dataset: Dataset) -> dict:
-    """
-    Scan alpaca dataset for None/empty instruction or output fields.
-    Returns a stats dict with a detailed 'findings' list.
-    """
+    """Scan alpaca dataset for None/empty instruction or output; returns stats with a 'findings' list."""
     stats = {
         "total_rows": len(dataset),
         "none_instruction": 0,
@@ -220,17 +184,8 @@ def find_none_alpaca(dataset: Dataset) -> dict:
     return stats
 
 
-# ChatML / conversational detection
-
-
 def find_none_chatml(dataset: Dataset, col: str = None) -> dict:
-    """
-    Scan chatml/sharegpt/gptoss dataset for turns with None/empty content.
-    Auto-detects the conversation column if col=None.
-
-    Returns a stats dict with a complete 'findings' list - one entry per bad
-    turn with row_index, turn_index, role, value_type, and raw_value.
-    """
+    """Auto-detects the conversation column when col is None; findings hold one entry per bad turn."""
     if col is None:
         # Reuse _probe_conversation so the all_corrupt path is handled here too.
         _cinfo = _probe_conversation(dataset)
@@ -315,8 +270,7 @@ def find_none_chatml(dataset: Dataset, col: str = None) -> dict:
                 vtype = "None" if turn is None else "invalid_type"
                 stats["none_by_type"][vtype] = stats["none_by_type"].get(vtype, 0) + 1
                 continue
-            # Explicit None check so falsy roles (0, "", False) are kept, not
-            # collapsed to "unknown".
+            # Explicit None check keeps falsy roles (0, "", False) instead of collapsing them to unknown.
             r = turn.get("role")
             if r is None:
                 r = turn.get("from")
@@ -326,9 +280,7 @@ def find_none_chatml(dataset: Dataset, col: str = None) -> dict:
                 role = r
             else:
                 role = str(r)
-            # Pick the content key: from+value -> value (ShareGPT, even if role
-            # is set); role -> content (or value); from only -> value (None when
-            # missing, so it is flagged); neither -> content then value.
+            # from+value reads value (ShareGPT, even with role); role reads content; from-only reads value.
             if "from" in turn and "value" in turn:
                 content = turn.get("value")
             elif "role" in turn:
@@ -337,8 +289,7 @@ def find_none_chatml(dataset: Dataset, col: str = None) -> dict:
                 content = turn.get("value")
             else:
                 content = turn.get("content") if "content" in turn else turn.get("value")
-            # Assistant tool-call turns carry empty content + tool_calls and are
-            # valid; the exemption is assistant-only.
+            # Assistant tool-call turns carry empty content and are valid.
             if is_none_or_empty(content) and not (role == "assistant" and turn.get("tool_calls")):
                 vtype = _classify_empty(content)
                 row_findings.append(
@@ -366,13 +317,10 @@ def find_none_chatml(dataset: Dataset, col: str = None) -> dict:
 
 
 # Convenience wrappers per format (all delegate to the same scan logic)
-
-
 def find_none_sharegpt(dataset: Dataset, col: str = None) -> dict:
     """ShareGPT uses 'from'/'value' keys - same scan logic handles both."""
     if col is None:
-        # ShareGPT lives in 'conversations': probe only that column so a corrupt one is still scanned,
-        # not replaced by a healthy 'messages'.
+        # Probe only 'conversations' for ShareGPT: a corrupt one is still scanned, not swapped for 'messages'.
         conv_info = _probe_conversation(dataset, candidates = ("conversations",))
         if conv_info is None:
             raise ValueError(
@@ -400,16 +348,12 @@ def find_none_gptoss(dataset: Dataset, col: str = None) -> dict:
     return find_none_chatml(dataset, col = col)
 
 
-# Format registry, first match wins: put specific formats before general ones (gptoss before chatml, since gptoss is
-# chatml with a 'developer' role).
-# Each entry is name, match(dataset, conv_info) -> bool, scan (find_none_* function); to add one write
-# find_none_<name>() or reuse find_none_chatml, and detect_format(), --format and scan_dataset() pick it up.
+# First match wins: gptoss must come before chatml, since gptoss is chatml with a developer role.
 
 FORMAT_REGISTRY = [
     {
         "name": "alpaca",
-        # instruction/output present and no usable chat column, meaning none exists or the only one is
-        # fully corrupt; a healthy chat column falls through to the conversational scanners below.
+        # Alpaca needs no usable chat column (none, or only fully corrupt); a healthy one falls through.
         "match": lambda ds, conv: (
             {"instruction", "output"}.issubset(ds.column_names)
             and (conv is None or conv.get("all_corrupt"))
@@ -436,8 +380,7 @@ FORMAT_REGISTRY = [
             conv is not None
             and (
                 {"role", "content"} <= conv["turn_keys"]
-                # all_corrupt: column found but every row malformed; require
-                # has_plausible_turns so scalar/string columns aren't chatml.
+                # all_corrupt (every row malformed) also needs has_plausible_turns, so scalar columns are not chatml.
                 or (conv.get("all_corrupt") and conv.get("has_plausible_turns"))
             )
         ),
@@ -453,12 +396,7 @@ FORMAT_ALIASES = {"gpt-oss": "gptoss"}
 
 
 def detect_format(dataset: Dataset) -> str:
-    """
-    Auto-detect dataset format by probing columns and turn structure.
-
-    Returns a format name from FORMAT_REGISTRY, or 'unknown'.
-    Walks the registry in order; first match wins.
-    """
+    """Returns the name of the first FORMAT_REGISTRY entry that matches, or 'unknown'."""
     conv_info = _probe_conversation(dataset)
     for entry in FORMAT_REGISTRY:
         if entry["match"](dataset, conv_info):
@@ -467,7 +405,6 @@ def detect_format(dataset: Dataset) -> str:
 
 
 def get_scanner(fmt: str):
-    """Return the scanner function for a format name, or None if unknown."""
     for entry in FORMAT_REGISTRY:
         if entry["name"] == fmt:
             return entry["scan"]
@@ -475,15 +412,7 @@ def get_scanner(fmt: str):
 
 
 def scan_dataset(dataset: Dataset, fmt: str = "auto") -> dict:
-    """
-    One-liner: detect format (if 'auto') and scan for None/empty content.
-
-    Returns the stats dict with an added 'format' key.
-    Raises ValueError if the format is unknown or unsupported.
-    """
-    # Reject a DatasetDict / IterableDatasetDict (load_dataset without split)
-    # Its column_names is a split map and would yield a confusing "unknown format". Check both, since
-    # IterableDatasetDict is not a DatasetDict subclass, and import locally so this module never hard-requires them.
+    """Raises ValueError for an unknown or unsupported format; DatasetDict and IterableDatasetDict are rejected since their split map reads as unknown."""
     _dict_types = []
     try:
         from datasets import DatasetDict as _DatasetDict
@@ -501,8 +430,7 @@ def scan_dataset(dataset: Dataset, fmt: str = "auto") -> dict:
             f"Available splits: {list(dataset.keys())}. "
             "Pass dataset[<split>] or use load_dataset(..., split='train')."
         )
-    # Streaming IterableDataset has no len()/column_names; give a clear error
-    # instead of a confusing downstream TypeError.
+    # Streaming IterableDataset lacks len()/column_names; fail clearly, not with a downstream TypeError.
     try:
         from datasets import IterableDataset as _IterableDataset
         if isinstance(dataset, _IterableDataset):
@@ -515,7 +443,6 @@ def scan_dataset(dataset: Dataset, fmt: str = "auto") -> dict:
         pass
     fmt = FORMAT_ALIASES.get(fmt, fmt)
     was_auto = fmt == "auto"
-    # Zero-row dataset: return a trivially clean stats dict.
     if was_auto and len(dataset) == 0:
         return {
             "format": "unknown",
@@ -531,8 +458,7 @@ def scan_dataset(dataset: Dataset, fmt: str = "auto") -> dict:
             if entry["match"](dataset, conv_info):
                 fmt = entry["name"]
                 break
-        # No format matched: return clean stats (format="unknown") instead of
-        # raising, so callers can branch on stats["format"].
+        # No format matched: return stats with format 'unknown' instead of raising, so callers can branch.
         if fmt == "unknown":
             return {
                 "format": "unknown",
@@ -543,7 +469,6 @@ def scan_dataset(dataset: Dataset, fmt: str = "auto") -> dict:
     scanner = get_scanner(fmt)
     if scanner is None:
         raise ValueError(f"Unknown or unsupported format: '{fmt}'")
-    # Column forwarding: on auto-detect pass the probed column
     use_probed_col = conv_info is not None and fmt != "alpaca" and was_auto
     if use_probed_col:
         stats = scanner(dataset, col = conv_info["column"])
@@ -554,8 +479,6 @@ def scan_dataset(dataset: Dataset, fmt: str = "auto") -> dict:
 
 
 # Report printing
-
-
 def _print_summary_header(stats: dict, fmt: str) -> bool:
     """Print the top-level stats block (shared by all report modes). Returns True if findings exist."""
     total = stats["total_rows"]
@@ -591,8 +514,7 @@ def _print_summary_header(stats: dict, fmt: str) -> bool:
         if rows_all:
             print(f"  Rows ALL bad: {rows_all} (every turn is None/empty)")
 
-    # Rows with no Nones - compute the count directly rather than allocating a
-    # full set of row indices, which OOMs on large (10M+ row) datasets.
+    # Count directly; a full set of good indices OOMs on 10M+ row datasets.
     bad_indices = set(stats.get("bad_row_indices", []))
     clean_count = total - len(bad_indices)
     if 0 < clean_count <= 20:
@@ -610,7 +532,6 @@ def print_report(
     fmt: str,
     summary_only: bool = False,
 ):
-    """Print a human-readable summary, optionally with full findings list."""
     has_findings = _print_summary_header(stats, fmt)
     if not has_findings or summary_only:
         return
@@ -646,11 +567,7 @@ def show_row(
     fmt: str,
     col: str = None,
 ):
-    """Print the full contents of specific rows for inspection.
-
-    Used by test_codex_fixes.py to verify row rendering behaviour.
-    Not part of the production API.
-    """
+    """Not part of the production API; used by test_codex_fixes.py to check row rendering."""
     if col is None:
         for candidate in ("messages", "conversations", "texts"):
             if candidate in dataset.column_names:
@@ -667,8 +584,7 @@ def show_row(
         print(f"  Row {ri}")
         print(f"{'=' * 64}")
 
-        # Print non-conversation columns. For alpaca, skip fields the alpaca
-        # block below prints with status markers (avoid double render).
+        # Print non-conversation columns; alpaca fields are skipped since the alpaca block prints them.
         _ALPACA_FIELDS = {"instruction", "input", "output"}
         for key in dataset.column_names:
             if key == col:
@@ -703,8 +619,7 @@ def show_row(
                         c = t.get("value")
                     else:
                         c = t.get("content") if "content" in t else t.get("value")
-                    # Mirror scanner: tool_calls exemption is assistant-only;
-                    # other roles with empty content + tool_calls are still bad.
+                    # Mirrors the scanner: only assistant turns may skip empty content when they carry tool_calls.
                     r = t.get("role") if t.get("role") is not None else t.get("from")
                     if is_none_or_empty(c) and not (str(r) == "assistant" and t.get("tool_calls")):
                         return True
@@ -749,8 +664,6 @@ def show_row(
 
         print(f"{'=' * 64}")
 
-
-# CLI entry point
 
 if __name__ == "__main__":
     import argparse
@@ -808,8 +721,7 @@ examples:
     try:
         ds = load_dataset(args.dataset, split = args.split, token = args.token)
     except Exception as exc:
-        # Some `datasets` / `requests` versions include the Authorization
-        # header in exception messages. Redact the token before printing.
+        # Some library versions include the Authorization header in errors; redact it.
         msg = str(exc)
         if args.token:
             msg = msg.replace(args.token, "hf_***REDACTED***")

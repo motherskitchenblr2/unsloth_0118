@@ -6,14 +6,13 @@ import { readFileSync } from "node:fs";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
-import { en } from "../src/i18n/locales/en.ts";
 import { SETTINGS_SEARCH_INDEX } from "../src/features/settings/settings-search.ts";
+import { en } from "../src/i18n/locales/en.ts";
 
 function read(path: string): string {
   return readFileSync(fileURLToPath(new URL(path, import.meta.url)), "utf-8");
 }
 
-// The section reaches the hub and auth barrels, which cannot be imported here, so this asserts on source.
 const SECTION = read(
   "../src/features/settings/components/decision-api-section.tsx",
 );
@@ -21,7 +20,11 @@ const API = read("../src/features/settings/api/systemone.ts");
 const API_TAB = read("../src/features/settings/tabs/api-keys-tab.tsx");
 
 test("the API tab renders the section and search finds it", () => {
-  assert.match(API_TAB, /<DecisionApiSection \/>/);
+  const tabs = read("../src/features/settings/components/api-example-tabs.tsx");
+  assert.match(API_TAB, /<ApiExamplesPanel/);
+  assert.match(tabs, /<DecisionApiSection[\s\S]*?showHeading=\{false\}/);
+  assert.match(tabs, /searchLabel: "settings\.apiKeys\.decisionApi\.title"/);
+  assert.match(tabs, /data-settings-label=\{\s*entry\.searchLabel \? t\(entry\.searchLabel\) : undefined\s*\}/);
   assert.ok(
     SETTINGS_SEARCH_INDEX["api-keys"].includes(
       "settings.apiKeys.decisionApi.title",
@@ -33,11 +36,13 @@ test("the API tab renders the section and search finds it", () => {
   );
 });
 
-test("only the owner sees it, below the chat usage examples", () => {
+test("only the owner sees it, as a tab after the chat, media and audio examples", () => {
+  const tabs = read("../src/features/settings/components/api-example-tabs.tsx");
   assert.match(
-    API_TAB,
-    /<UsageExamples[\s\S]*?\/>\s*(?:\{\/\*[^*]*\*\/\}\s*)?\{isOwner \? <DecisionApiSection \/> : null\}/,
+    tabs,
+    /id: "audio",[\s\S]*?\.\.\.\(isOwner\s*\? \[\s*\{\s*id: "decision" as const/,
   );
+  assert.match(tabs, /if \(tab === "decision" && !isOwner\) return;/);
   assert.doesNotMatch(SECTION, /useIsAccountOwner/);
 });
 
@@ -50,11 +55,58 @@ test("turning it on or picking a model downloads, the device does not", () => {
   );
 });
 
+test("a download waits for confirmation before changing the setting", () => {
+  const apply = SECTION.slice(
+    SECTION.indexOf("const apply = async"),
+    SECTION.indexOf("const acceptDownload = async"),
+  );
+  assert.doesNotMatch(apply, /startDownload\(/);
+  assert.ok(
+    apply.indexOf("resolveSystemOneDownload(nextModel, nextBackend)") <
+      apply.indexOf("updateSystemOneSettings(settingsPatch)"),
+  );
+  assert.match(apply, /expectedEnabled: settings\.enabled/);
+  assert.match(apply, /expectedModel: settings\.model/);
+  assert.match(
+    apply,
+    /setConfirm\(\{\s*plan: nextPlan,\s*patch: settingsPatch,\s*model: nextModel,?\s*\}\);\s*return;/,
+  );
+  assert.doesNotMatch(
+    apply.slice(0, apply.indexOf("setConfirm")),
+    /setPlanState/,
+  );
+  const accept = SECTION.slice(
+    SECTION.indexOf("const acceptDownload = async"),
+    SECTION.indexOf("const unload = async"),
+  );
+  assert.ok(
+    accept.indexOf("validateSystemOneSettings(accepted.patch)") <
+      accept.indexOf("startDownload(accepted.plan)"),
+  );
+  assert.ok(
+    accept.indexOf("startDownload(accepted.plan)") <
+      accept.indexOf("updateSystemOneSettings(accepted.patch)"),
+  );
+  assert.match(
+    SECTION,
+    /<AlertDialogAction[\s\S]*?acceptDownload\(accepted\)[\s\S]*?<\/AlertDialogAction>/,
+  );
+  assert.doesNotMatch(SECTION, /apply\(confirm\./);
+  assert.match(en.settings.apiKeys.decisionApi.downloadConfirmBody, /\{size\}/);
+});
+
 test("the download goes through the manager with the exact files and one scope", () => {
   assert.match(SECTION, /const DOWNLOAD_SCOPE = "systemone";/);
   assert.match(SECTION, /scopeId: DOWNLOAD_SCOPE,/);
   assert.match(SECTION, /files: next\.files,/);
   assert.match(SECTION, /expectedBytes: next\.sizeBytes,/);
+  assert.match(
+    SECTION,
+    /acceptedState === "running" \|\| acceptedState === "complete"/,
+  );
+  assert.match(SECTION, /resolveSystemOneDownload\(model, backend\)\.then/);
+  assert.match(SECTION, /\[enabled, model, backend, mlxAvailable, downloadDone\]/);
+  assert.match(SECTION, /await resyncSettingsAfterError/);
 });
 
 test("environment overrides lock their control and say why", () => {
@@ -79,6 +131,15 @@ test("GPU is offered only where the backend found one", () => {
   );
 });
 
+test("MLX is a runtime only where the backend can serve it", () => {
+  assert.match(
+    SECTION,
+    /\{settings\.mlxAvailable \|\| backend === "mlx" \? \(\s*<SelectItem value="mlx">/,
+  );
+  assert.match(SECTION, /backend: decisionRuntimeLabel\(/);
+  assert.match(API, /return backend === "mlx" \? "MLX" : backend;/);
+});
+
 test("the copy stays plain", () => {
   const copy = en.settings.apiKeys.decisionApi;
   assert.equal("experimental" in copy, false);
@@ -91,7 +152,10 @@ test("the copy stays plain", () => {
 test("the client talks to the settings routes and maps the schema", () => {
   assert.match(API, /const SETTINGS_PATH = "\/api\/settings\/systemone";/);
   assert.match(API, /`\$\{SETTINGS_PATH\}\/unload`/);
-  assert.match(API, /`\$\{SETTINGS_PATH\}\/resolve`/);
+  assert.match(API, /`\$\{SETTINGS_PATH\}\/validate`/);
+  assert.match(API, /`\$\{SETTINGS_PATH\}\/resolve\$\{query\}`/);
+  assert.match(API, /expected_enabled: expectedEnabled/);
+  assert.match(API, /expected_model: expectedModel/);
   for (const [camel, snake] of [
     ["enabledLocked", "enabled_locked"],
     ["gpuAvailable", "gpu_available"],
@@ -108,10 +172,21 @@ test("reports a resident model as loaded only when it is the selected one", () =
   assert.match(SECTION, /settings\.loadingModel === settings\.model/);
 });
 
-test("a failed first load still renders the section with its error", () => {
-  assert.match(SECTION, /if \(!settings\) \{\s*return error \?/);
+test("before settings load, the section renders its header with the error or a loading line", () => {
+  assert.match(
+    SECTION,
+    /if \(!settings\) \{[\s\S]*?\{header\}\s*<div>\s*\{errorLine \?\? \([\s\S]*?decisionApi\.loading/,
+  );
   assert.match(
     SECTION,
     /translate\("settings.apiKeys.decisionApi.loadError"\)/,
   );
+});
+
+test("The Connections link works off the dialog too, where the API page shows this card", () => {
+  assert.match(
+    SECTION,
+    /onClick=\{\(\) =>\s*useSettingsDialogStore\.getState\(\)\.openDialog\("connections"\)\s*\}/,
+  );
+  assert.doesNotMatch(SECTION, /setActiveTab\("connections"\)/);
 });

@@ -30,8 +30,7 @@ from transformers.models.qwen3_moe.modeling_qwen3_moe import (
     Qwen3MoeForCausalLM,
 )
 
-# For Pytorch 2.1.1
-# Transformers moved to attention_interface, so the Sdpa/FlashAttention2 aliases may no longer be needed.
+# For torch 2.1.1: transformers moved to attention_interface, so the Sdpa/FlashAttention2 aliases may be unneeded.
 from unsloth_zoo.utils import Version, _get_dtype
 
 
@@ -56,11 +55,9 @@ def Qwen3MoeSparseMoeBlock_fast_forward(
     routing_weights = torch_nn_functional_softmax(router_logits, dim = -1, dtype = torch.float32)
     routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim = -1)
     routing_weights /= routing_weights.sum(dim = -1, keepdim = True)
-    # Cast back to the input dtype.
     routing_weights = routing_weights.to(X.dtype)
     final_X = torch.zeros((bsz * seq_len, hd), dtype = torch.float32, device = X.device)
 
-    # One-hot the selected experts into a mask indexing which expert is used.
     expert_mask = torch.nn.functional.one_hot(
         selected_experts, num_classes = self.num_experts
     ).permute(2, 1, 0)
@@ -69,7 +66,6 @@ def Qwen3MoeSparseMoeBlock_fast_forward(
         expert_layer = self.experts[expert_idx]
         idx, top_x = torch.where(expert_mask[expert_idx])
 
-        # Index hidden states for this expert and scale by routing_weights.
         current_state = X[None, top_x].reshape(-1, hd)
         current_X = (
             expert_layer(current_state) * routing_weights[top_x, idx, None]
@@ -115,14 +111,13 @@ def Qwen3MoeDecoderLayer_fast_forward(
         )
         hidden_states += residual
 
-        # MoE Router MLP.
         residual = hidden_states
         hidden_states = fast_rms_layernorm_inference(self.post_attention_layernorm, hidden_states)
         hidden_states, router_logits = Qwen3MoeSparseMoeBlock_fast_forward(self.mlp, hidden_states)
         hidden_states += residual
     else:
         residual = hidden_states
-        hidden_states = fast_rms_layernorm(self.input_layernorm, hidden_states)
+        hidden_states = fast_rms_layernorm(self.input_layernorm, hidden_states, reuse_grad = True)
         hidden_states, self_attn_weights, present_key_value = self.self_attn(
             hidden_states = hidden_states,
             causal_mask = causal_mask,
@@ -136,9 +131,10 @@ def Qwen3MoeDecoderLayer_fast_forward(
         )
         hidden_states = residual + hidden_states
 
-        # MoE Router MLP.
         residual = hidden_states
-        hidden_states = fast_rms_layernorm(self.post_attention_layernorm, hidden_states)
+        hidden_states = fast_rms_layernorm(
+            self.post_attention_layernorm, hidden_states, reuse_grad = True
+        )
         hidden_states, router_logits = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
 
@@ -173,8 +169,7 @@ class FastQwen3MoeModel(FastQwen3Model):
         PeftModelForCausalLM.forward = PeftModel_fast_forward
         fix_prepare_inputs_for_generation(Qwen3MoeForCausalLM)
 
-        # Static KV Cache landed in 4.38.0 and made training much slower (#168,
-        # huggingface/transformers#27931), so the old rotary embeddings are retained.
+        # Static KV cache (4.38.0) slowed training (#168), so the old rotary embeddings are retained.
         import transformers.models.qwen3_moe.modeling_qwen3_moe
 
         transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeRotaryEmbedding = (

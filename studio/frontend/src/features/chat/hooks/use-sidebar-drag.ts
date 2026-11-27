@@ -1,12 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
-// The React side of sidebar drag-and-drop: the lifted row, the plan under the pointer, and the
-// pointer events that feed both. What a drop does is decided in lib/sidebar-drag.ts.
-//
-// Pointer events, not the HTML5 drag API. The desktop webview answers every OS drag itself and
-// never forwards it to the page, so dragover and drop never fire there and a row wired to them
-// is dead. Same reason shared-composer.tsx skips its drop handlers under isTauri.
+// React side of sidebar drag-and-drop; drop semantics live in lib/sidebar-drag.ts.
+// Pointer events, not HTML5 drag: the desktop webview never forwards OS drags to the page.
 
 import { useCallback, useEffect, useRef, useState } from "react";
 
@@ -30,27 +26,63 @@ import {
   sidebarDragSource,
 } from "../stores/sidebar-drag-source.ts";
 
-/** How long the pointer rests on a closed folder or section before it opens. */
 export const SPRING_OPEN_DELAY_MS = 450;
 
-/** Pointer travel before a press on a row becomes a drag, so a click stays a click and a
- *  double-click still renames. */
+/** Travel before a press becomes a drag, so clicks and double-click rename still work. */
 export const DRAG_THRESHOLD_PX = 5;
 
-/** Marks a drop zone in the DOM, carrying the zone itself. A zone needs no ref and no
- *  registration: the hit test reads it back off whatever sits under the pointer. */
+/** Marks a drop zone; the hit test reads the zone back off the element under the pointer. */
 export const DROP_ZONE_ATTR = "data-sidebar-drop";
 
-/** Set on the body for the length of a drag: no text selection, and the grabbing cursor
- *  follows the row off its own list. */
-export const DRAGGING_BODY_CLASS = "sidebar-row-dragging";
+/** Set on the drag box, never the body: restyling the body caused a visible hitch. */
+export const DRAGGING_CLASS = "pointer-dragging";
 
-/** Controls that own their own press. A drag never starts from the pin or the kebab. */
+function refuseSelection(event: Event) {
+  event.preventDefault();
+}
+
+export function markDragging(box: Element | null, on: boolean) {
+  if (on) {
+    box?.classList.add(DRAGGING_CLASS);
+    window.getSelection()?.removeAllRanges();
+    document.addEventListener("selectstart", refuseSelection, true);
+    return;
+  }
+  document.removeEventListener("selectstart", refuseSelection, true);
+  for (const marked of document.querySelectorAll(`.${DRAGGING_CLASS}`)) {
+    marked.classList.remove(DRAGGING_CLASS);
+  }
+}
+
+/** Persistent drag overlay layer: removing body children restyles the whole page. */
+export function dragLayer(): HTMLElement {
+  let layer = document.getElementById(DRAG_LAYER_ID);
+  if (!layer) {
+    layer = document.createElement("div");
+    layer.id = DRAG_LAYER_ID;
+    layer.setAttribute("aria-hidden", "true");
+    document.body.append(layer);
+  }
+  return layer;
+}
+
+const DRAG_LAYER_ID = "pointer-drag-layer";
+
+export const sidebarOf = (element: Element): Element | null =>
+  element.closest('[data-sidebar="sidebar"]');
+
 const NO_DRAG_SELECTOR = ".sidebar-row-action";
 
-/** How near an edge of the scroller the pointer scrolls the list, and by how much per move. */
-const EDGE_PX = 48;
-const EDGE_STEP_PX = 12;
+export const ROW_GHOST_CLASS = "sidebar-row-ghost";
+
+export const DROP_CUE_CLASS = "sidebar-drop-cue";
+
+const CUE_OVERLAY_CLASS = "sidebar-drop-cue-overlay";
+
+const SETTLE_MS = 180;
+
+export const EDGE_PX = 48;
+export const EDGE_STEP_PX = 12;
 
 interface ZoneHit {
   zone: SidebarDropZone;
@@ -58,8 +90,6 @@ interface ZoneHit {
   rect: DOMRect;
 }
 
-/** The drop zones under the pointer, innermost first: a row paints over its folder block,
- *  which paints over its section. */
 function zonesUnder(x: number, y: number): ZoneHit[] {
   if (typeof document === "undefined") return [];
   const hits: ZoneHit[] = [];
@@ -83,15 +113,30 @@ function zonesUnder(x: number, y: number): ZoneHit[] {
   return hits;
 }
 
-/** Max distance between a row's bottom and the next row's top for them to share a gap. */
+/** Recents is always last, so empty sidebar below it acts as its end strip. */
+function zonePastRecents(x: number, y: number, list: Element | null): ZoneHit | null {
+  if (typeof document === "undefined") return null;
+  const tail = document.querySelector(
+    `[${ROW_KEY_ATTR}="${CSS.escape(rowKey(SIDEBAR_TAIL_SCOPE, "recents"))}"]`,
+  );
+  if (!tail) return null;
+  const rect = tail.getBoundingClientRect();
+  if (rect.height === 0 || y < rect.bottom || x < rect.left || x > rect.right) return null;
+  if (list && y > list.getBoundingClientRect().bottom) return null;
+  try {
+    const parsed = JSON.parse(tail.getAttribute(DROP_ZONE_ATTR) ?? "") as {
+      zone: SidebarDropZone;
+    };
+    return { zone: parsed.zone, closed: false, rect };
+  } catch {
+    return null;
+  }
+}
+
 const ADJACENT_PX = 3;
 
-/** Marks the row, or section tail, a line can be drawn on with its row key, so a neighbour
- *  lookup finds it directly instead of scanning every zone. */
 const ROW_KEY_ATTR = "data-sidebar-row-key";
 
-/** The row drawn directly below or above the row, or section tail, that `key` names. Probes
- *  just past its edge, so the cost does not grow with the list. */
 function rowNextTo(key: string, side: "below" | "above"): ZoneHit | null {
   if (typeof document === "undefined") return null;
   const self = document.querySelector(`[${ROW_KEY_ATTR}="${CSS.escape(key)}"]`);
@@ -117,8 +162,180 @@ function rowNextTo(key: string, side: "below" | "above"): ZoneHit | null {
   return null;
 }
 
-/** The list the row scrolls while it is carried: the nearest ancestor that actually scrolls. */
-function scrollerOf(element: Element | null): HTMLElement | null {
+const ROW_FACE_SELECTOR = '[data-sidebar="menu-button"]';
+
+const GHOST_DROPPED_ATTRS = [
+  "id",
+  DROP_ZONE_ATTR,
+  ROW_KEY_ATTR,
+  "data-active",
+  "data-testid",
+  "data-thread-id",
+  "data-thread-type",
+] as const;
+
+export interface RowGhost {
+  element: HTMLElement;
+  grab: number;
+  view: Element;
+  top: number;
+  cues: HTMLElement[];
+}
+
+function liftRow(row: HTMLElement, pressY: number, view: Element): RowGhost | null {
+  const face = row.querySelector<HTMLElement>(ROW_FACE_SELECTOR);
+  if (!face) return null;
+  const ghost = liftCopy(face, pressY, view, ROW_GHOST_CLASS, GHOST_DROPPED_ATTRS);
+  const iconSize = getComputedStyle(face).getPropertyValue("--icon-size");
+  if (iconSize) ghost.element.style.setProperty("--icon-size", iconSize);
+  return ghost;
+}
+
+export function liftCopy(
+  face: HTMLElement,
+  pressY: number,
+  view: Element,
+  className: string,
+  dropped: readonly string[],
+): RowGhost {
+  const rect = face.getBoundingClientRect();
+  const style = getComputedStyle(face);
+  const copy = face.cloneNode(true) as HTMLElement;
+  for (const node of [copy, ...copy.querySelectorAll<HTMLElement>("*")]) {
+    for (const name of dropped) node.removeAttribute(name);
+  }
+  copy.tabIndex = -1;
+  const element = document.createElement("div");
+  element.setAttribute("aria-hidden", "true");
+  element.inert = true;
+  element.className = className;
+  element.append(copy);
+  // Lifted where the row is, so a frame before the first transform is not at the top.
+  Object.assign(element.style, {
+    top: `${rect.top}px`,
+    left: `${rect.left}px`,
+    width: `${rect.width}px`,
+    height: `${rect.height}px`,
+    borderRadius: style.borderRadius,
+    fontFamily: style.fontFamily,
+    color: style.color,
+  });
+  dragLayer().append(element);
+  return { element, grab: pressY - rect.top, view, top: rect.top, cues: [] };
+}
+
+/** Redraw cue borders over the copy (border only, or the tint doubles). */
+export function placeCue(ghost: RowGhost) {
+  const view = ghost.view.getBoundingClientRect();
+  let shown = 0;
+  for (const cue of document.querySelectorAll<HTMLElement>(`.${DROP_CUE_CLASS}`)) {
+    const style = getComputedStyle(cue, "::before");
+    if (style.content === "none" || cue.offsetHeight === 0) continue;
+    let overlay = ghost.cues[shown];
+    if (!overlay) {
+      overlay = document.createElement("div");
+      overlay.setAttribute("aria-hidden", "true");
+      overlay.className = CUE_OVERLAY_CLASS;
+      dragLayer().append(overlay);
+      ghost.cues.push(overlay);
+    }
+    shown += 1;
+    const box = cue.getBoundingClientRect();
+    const left = box.left + (parseFloat(style.left) || 0);
+    const top = box.top + (parseFloat(style.top) || 0);
+    const height = parseFloat(style.height) || 0;
+    Object.assign(overlay.style, {
+      display: "block",
+      width: style.width,
+      height: `${height}px`,
+      borderStyle: style.borderStyle,
+      borderColor: style.borderColor,
+      borderTopWidth: style.borderTopWidth,
+      borderRightWidth: style.borderRightWidth,
+      borderBottomWidth: style.borderBottomWidth,
+      borderLeftWidth: style.borderLeftWidth,
+      borderRadius: style.borderRadius,
+      left: `${left}px`,
+      top: `${top}px`,
+      clipPath: `inset(${Math.max(0, view.top - top)}px 0 ${Math.max(0, top + height - view.bottom)}px 0)`,
+    });
+  }
+  for (const overlay of ghost.cues.slice(shown)) overlay.style.display = "none";
+}
+
+export function placeGhost(ghost: RowGhost, y: number) {
+  const view = ghost.view.getBoundingClientRect();
+  const height = ghost.element.offsetHeight;
+  const top = Math.min(Math.max(y - ghost.grab, view.top), view.bottom - height);
+  ghost.element.style.transform = `translate3d(0, ${Math.round(top - ghost.top)}px, 0)`;
+}
+
+function zoneOf(element: Element): SidebarDropZone | null {
+  try {
+    return (JSON.parse(element.getAttribute(DROP_ZONE_ATTR) ?? "") as { zone: SidebarDropZone }).zone;
+  } catch {
+    return null;
+  }
+}
+
+function settleRow(item: SidebarDragItem, from: number) {
+  // Two frames: the drop re-renders the sidebar before the row can be measured.
+  requestAnimationFrame(() =>
+    requestAnimationFrame(() => {
+      let row: HTMLElement | null = null;
+      const moving: HTMLElement[] = [];
+      for (const element of document.querySelectorAll<HTMLElement>(`[${DROP_ZONE_ATTR}]`)) {
+        if (element.offsetHeight === 0) continue;
+        const zone = zoneOf(element);
+        if (!zone) continue;
+        const isRow = zone.row?.id === item.id && zone.row.kind === item.kind && !zone.header;
+        if (isRow && element.hasAttribute(ROW_KEY_ATTR)) {
+          const face = element.querySelector(ROW_FACE_SELECTOR) ?? element;
+          const top = face.getBoundingClientRect().top;
+          const best = row?.querySelector(ROW_FACE_SELECTOR) ?? row;
+          if (!best || Math.abs(top - from) < Math.abs(best.getBoundingClientRect().top - from)) {
+            row = element;
+          }
+        }
+        if (
+          item.kind === "project" &&
+          zone.folderId === item.id &&
+          zone.row?.kind !== "project" &&
+          !zone.header
+        ) {
+          moving.push(element);
+        }
+      }
+      if (!row) return;
+      const to = (row.querySelector(ROW_FACE_SELECTOR) ?? row).getBoundingClientRect().top;
+      const delta = from - to;
+      if (Math.abs(delta) < 2) return;
+      // Only the outermost of nested spots move, or a spot would move twice.
+      const all = [row, ...moving.filter((element) => element !== row)];
+      const slide = all.filter(
+        (element) => !all.some((other) => other !== element && other.contains(element)),
+      );
+      for (const element of slide) {
+        element.style.transition = "none";
+        element.style.transform = `translateY(${delta}px)`;
+        element.style.zIndex = "1";
+      }
+      row.getBoundingClientRect();
+      for (const element of slide) {
+        element.style.transition = `transform ${SETTLE_MS}ms cubic-bezier(0.2, 0.8, 0.2, 1)`;
+        element.style.transform = "";
+      }
+      window.setTimeout(() => {
+        for (const element of slide) {
+          element.style.transition = "";
+          element.style.zIndex = "";
+        }
+      }, SETTLE_MS + 20);
+    }),
+  );
+}
+
+export function scrollerOf(element: Element | null): HTMLElement | null {
   for (let node = element; node; node = node.parentElement) {
     if (!(node instanceof HTMLElement)) continue;
     const overflow = getComputedStyle(node).overflowY;
@@ -133,31 +350,23 @@ function scrollerOf(element: Element | null): HTMLElement | null {
 }
 
 export interface UseSidebarDragOptions {
-  /** Read at event time, so a plan sees the lists as they stand. */
   context: () => SidebarDropContext;
-  /** Commits the plan the row was dropped on. */
   onDrop: (plan: SidebarDropPlan, drag: SidebarDragItem) => void;
-  /** Opens the closed folder or section the pointer rested on. */
   onSpringOpen?: (zone: SidebarDropZone) => void;
+  reducedMotion?: () => boolean;
 }
 
 export interface SidebarDragApi {
-  /** The lifted row, for painting it faded. Null between drags. */
   drag: SidebarDragItem | null;
-  /** What the drop under the pointer would do. */
   plan: SidebarDropPlan | null;
-  /** Props that let a row be picked up. */
   dragHandleProps: (item: SidebarDragItem) => {
     onPointerDown: (event: React.PointerEvent) => void;
   };
-  /** Props that let a spot take a drop. `closed` marks a collapsed folder or section. */
   dropZoneProps: (
     zone: SidebarDropZone,
     options?: { closed?: boolean },
   ) => Record<string, string>;
-  /** The edge the insertion line is drawn on for this row in this list, if any. */
-  lineEdge: (scope: string, id: string) => DropEdge | undefined;
-  /** Whether the whole target under this key is lit. */
+  lineAt: (scope: string, id: string) => { edge: DropEdge; inFolder: boolean } | undefined;
   ringLit: (key: string) => boolean;
 }
 
@@ -168,14 +377,13 @@ export function useSidebarDrag(options: UseSidebarDragOptions): SidebarDragApi {
     key: "",
     plan: null,
   });
-  // Handlers are made once and read the latest options at event time.
   const optionsRef = useRef(options);
   useEffect(() => {
     optionsRef.current = options;
   });
   const spring = useRef<{ key: string; timer: number } | null>(null);
   const scroller = useRef<HTMLElement | null>(null);
-  /** The gesture in flight, so a second pointer cannot start another over the top of it. */
+  const ghost = useRef<RowGhost | null>(null);
   const press = useRef<{ end: () => void } | null>(null);
 
   const cancelSpring = useCallback(() => {
@@ -196,15 +404,16 @@ export function useSidebarDrag(options: UseSidebarDragOptions): SidebarDragApi {
     setSidebarDragSource(null);
     cancelSpring();
     scroller.current = null;
-    document.body.classList.remove(DRAGGING_BODY_CLASS);
+    ghost.current?.element.remove();
+    for (const overlay of ghost.current?.cues ?? []) overlay.remove();
+    ghost.current = null;
+    markDragging(null, false);
     setDrag(null);
     showPlan(null);
   }, [cancelSpring, showPlan]);
 
   useEffect(() => () => clear(), [clear]);
 
-  /** The first zone under the pointer with an answer. No answer lets the zone around it
-   *  answer instead. */
   const aim = useCallback(
     (
       x: number,
@@ -213,7 +422,9 @@ export function useSidebarDrag(options: UseSidebarDragOptions): SidebarDragApi {
       const dragged = sidebarDragSource();
       if (!dragged) return null;
       const context = optionsRef.current.context();
-      for (const hit of zonesUnder(x, y)) {
+      const under = zonesUnder(x, y);
+      const past = under.length === 0 ? zonePastRecents(x, y, scroller.current) : null;
+      for (const hit of past ? [past] : under) {
         const outcome = planSidebarDrop(
           dragged,
           hit.zone,
@@ -221,9 +432,7 @@ export function useSidebarDrag(options: UseSidebarDragOptions): SidebarDragApi {
           context,
         );
         if (!outcome) continue;
-        // One line per gap: a bottom line defers to the row below's top, and a section tail's
-        // line to the row above's bottom, when that lands the drop identically. Different drops
-        // (a folder's last chat vs the next row) keep their own lines.
+        // One line per gap when both neighbours land the drop identically.
         if (outcome !== STAY && "line" in outcome.cue) {
           const { rowKey: key, edge } = outcome.cue.line;
           const tail = key.startsWith(`${SIDEBAR_TAIL_SCOPE}:`);
@@ -241,7 +450,6 @@ export function useSidebarDrag(options: UseSidebarDragOptions): SidebarDragApi {
             "line" in alt.cue &&
             equivalentDrop(alt, outcome)
           ) {
-            // Only the painted line moves: the original `place` is what a slow move re-aims by.
             return { hit, outcome: { ...outcome, cue: alt.cue } };
           }
         }
@@ -252,8 +460,7 @@ export function useSidebarDrag(options: UseSidebarDragOptions): SidebarDragApi {
     [],
   );
 
-  /** One step of the edge scroll. Driven by the frame loop, not by pointermove: a pointer resting
-   *  on the edge sends no moves and would stall. */
+  /** Edge-scroll step from the frame loop: a resting pointer sends no moves. */
   const edgeScroll = useCallback((y: number) => {
     const list = scroller.current;
     if (!list) return;
@@ -297,15 +504,12 @@ export function useSidebarDrag(options: UseSidebarDragOptions): SidebarDragApi {
   const dragHandleProps = useCallback(
     (item: SidebarDragItem) => ({
       onPointerDown: (event: React.PointerEvent) => {
-        // Touch scrolls the list and keeps Move up and Move down. The right button opens the
-        // row menu, and a control with its own press keeps it.
         if (event.button !== 0 || event.pointerType === "touch") return;
         if (!event.isPrimary) return;
         if ((event.target as Element | null)?.closest?.(NO_DRAG_SELECTOR)) {
           return;
         }
-        // Abandoned rather than refused: a release the window never saw would otherwise leave a
-        // gesture in flight for good and block every drag after it.
+        // Abandon, not refuse: a release the window never saw would block every later drag.
         press.current?.end();
 
         const startX = event.clientX;
@@ -325,15 +529,12 @@ export function useSidebarDrag(options: UseSidebarDragOptions): SidebarDragApi {
           window.removeEventListener("pointerup", onUp);
           window.removeEventListener("pointercancel", onCancel);
           window.removeEventListener("keydown", onKey, true);
-          // Captured on the body, which no re-render can unmount mid-gesture. A row can.
+          // Captured on the body, which no re-render can unmount mid-gesture.
           if (document.body.hasPointerCapture?.(pointerId)) {
             document.body.releasePointerCapture(pointerId);
           }
         };
-        // The rows move under the pointer, not the other way about: the list edge-scrolls, a
-        // folder springs open under a pointer that by definition is resting. So every frame
-        // re-aims, not only the ones that scroll, or the cue would describe the layout as it was
-        // when the pointer last moved while the release hit-tests the layout as it is.
+        // Re-aim every frame: rows move under a resting pointer (edge scroll, spring open).
         const onFrame = () => {
           // Self-terminating, so an unmount mid-drag cannot leave the loop running.
           if (!sidebarDragSource()) {
@@ -342,9 +543,10 @@ export function useSidebarDrag(options: UseSidebarDragOptions): SidebarDragApi {
           }
           frame = requestAnimationFrame(onFrame);
           edgeScroll(at.y);
+          if (ghost.current) placeGhost(ghost.current, at.y);
           track(at.x, at.y);
+          if (ghost.current) placeCue(ghost.current);
         };
-        // Abandons this gesture whole, for a drop that never came: the same as a cancel.
         const self = {
           end: () => {
             detach();
@@ -353,7 +555,6 @@ export function useSidebarDrag(options: UseSidebarDragOptions): SidebarDragApi {
         };
         press.current = self;
 
-        // Swallow the click the release would otherwise fire on the row it landed on.
         const swallowClick = () => {
           const stop = (clicked: MouseEvent) => {
             clicked.preventDefault();
@@ -365,8 +566,7 @@ export function useSidebarDrag(options: UseSidebarDragOptions): SidebarDragApi {
           }, 0);
         };
 
-        // Every window handler answers only the pointer that started the gesture. A second
-        // pointer, a finger on a touch screen above all, is not this drag.
+        // Answer only the starting pointer; a second finger is not this drag.
         function onMove(moved: PointerEvent) {
           if (moved.pointerId !== pointerId || escaped) return;
           at.x = moved.clientX;
@@ -380,9 +580,14 @@ export function useSidebarDrag(options: UseSidebarDragOptions): SidebarDragApi {
             }
             started = true;
             scroller.current = scrollerOf(row);
-            document.body.classList.add(DRAGGING_BODY_CLASS);
-            // Without capture a release outside the window never arrives and the row stays
-            // stuck. Capture retargets events only, so the hit test still finds the zone.
+            ghost.current = liftRow(
+              row,
+              startY,
+              scroller.current ?? row.closest('[data-sidebar="content"]') ?? document.documentElement,
+            );
+            if (ghost.current) placeGhost(ghost.current, moved.clientY);
+            markDragging(sidebarOf(row), true);
+            // Without capture a release outside the window never arrives and the row sticks.
             try {
               document.body.setPointerCapture(pointerId);
             } catch {
@@ -392,7 +597,6 @@ export function useSidebarDrag(options: UseSidebarDragOptions): SidebarDragApi {
             setDrag(item);
             frame = requestAnimationFrame(onFrame);
           }
-          // Held by the window, so the row keeps following the pointer outside the sidebar.
           moved.preventDefault();
           track(moved.clientX, moved.clientY);
         }
@@ -401,14 +605,15 @@ export function useSidebarDrag(options: UseSidebarDragOptions): SidebarDragApi {
           if (released.pointerId !== pointerId) return;
           detach();
           if (!started) return;
-          // A drop or an escape: either way this release must not click the row it landed on.
           swallowClick();
           if (escaped) return;
           const dragged = sidebarDragSource();
           const aimed = aim(released.clientX, released.clientY);
+          const from = ghost.current?.element.getBoundingClientRect().top ?? null;
           clear();
           if (dragged && aimed && aimed.outcome !== STAY) {
             optionsRef.current.onDrop(aimed.outcome, dragged);
+            if (from !== null && !optionsRef.current.reducedMotion?.()) settleRow(dragged, from);
           }
         }
 
@@ -421,13 +626,11 @@ export function useSidebarDrag(options: UseSidebarDragOptions): SidebarDragApi {
         function onKey(pressed: KeyboardEvent) {
           if (pressed.key !== "Escape" || escaped) return;
           if (!started) {
-            // Nothing was lifted, so the press is abandoned and a click after it is the row's.
             detach();
             return;
           }
           pressed.preventDefault();
-          // The button is still down. The gesture keeps its listeners so the release, whenever
-          // it comes, is still ours to swallow: a guard armed now would be long gone by then.
+          // Button still down: keep listeners so the eventual release is swallowed.
           escaped = true;
           clear();
         }
@@ -460,12 +663,11 @@ export function useSidebarDrag(options: UseSidebarDragOptions): SidebarDragApi {
     [],
   );
 
-  const lineEdge = useCallback(
-    (scope: string, id: string): DropEdge | undefined => {
+  const lineAt = useCallback(
+    (scope: string, id: string) => {
       if (!plan || !("line" in plan.cue)) return undefined;
-      return plan.cue.line.rowKey === rowKey(scope, id)
-        ? plan.cue.line.edge
-        : undefined;
+      const { rowKey: key, edge, folderId } = plan.cue.line;
+      return key === rowKey(scope, id) ? { edge, inFolder: folderId !== undefined } : undefined;
     },
     [plan],
   );
@@ -480,7 +682,7 @@ export function useSidebarDrag(options: UseSidebarDragOptions): SidebarDragApi {
     plan,
     dragHandleProps,
     dropZoneProps,
-    lineEdge,
+    lineAt,
     ringLit,
   };
 }

@@ -2,28 +2,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
-"""Component-agnostic machinery shared by the ggml-family prebuilt installers.
-
-``install_llama_prebuilt.py`` and ``install_whisper_prebuilt.py`` both run on
-this module, which owns two layers:
-
-1. Primitives: HTTP fetches with retries and token-safe redirects, verified
-   downloads, safe archive extraction, the install lock, sha256 helpers, and
-   CUDA runtime-line / compute-capability selection. Moved verbatim out of
-   ``install_llama_prebuilt.py``, which re-exports them under their old names.
-
-2. The generic descriptor-driven install flow: release resolution (download
-   host fast path, GitHub API fallback), checksum-index parsing, coverage-aware
-   artifact selection, verified download + extraction + staged atomic
-   activation, marker/fingerprint handling, and the resolve probe. Whisper runs
-   entirely on this flow; a third component plugs in with a ``ComponentDescriptor``.
-
-Seam rule: every function calling a collaborator tests monkeypatch takes an
-``ops`` handle first. ``ops`` resolves names in the calling installer module's
-globals first (so a ``monkeypatch.setattr`` still wins) and falls back to this
-module's defaults, letting a descriptor-only component work with no installer
-module behind it.
-"""
+"""ggml installer core: verified downloads, safe extraction, install lock; monkeypatchable ops."""
 
 from __future__ import annotations
 
@@ -50,8 +29,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator
 
-# Bootstrap studio/ like install_llama_prebuilt.py: an importlib spec load prepares no
-# path, so the absolute branch cannot rely on the caller. auth_safe imports only urllib.
+# Bootstrap studio/ on sys.path: an importlib spec load prepares no path.
 if __package__:
     from .backend.utils.auth_safe import AuthSafeRedirectHandler
 else:
@@ -80,9 +58,7 @@ def filelock_classes() -> tuple[Any, Any]:
     return _FILELOCK_CLASSES
 
 
-# Fresh spawned interpreter, and this standalone module cannot import backend
-# modules, so the gate is pasted from native_tls.py's inline_gate_source().
-# test_native_tls_entrypoints.py asserts the paste still matches, by AST.
+# Gate pasted from native_tls.py inline_gate_source(); test_native_tls_entrypoints.py checks it.
 _TRUSTSTORE_VENDOR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "backend", "vendor")
 _flag = os.environ.get("UNSLOTH_STUDIO_NATIVE_TLS", "").strip().lower()
 _owned = os.environ.get("UNSLOTH_STUDIO_DESKTOP_OWNER_KIND", "") == "tauri"
@@ -126,33 +102,27 @@ USER_AGENT = "unsloth-studio-prebuilt"
 GITHUB_AUTH_HOSTS = {"api.github.com", "github.com"}
 HF_AUTH_HOSTS = {"huggingface.co", "www.huggingface.co"}
 RETRYABLE_HTTP_STATUS = {408, 429, 500, 502, 503, 504}
-# What an exceeded GitHub API rate limit (primary or secondary) answers with.
 GITHUB_RATE_LIMIT_STATUS = {403, 429}
 HTTP_FETCH_ATTEMPTS = 4
 HTTP_FETCH_BASE_DELAY_SECONDS = 0.75
 JSON_FETCH_ATTEMPTS = 3
 TTY_PROGRESS_START_DELAY_SECONDS = 0.5
 INSTALL_LOCK_TIMEOUT_SECONDS = 300
-# The metadata catch-up over a kept install is an optimisation, and it runs on the FIRST update
-# after an upgrade, for every existing user. Waiting the full install timeout for it would hold
-# an otherwise finished launch for five minutes to write fields whose only effect is to spare
-# the next run some work, so it asks briefly and gives up.
+# Settle is only an optimisation, so wait briefly rather than the full install timeout.
 SETTLE_LOCK_TIMEOUT_SECONDS = 5
 INSTALL_STAGING_ROOT_NAME = ".staging"
 SCHEMA_VERSION = 1
-# Backend to retry when the preferred one has no covering asset; None disables it.
 FALLBACK_BACKEND: str | None = "cpu"
 _RATE_LIMIT_WAIT_CAP_SECONDS = 60.0
 
-# Lowest CUDA major we ship prebuilts for, and highest we probe for installed
-# runtime libraries. Detection and runtime-line derivation are generated per
-# major, so a new toolkit (cuda14, ...) needs no code change while ggml keeps
-# the cudart64_<major>.dll / libcudart.so.<major> naming.
+# Lowest CUDA major shipped; higher majors are probed generically by naming convention.
 _MIN_CUDA_MAJOR = 12
 _MAX_PROBE_CUDA_MAJOR = 19
 
-# Blackwell floor is sm_100 (B100/B200 sm_100, B300/GB300 sm_103 below consumer
-# RTX 50 sm_120); the family needs toolkit >= 12.8, sm_103/sm_121 need 12.9.
+# 12.8+ nvcc -compress-mode=size: every kernel load fails on drivers older than 12.4 (#12842).
+_COMPRESSED_FATBIN_MIN_DRIVER = (12, 4)
+
+# Blackwell floor is sm_100 and the family needs toolkit >= 12.8; sm_103 and sm_121 need 12.9.
 _BLACKWELL_MIN_SM = 100
 _BLACKWELL_MIN_TOOLKIT = (12, 8)
 _BLACKWELL_SM_MIN_TOOLKIT = {103: (12, 9), 121: (12, 9)}
@@ -163,17 +133,14 @@ def log(message: str) -> None:
 
 
 def _cuda_runtime_lines_for_major(major: int) -> list[str]:
-    """Runtime lines a driver of this CUDA major can use (its own major and any
-    older one, newest first down to the minimum we ship)."""
+    """Runtime lines for a driver of this CUDA major: its own major and older, newest first."""
     return [f"cuda{m}" for m in range(major, _MIN_CUDA_MAJOR - 1, -1)]
 
 
 # ── The ops seam ──
 _MISSING = object()
 
-# Core functions expecting an ``ops`` first argument. ModuleOps binds itself when
-# a lookup falls back to the core default, so a descriptor-only component gets
-# working defaults while an installer wrapper (or a test monkeypatch) always wins.
+# Core functions taking ops first; installer wrappers and test monkeypatches win over defaults.
 _OPS_FIRST_NAMES = {
     "auth_headers",
     "github_api_headers",
@@ -226,7 +193,6 @@ _OPS_FIRST_NAMES = {
     "assemble_install_tree",
     "validate_staged_server",
     "locate_server_in_tree",
-    # Underscored aliases the installer modules expose for their tests.
     "_download_host_latest_release_tag",
     "_download_host_json",
     "_resolve_release_via_download_host",
@@ -273,14 +239,11 @@ class ComponentDescriptor:
     user_agent: str
     supported_backends: tuple[str, ...] = ("cpu", "cuda", "metal", "vulkan", "rocm")
     schema_version: int = SCHEMA_VERSION
-    # Backend to retry when the preferred one has no covering asset: "cpu"
-    # (whisper) ships a CPU bundle in every release; None (llama) reports "no
-    # prebuilt" so the caller falls back to a source build.
+    # None (llama) reports no prebuilt so the caller falls back to a source build.
     fallback_backend: str | None = "cpu"
     staging_root_name: str = INSTALL_STAGING_ROOT_NAME
     run_staged_validation: bool = False
-    # Hooks. Each mirrors the module-level function it replaces; None keeps the
-    # core default (which raises if truly required).
+    # Hooks; None keeps the core default.
     detect_host: Callable[[], Any] | None = None
     host_platform_tokens: Callable[[Any], tuple[str, str]] | None = None
     server_binary_name: Callable[[Any], str] | None = None
@@ -289,8 +252,7 @@ class ComponentDescriptor:
 
 
 def component_namespace(descriptor: ComponentDescriptor) -> dict[str, Any]:
-    """Materialize a descriptor into the module-like namespace ``ModuleOps``
-    resolves against; core defaults cover anything not listed here."""
+    """Namespace for ModuleOps to resolve against; core defaults cover unlisted names."""
     prefix = descriptor.log_prefix
 
     def component_log(message: str) -> None:
@@ -404,8 +366,7 @@ def auth_headers(ops: ModuleOps, url: str | None = None) -> dict[str, str]:
     if token and should_send_github_auth(url):
         headers["Authorization"] = f"Bearer {token}"
         return headers
-    # Anonymous huggingface.co fetches share a per-IP rate limit CI fleets
-    # exhaust (HTTP 429); authenticate when a token is available.
+    # Anonymous HF fetches share a per-IP rate limit (429).
     hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
     if hf_token and should_send_hf_auth(url):
         headers["Authorization"] = f"Bearer {hf_token}"
@@ -429,7 +390,6 @@ def is_github_api_url(url: str | None) -> bool:
 
 def is_retryable_url_error(exc: Exception) -> bool:
     if isinstance(exc, urllib.error.HTTPError):
-        # A GitHub API 403 is a rate limit; only retry when the reset is close enough to wait for.
         if exc.code == 403:
             return (
                 is_github_api_url(getattr(exc, "url", None))
@@ -442,20 +402,14 @@ def is_retryable_url_error(exc: Exception) -> bool:
         return True
     if isinstance(exc, socket.timeout):
         return True
-    # urllib wraps only a failure to send in URLError. A server that drops the connection
-    # before answering (RemoteDisconnected), a reset mid-body, or a body cut short
-    # (IncompleteRead) reaches here raw, and one of those would otherwise skip every retry.
+    # Raw ConnectionError/IncompleteRead bypass URLError and would skip retries.
     if isinstance(exc, (ConnectionError, http.client.IncompleteRead)):
         return True
     return False
 
 
 def _http_error_retry_delay(exc: Exception) -> float | None:
-    """Recommended wait from rate-limit headers on a 403/429.
-
-    None when no header is present or the wait exceeds
-    _RATE_LIMIT_WAIT_CAP_SECONDS (the source-build fallback is faster).
-    """
+    """Rate-limit wait on 403/429; None if absent or over the cap (source build is faster)."""
     if not isinstance(exc, urllib.error.HTTPError):
         return None
     headers = getattr(exc, "headers", None)
@@ -488,6 +442,25 @@ def sleep_backoff(
 
 
 # ── Atomic writes and hashing ──
+def make_staging_dir(parent: Path, prefix: str) -> Path:
+    """``tempfile.mkdtemp``, except a Windows dir inherits ``parent``'s ACL.
+
+    mkdtemp's 0o700 gives a Windows dir a protected SYSTEM / Administrators / OWNER RIGHTS DACL
+    (CPython gh-118486), and a tree renamed out of it keeps those entries. An elevated run owns it
+    as Administrators, so the same account cannot read it unelevated (#14052, #9928).
+    """
+    if sys.platform != "win32":
+        return Path(tempfile.mkdtemp(prefix = prefix, dir = str(parent)))
+    for _ in range(100):
+        path = Path(parent) / f"{prefix}{os.urandom(6).hex()}"
+        try:
+            os.mkdir(path)
+        except FileExistsError:
+            continue
+        return path
+    raise FileExistsError(f"no free staging name under {parent}")
+
+
 def atomic_write_bytes(destination: Path, data: bytes) -> None:
     destination.parent.mkdir(parents = True, exist_ok = True)
     with tempfile.NamedTemporaryFile(
@@ -508,14 +481,7 @@ def atomic_replace_from_tempfile(
     *,
     attempts: int = 8,
 ) -> None:
-    """os.replace, retried against transient Windows sharing violations.
-
-    Rename-over needs DELETE access on the destination, so a scanner or the indexer holding the
-    marker open fails the swap outright -- where the in-place write this replaced would only
-    have contended for write access. Handles clear in a second or two, so a bounded backoff
-    turns the failure into a pause; anything else raises at once rather than stalling on a real
-    problem. A no-op off Windows, where the rename does not care about open handles.
-    """
+    """Retries os.replace on Windows sharing violations (scanner holds file); others raise."""
     destination.parent.mkdir(parents = True, exist_ok = True)
     delay = 0.25
     for attempt in range(attempts):
@@ -559,11 +525,7 @@ def write_live_marker(marker_path: Path, marker: dict[str, Any]) -> None:
             os.fsync(handle.fileno())
         if original is not None:
             os.chmod(tmp_path, stat.S_IMODE(original.st_mode))
-            # Owner AND group when the caller can, group alone when it cannot. chown is
-            # all-or-nothing, so the combined call is refused outright for a non-root member of
-            # a shared group and os.replace then installs the member's own uid and gid, which is
-            # how the group was lost (e8d128d24); group-only alone leaves a root-refreshed marker
-            # owned by root, unreadable through an 0600 mode to the user who owns the install.
+            # chown owner+group is all-or-nothing, so fall back to group alone for non-root members.
             try:
                 os.chown(tmp_path, original.st_uid, original.st_gid)
             except (OSError, AttributeError):
@@ -741,6 +703,76 @@ class DownloadProgress:
         self.stream.flush()
 
 
+class TruncatedDownload(http.client.IncompleteRead):
+    """The server closed the body before Content-Length bytes arrived. http.client's read(amt)
+    returns b"" here instead of raising, so without this a short file is hashed as if whole."""
+
+    def __init__(self, received: int, expected: int) -> None:
+        super().__init__(b"", expected - received)
+        self.received = received
+        self.expected = expected
+
+    def __str__(self) -> str:
+        return f"connection closed after {self.received} of {self.expected} bytes"
+
+    __repr__ = __str__
+
+
+class StalledDownload(TimeoutError):
+    """The body is still arriving but too slowly to finish; the socket timeout never fires on a
+    trickle, so one stalled connection could otherwise hold an install for an hour."""
+
+
+# Bytes that must arrive per window, else the attempt is abandoned and retried on a new connection.
+DOWNLOAD_STALL_WINDOW_SECONDS = 60.0
+DOWNLOAD_STALL_MIN_BYTES = 256 * 1024
+
+
+def copy_response_body(
+    response: Any,
+    write: Callable[[bytes], Any],
+    *,
+    total_bytes: int | None,
+    progress: "DownloadProgress | None" = None,
+    chunk_size: int = 1024 * 1024,
+) -> int:
+    """Byte count; retryable stall/truncation errors; read1 on HTTPResponse, as read(n) blocks."""
+    per_receive = isinstance(response, http.client.HTTPResponse)
+    read = response.read1 if per_receive else response.read
+    downloaded = 0
+    next_report = chunk_size
+    window_start = time.monotonic()
+    window_bytes = 0
+    while True:
+        chunk = read(next_report - downloaded if per_receive else chunk_size)
+        if not chunk:
+            break
+        write(chunk)
+        downloaded += len(chunk)
+        window_bytes += len(chunk)
+        if downloaded >= next_report or not per_receive:
+            if progress is not None:
+                progress.update(downloaded)
+            while next_report <= downloaded:
+                next_report += chunk_size
+        now = time.monotonic()
+        if now - window_start >= DOWNLOAD_STALL_WINDOW_SECONDS:
+            if window_bytes < DOWNLOAD_STALL_MIN_BYTES and (
+                total_bytes is None or downloaded < total_bytes
+            ):
+                raise StalledDownload(
+                    f"download stalled: {window_bytes} bytes in the last "
+                    f"{now - window_start:.0f}s ({downloaded} received so far)"
+                )
+            window_start = now
+            window_bytes = 0
+    if progress is not None:
+        progress.finish(downloaded)
+    if total_bytes is not None and downloaded < total_bytes:
+        raise TruncatedDownload(downloaded, total_bytes)
+    return downloaded
+
+
 def download_label_from_url(url: str) -> str:
     name = Path(urllib.parse.urlparse(url).path).name
     return name or url
@@ -769,15 +801,9 @@ def download_bytes(
                     total_bytes = int(content_length)
                 progress = DownloadProgress(progress_label, total_bytes) if progress_label else None
                 data = bytearray()
-                while True:
-                    chunk = response.read(1024 * 1024)
-                    if not chunk:
-                        break
-                    data.extend(chunk)
-                    if progress is not None:
-                        progress.update(len(data))
-                if progress is not None:
-                    progress.finish(len(data))
+                copy_response_body(
+                    response, data.extend, total_bytes = total_bytes, progress = progress
+                )
                 return bytes(data)
         except Exception as exc:
             last_exc = exc
@@ -802,10 +828,7 @@ def fetch_json(ops: ModuleOps, url: str) -> Any:
                 else ops.auth_headers(url),
             )
         except urllib.error.HTTPError as exc:
-            # Both codes: GitHub answers an exceeded primary or secondary rate
-            # limit with 403 or 429 (docs.github.com/rest/using-the-rest-api/
-            # rate-limits-for-the-rest-api), and a bare "HTTP Error 429: Too Many
-            # Requests" carries none of the token guidance.
+            # GitHub signals rate limits with 403 or 429.
             if exc.code in GITHUB_RATE_LIMIT_STATUS and is_github_api_url(url):
                 hint = ""
                 if not (os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")):
@@ -854,15 +877,9 @@ def download_file(ops: ModuleOps, url: str, destination: Path) -> None:
                     if content_length and content_length.isdigit():
                         total_bytes = int(content_length)
                     progress = DownloadProgress(f"Downloading {destination.name}", total_bytes)
-                    downloaded_bytes = 0
-                    while True:
-                        chunk = response.read(1024 * 1024)
-                        if not chunk:
-                            break
-                        handle.write(chunk)
-                        downloaded_bytes += len(chunk)
-                        progress.update(downloaded_bytes)
-                    progress.finish(downloaded_bytes)
+                    copy_response_body(
+                        response, handle.write, total_bytes = total_bytes, progress = progress
+                    )
                 handle.flush()
                 os.fsync(handle.fileno())
             if not tmp_path.exists() or tmp_path.stat().st_size == 0:
@@ -915,8 +932,7 @@ def download_file_verified(
 def download_file_verified_strict(
     ops: ModuleOps, url: str, destination: Path, *, expected_sha256: str, label: str
 ) -> None:
-    """Verified download with a required digest (the generic flow fails closed on
-    a missing checksum, so None never reaches here)."""
+    """Verified download; generic flow fails closed on missing checksum, so None never arrives."""
     for attempt in range(1, 3):
         ops.download_file(url, destination)
         actual = ops.sha256_file(destination)
@@ -946,13 +962,8 @@ def release_asset_map(release: dict[str, Any]) -> dict[str, str]:
 
 
 def release_asset_digests(release: dict[str, Any]) -> dict[str, str]:
-    """asset name -> bare sha256 hex, for the assets whose digest GitHub reports.
-
-    Separate from release_asset_map because the name -> url mapping is what nearly every
-    caller wants and widening its return type would touch all of them. GitHub returns
-    `digest` as an algorithm-prefixed string ("sha256:<hex>"); anything else is skipped
-    rather than guessed at, so a future algorithm cannot be read as a sha256.
-    """
+    """Maps asset name to bare sha256 hex from GitHub's digest field, accepting only sha256:
+    prefixed digests; kept separate from release_asset_map to leave its return type alone."""
     assets = release.get("assets")
     if not isinstance(assets, list):
         return {}
@@ -961,7 +972,7 @@ def release_asset_digests(release: dict[str, Any]) -> dict[str, str]:
         if not isinstance(asset, dict) or not isinstance(asset.get("name"), str):
             continue
         raw = asset.get("digest")
-        # The prefix is required, not stripped for convenience: normalize_sha256_digest accepts a bare 64-hex string, and an unprefixed digest is one whose algorithm GitHub did not state.
+        # Require the prefix: an unprefixed digest has no stated algorithm.
         if not isinstance(raw, str) or not raw.lower().startswith("sha256:"):
             continue
         digest = normalize_sha256_digest(raw)
@@ -1004,11 +1015,27 @@ def release_asset_download_url(repo: str, release_tag: str, asset_name: str) -> 
     )
 
 
+# Currency check + resolve ask seconds apart; short TTL so a failure, later run or long-lived importer re-asks.
+_DOWNLOAD_HOST_LATEST_TAG_TTL_S = 300.0
+_DOWNLOAD_HOST_LATEST_TAG_MEMO: dict[tuple[str, Any], tuple[str, float]] = {}
+
+
 def download_host_latest_release_tag(ops: ModuleOps, repo: str) -> str | None:
     """Latest release tag from github.com/<repo>/releases/latest via its redirect
     target (no api.github.com call). None on 404 so the caller falls back to the
     API. /releases/latest resolves by created_at/make_latest, which can lag the
     published_at newest the freshness check uses -- acceptable for install."""
+    key = (repo, ops._URL_OPENER)
+    cached = _DOWNLOAD_HOST_LATEST_TAG_MEMO.get(key)
+    if cached is not None and time.monotonic() - cached[1] < _DOWNLOAD_HOST_LATEST_TAG_TTL_S:
+        return cached[0]
+    tag = _download_host_latest_release_tag_uncached(ops, repo)
+    if tag:
+        _DOWNLOAD_HOST_LATEST_TAG_MEMO[key] = (tag, time.monotonic())
+    return tag
+
+
+def _download_host_latest_release_tag_uncached(ops: ModuleOps, repo: str) -> str | None:
     url = f"https://github.com/{urllib.parse.quote(repo, safe = '/')}/releases/latest"
     request = urllib.request.Request(
         url,
@@ -1031,7 +1058,6 @@ def download_host_latest_release_tag(ops: ModuleOps, repo: str) -> str | None:
 
 
 def fetch_download_host_json(ops: ModuleOps, url: str) -> Any:
-    # Public CDN asset: plain unauthenticated GET, not the rate-limited API.
     data = ops.download_bytes(
         url,
         timeout = 30,
@@ -1081,11 +1107,8 @@ def web_release_tags(
     *,
     limit: int = 30,
 ) -> list[str]:
-    """Recent release tags, newest first, from github.com/<repo>/releases.atom.
-
-    The only tokenless surface that ORDERS releases, so it is what restores the
-    older-release walk-back, and the only one that can name the newest nightly.
-    """
+    """Recent release tags, newest first, from releases.atom: the only tokenless source that orders
+    releases, so it can name the newest nightly and restore the older-release walk-back."""
     url = f"https://github.com/{urllib.parse.quote(repo, safe = '/')}/releases.atom"
     body = _fetch_web_metadata(ops, url)
     tags: list[str] = []
@@ -1102,12 +1125,8 @@ _PRERELEASE_LABEL_RE = re.compile(r"Label--warning[^>]*>\s*Pre-release\s*<", re.
 
 
 def web_release_prerelease(ops: ModuleOps, repo: str, tag: str) -> bool:
-    """Whether <repo>@<tag> is marked pre-release, read from its release page.
-
-    The feed and the asset fragment both omit it, and asserting a value we did not read
-    would let the web path select a release the REST path filters out. Draft is not
-    asked: a draft is not served anonymously, so reaching this page proves publication.
-    """
+    """Reads the pre-release flag from the release page so the web path never picks a release the
+    REST path filters out; drafts go unchecked since the page proves publication."""
     url = (
         f"https://github.com/{urllib.parse.quote(repo, safe = '/')}/releases/tag/"
         f"{urllib.parse.quote(tag, safe = '')}"
@@ -1118,12 +1137,7 @@ def web_release_prerelease(ops: ModuleOps, repo: str, tag: str) -> bool:
 def _web_release_prerelease_or_default(
     ops: ModuleOps, repo: str, tag: str, default: bool | None
 ) -> bool:
-    """The release's prerelease flag, or *default* when the page cannot be read.
-
-    The assets and their digests have already loaded by this point, so discarding them
-    because one more request failed would drop a usable release for a fact the caller
-    may already know from the tag.
-    """
+    """Returns default when the page is unreadable; a failed request must not drop a release."""
     try:
         return web_release_prerelease(ops, repo, tag)
     except Exception as exc:  # noqa: BLE001 - a known answer beats losing the release
@@ -1159,8 +1173,7 @@ def web_release_payload(
         for row in _DOWNLOAD_HREF_RE.finditer(body)
         if urllib.parse.unquote(row.group("tag")).strip() == tag
     }
-    # The copy-to-clipboard control names its asset in the same element; pairing two
-    # lists by position would misassign a hash the first time a row moves or is omitted.
+    # Pair by element, not list position, so a moved row cannot misassign a hash.
     digests: dict[str, str] = {}
     conflicting: set[str] = set()
     for control in _CLIPBOARD_TAG_RE.finditer(body):
@@ -1210,18 +1223,8 @@ def extract_archive(archive_path: Path, destination: Path) -> None:
     def _try_repair_missing_slash(
         member_name: str, link_name: str, archive_names: set[str]
     ) -> str | None:
-        """Repair a mangled symlink from some upstream llama.cpp Mac releases
-        (e.g. b9165, b9169) whose linkname drops the separator AND the file
-        basename's leading char between the top-level dir and the rest:
-
-            llama-b9165/libggml-rpc.0.dylib -> llama-b9165ibggml-rpc.0.11.1.dylib
-
-        Detect the pattern (linkname starts with the top-level dir but no
-        following slash), then find the archive entry under that dir whose
-        basename ends with the mangled suffix; only accept a unique match.
-        Returns the corrected linkname relative to the member's parent dir --
-        callers join it with `target.parent`, so a full `top/file` path would
-        double the prefix into `top/top/file`."""
+        """Repairs Mac llama.cpp symlinks (e.g. b9165) that lost the separator and leading char;
+        unique match, relative to member's parent (callers join onto target.parent)."""
         if "/" not in member_name or "/" in link_name:
             return None
         top, _, _ = member_name.partition("/")
@@ -1240,8 +1243,7 @@ def extract_archive(archive_path: Path, destination: Path) -> None:
         ]
         if len(candidates) != 1:
             return None
-        # Strip the top-level dir so the caller's `target.parent / Path(...)`
-        # resolves inside the staging dir, not a duplicate `top/top/...` path.
+        # Strip the top-level dir to avoid a duplicate top/top path.
         return candidates[0][len(prefix) :]
 
     def safe_link_target(
@@ -1270,8 +1272,7 @@ def extract_archive(archive_path: Path, destination: Path) -> None:
         return normalized, resolved
 
     def extract_zip_safely(source: Path, base: Path) -> None:
-        # Local: only an install that unpacks an archive needs these, and every CLI
-        # command imports this module.
+        # Local import: every CLI command imports this module.
         import zipfile
         with zipfile.ZipFile(source) as archive:
             for member in archive.infolist():
@@ -1358,8 +1359,7 @@ def extract_archive(archive_path: Path, destination: Path) -> None:
 
 
 def restore_tar_exec_bits(archive_path: Path, destination: Path) -> None:
-    """Re-apply tar exec bits after the guarded extraction writes plain files;
-    server binaries must stay executable on Unix."""
+    """Restores exec bits lost in guarded extraction; servers must stay executable on Unix."""
     if os.name == "nt" or not archive_path.name.endswith(".tar.gz"):
         return
     import tarfile
@@ -1368,7 +1368,6 @@ def restore_tar_exec_bits(archive_path: Path, destination: Path) -> None:
         for member in archive.getmembers():
             if not (member.isfile() and member.mode & 0o111):
                 continue
-            # Paths were already traversal-validated by the extractor above.
             target = destination / Path(member.name.replace("\\", "/"))
             if target.is_file():
                 os.chmod(target, target.stat().st_mode | 0o111)
@@ -1382,8 +1381,7 @@ def install_lock(lock_path: Path, *, timeout: float | None = None) -> Iterator[N
 
     file_lock, file_lock_timeout = filelock_classes()
     if file_lock is None:
-        # Fallback lock: exclusive file creation, writing our PID so stale locks
-        # from crashed processes can be detected.
+        # Fallback lock: exclusive create with our PID for stale-lock detection.
         fd: int | None = None
         deadline = time.monotonic() + seconds
         while True:
@@ -1401,14 +1399,11 @@ def install_lock(lock_path: Path, *, timeout: float | None = None) -> Iterator[N
             except FileExistsError:
                 stale = False
                 try:
-                    # errors="replace" so an undecodable lock reaches the int()
-                    # below and is treated as a corrupt PID, not retried forever.
+                    # errors=replace so a garbled lock is treated as corrupt, not retried forever.
                     raw = lock_path.read_text(encoding = "utf-8", errors = "replace").strip()
                 except FileNotFoundError:
-                    # Lock vanished between our open and read -- retry
                     continue
                 if not raw:
-                    # Exists but PID not yet written; wait for the write to land.
                     if time.monotonic() >= deadline:
                         raise BusyInstallConflict(
                             f"timed out after {seconds}s waiting for concurrent install lock: {lock_path}"
@@ -1455,10 +1450,7 @@ def install_lock_path(install_dir: Path) -> Path:
 
 # ── macOS version parsing ──
 def parse_macos_version(value: str | None) -> tuple[int, int] | None:
-    """Parse a macOS product version into (major, minor).
-
-    Handles "14.7.1", "15.5", "26.0", bare "26". None when empty/unparseable
-    (callers then defer to runtime validation rather than reject every prebuilt)."""
+    """(major, minor) of macOS version; None if unparseable, deferring to runtime validation."""
     if not value:
         return None
     match = re.match(r"\s*(\d+)(?:\.(\d+))?", str(value))
@@ -1622,8 +1614,7 @@ def linux_runtime_dirs_for_required_libraries(
 
 
 def detected_linux_runtime_lines(ops: ModuleOps) -> tuple[list[str], dict[str, list[str]]]:
-    """`cuda<major>` lines with a matching libcudart/libcublas file on disk (glob
-    match, so a versioned-only file counts), plus the dirs that matched."""
+    """cuda<major> lines and dirs holding libcudart/libcublas; globs match versioned names."""
     line_requirements = {
         f"cuda{m}": [f"libcudart.so.{m}", f"libcublas.so.{m}"]
         for m in range(_MAX_PROBE_CUDA_MAJOR, _MIN_CUDA_MAJOR - 1, -1)
@@ -1653,8 +1644,7 @@ def detected_linux_runtime_lines(ops: ModuleOps) -> tuple[list[str], dict[str, l
 
 
 def windows_runtime_line_info() -> dict[str, tuple[str, ...]]:
-    # Generated per CUDA major (newest first) so a new toolkit is detected without
-    # a code change while the cudart64_<major>.dll naming holds.
+    # Generated per CUDA major, newest first, so a new toolkit needs no code change.
     return {
         f"cuda{m}": (
             f"cudart64_{m}*.dll",
@@ -1677,11 +1667,27 @@ def detected_windows_runtime_lines(ops: ModuleOps) -> tuple[list[str], dict[str,
     return detected, runtime_dirs
 
 
+def driver_below_cuda_prebuilt_floor(host: Any) -> bool:
+    """A reported driver too old for any CUDA prebuilt (see _COMPRESSED_FATBIN_MIN_DRIVER)."""
+    driver = host.driver_cuda_version
+    return bool(driver) and tuple(driver[:2]) < _COMPRESSED_FATBIN_MIN_DRIVER
+
+
+def cuda_driver_floor_message(host: Any) -> str:
+    major, minor = host.driver_cuda_version[:2]
+    return (
+        f"NVIDIA driver reports CUDA {major}.{minor}, older than the CUDA "
+        f"{_COMPRESSED_FATBIN_MIN_DRIVER[0]}.{_COMPRESSED_FATBIN_MIN_DRIVER[1]} the CUDA "
+        "llama.cpp prebuilts need (their kernels fail with 'device kernel image is invalid'); "
+        "skipping them. Update the NVIDIA driver to R550 or newer (CUDA 12.4+) to use them."
+    )
+
+
 def compatible_linux_runtime_lines(host: Any) -> list[str]:
     if not host.driver_cuda_version:
         return []
     major, _minor = host.driver_cuda_version
-    if major < _MIN_CUDA_MAJOR:
+    if major < _MIN_CUDA_MAJOR or driver_below_cuda_prebuilt_floor(host):
         return []
     return _cuda_runtime_lines_for_major(major)
 
@@ -1773,8 +1779,7 @@ def detect_torch_cuda_runtime_preference(
 
 
 def artifact_covers_sms(artifact: Any, host_sms: Iterable[str]) -> bool:
-    """True when every host SM is in the artifact's supported_sms and within its
-    [min_sm, max_sm] range."""
+    """True when every host SM is in supported_sms and within [min_sm, max_sm]."""
     if not artifact.supported_sms or artifact.min_sm is None or artifact.max_sm is None:
         return False
     supported = {str(value) for value in artifact.supported_sms}
@@ -1782,22 +1787,18 @@ def artifact_covers_sms(artifact: Any, host_sms: Iterable[str]) -> bool:
 
 
 def sm_range(artifact: Any) -> int:
-    """SM-coverage span as a sort key (tighter range wins). A bundle with no SM
-    metadata gets a max range so it sorts last, never outranking a targeted bundle."""
+    """SM span sort key (tighter wins); bundles lacking SM metadata get 9999 to sort last."""
     if artifact.min_sm is not None and artifact.max_sm is not None:
         return artifact.max_sm - artifact.min_sm
     return 9999
 
 
 def blackwell_capable_linux_runtime_lines(host_sms: list[str], artifacts: list[Any]) -> list[str]:
-    """CUDA runtime lines (highest major first) shipping a bundle covering every
-    visible host SM. Lets a Blackwell host prefer a native sm_120 line over torch's
-    reported line, mirroring the Windows Blackwell preference."""
+    """Highest-major CUDA lines covering all host SMs; lets Blackwell prefer native sm_120."""
     lines: set[str] = set()
     for artifact in artifacts:
         line = artifact.runtime_line
-        # Only rank "cuda<major>" lines; skip malformed/future-format values
-        # (e.g. "cuda13.1") rather than crash the major sort.
+        # Skip malformed lines like cuda13.1 rather than crash the sort.
         if not (line and line.startswith("cuda") and line[len("cuda") :].isdigit()):
             continue
         if not artifact.supported_sms or artifact.min_sm is None or artifact.max_sm is None:
@@ -1825,12 +1826,9 @@ def blackwell_min_toolkit_for_host(host: Any) -> tuple[int, int]:
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# Generic descriptor-driven install flow (whisper dialect: one release carries
-# a manifest of os/arch/backend artifacts plus a same-origin checksum index).
 # ════════════════════════════════════════════════════════════════════════════
 def host_platform_tokens(host: Any) -> tuple[str, str]:
-    """Default (os, arch) asset tokens; components with their own HostInfo field
-    names override this hook."""
+    """Default (os, arch) asset tokens; components with their own HostInfo field names override it."""
     return host.os_token, host.arch_token
 
 
@@ -1902,8 +1900,7 @@ def macos_min_os_ok(ops: ModuleOps, host: Any, min_os: Any) -> bool:
 def artifacts_for_host(
     ops: ModuleOps, manifest: dict[str, Any], host: Any, backend: str
 ) -> list[dict[str, Any]]:
-    """Manifest artifacts matching this host os/arch/backend. On macOS, drop any
-    whose `min_os` exceeds the host version."""
+    """Host-matching artifacts; on macOS, drops any whose `min_os` exceeds the host version."""
     os_token, arch_token = ops.host_platform_tokens(host)
     return [
         artifact
@@ -1965,8 +1962,7 @@ def artifact_coverage(artifact: dict[str, Any]) -> dict[str, Any]:
 
 # ── Backend resolution ──
 def auto_detect_backend(ops: ModuleOps, host: Any) -> str:
-    """Host-preferred backend: Apple Silicon -> metal, usable NVIDIA -> cuda,
-    AMD gfx -> rocm, otherwise cpu."""
+    """Host-preferred: metal (Apple Silicon), cuda (usable NVIDIA), rocm (AMD gfx), else cpu."""
     if host.is_apple_silicon:
         return "metal"
     if host.has_usable_nvidia:
@@ -2005,11 +2001,8 @@ def valid_sha256(value: Any) -> str | None:
 def parse_release_checksums(
     ops: ModuleOps, repo: str, release_tag: str, payload: Any
 ) -> dict[str, str]:
-    """Asset name -> sha256 from a release's checksum-index asset.
-
-    That index is the authority for each asset's sha256. It is validated for
-    schema/component and that its ``release_tag`` matches the resolved release,
-    so a redirected or mismatched index is rejected; malformed fails closed."""
+    """Maps asset name to sha256 from the checksum-index asset, the authority for each digest; the
+    index must match schema, component and release_tag, and malformed input fails closed."""
     label = f"{ops.SHA256_ASSET_NAME} in {repo}@{release_tag}"
     if not isinstance(payload, dict):
         raise PrebuiltFallback(f"{label} was not a JSON object")
@@ -2040,8 +2033,7 @@ def parse_release_checksums(
 
 
 def fetch_release_checksums(ops: ModuleOps, bundle: "ReleaseBundle") -> dict[str, str]:
-    """Download + parse the release's checksum-index asset; fails closed if the
-    release does not publish it."""
+    """Fetches the checksum-index asset; fails closed if the release does not publish it."""
     sha_asset = ops.SHA256_ASSET_NAME
     url = bundle.asset_urls.get(sha_asset)
     if not url:
@@ -2070,9 +2062,7 @@ def expected_sha256_for(
     *,
     manifest_sha256: str | None = None,
 ) -> str:
-    """The sha256 the archive must match, from the release checksum-index entry.
-    An asset absent from the index fails closed. Any sha256 the manifest embeds
-    for the asset must agree with the index (a mismatch means a tampered manifest)."""
+    """Index sha256 of the asset; unlisted assets fail closed, manifest mismatch is tampering."""
     digest = checksums.get(asset_name)
     if digest is None:
         raise ReleaseIntegrityError(
@@ -2147,8 +2137,7 @@ def asset_download_url(ops: ModuleOps, bundle: ReleaseBundle, asset_name: str) -
     url = bundle.asset_urls.get(asset_name)
     if url:
         return url
-    # A manifest can list an asset the release JSON omitted; fall back to the
-    # deterministic release-download URL.
+    # A manifest can list an asset the release JSON omitted.
     return ops.release_asset_download_url(bundle.repo, bundle.release_tag, asset_name)
 
 
@@ -2239,8 +2228,6 @@ def resolve_release_via_download_host(
         )
     except PrebuiltFallback:
         return None
-    # Tag-pinned CDN URLs for every asset the install may fetch (asset_download_url
-    # reconstructs any missing one), keeping this a pure download-host path.
     names = {
         str(a.get("asset"))
         for a in manifest.get("artifacts", [])
@@ -2314,20 +2301,17 @@ class InstallSelection:
     runtime_line: str | None
     coverage: dict[str, Any]
     studio_protocol: str | None
-    # Slim pairing identity (whisper slim bundles ride the llama ggml runtime);
-    # all None for fat installs, never part of the fingerprint.
+    # Slim pairing identity; None for fat installs, never fingerprinted.
     install_kind: str | None = None
     paired_llama_tag: str | None = None
     linked_from: str | None = None
-    # Filenames the slim wiring hardlinked beside the server; the sidecar launch
-    # guard verifies exactly these instead of hardcoded per-OS names.
+    # Verified by the sidecar launch guard instead of hardcoded names.
     linked_libraries: tuple[str, ...] | None = None
     runtime_wiring_version: int | None = None
     linked_runtime_directories: tuple[str, ...] | None = None
-    # None when release_tag is the newest. Describes the choice, not the bundle: never fingerprinted.
+    # Never fingerprinted.
     walk_back: "WalkBack | None" = None
-    # The manifest's os/arch, so a keep decision need not infer it from an asset name a custom
-    # repository may spell freely. Outside the fingerprint.
+    # Recorded so keep decisions need not parse asset names. Outside the fingerprint.
     platform_os: str | None = None
     platform_arch: str | None = None
 
@@ -2382,9 +2366,7 @@ def macos_version_label(host: Any) -> str | None:
 
 
 def walk_back_for(host: Any, skipped_release_tag: str | None) -> WalkBack | None:
-    """The walk-back to record when the planner settled below *skipped_release_tag*
-    on this host; None when there is nothing to record (no skipped release, not
-    macOS, or a host version the marker-only re-check could not compare)."""
+    """Walk-back for a skipped release on macOS; None without a skip or a comparable version."""
     if not skipped_release_tag:
         return None
     label = macos_version_label(host)
@@ -2394,8 +2376,7 @@ def walk_back_for(host: Any, skipped_release_tag: str | None) -> WalkBack | None
 
 
 def marker_walk_back(marker: dict[str, Any]) -> WalkBack | None:
-    """The walk-back a marker records, or None when it records none or only half of
-    one (a marker written before the host version was kept beside the tag)."""
+    """Walk-back a marker records; None unless both the tag and the macOS version are present."""
     release_tag = marker.get("walked_back_from")
     macos_version = marker.get("walked_back_on_macos")
     if not (isinstance(release_tag, str) and release_tag):
@@ -2406,9 +2387,7 @@ def marker_walk_back(marker: dict[str, Any]) -> WalkBack | None:
 
 
 def walk_back_stands(marker: dict[str, Any], host: Any, expected_release: str | None) -> bool:
-    """Whether the marker's walk-back still explains why *expected_release*, the newest
-    published release, is not the installed one: same skipped release, same host
-    macOS version."""
+    """Walk-back still explains expected_release not being installed; same skip and macOS."""
     recorded = marker_walk_back(marker)
     if recorded is None or not expected_release:
         return False
@@ -2419,9 +2398,7 @@ def walk_back_stands(marker: dict[str, Any], host: Any, expected_release: str | 
 
 
 def walk_back_patch(marker: dict[str, Any], walk_back: WalkBack | None) -> dict[str, Any]:
-    """The marker keys a reused install must take from this run's walk-back: both
-    fields when the plan walked back and the marker says otherwise, None for each
-    one present when the plan no longer walks back."""
+    """Walk-back marker fields to patch; keys still set are None when there is no walk-back."""
     if walk_back is None:
         return {key: None for key in WALK_BACK_KEYS if marker.get(key) is not None}
     return {
@@ -2479,8 +2456,7 @@ def write_prebuilt_metadata(ops: ModuleOps, install_dir: Path, selection: Instal
         "min_os": coverage.get("min_os"),
         "studio_protocol": selection.studio_protocol,
         "install_fingerprint": selection.fingerprint(),
-        # The one fingerprint input the top-level fields do not carry whole, so a later run can
-        # recompute and tell a whole marker from an edited one.
+        # Lets a later run tell a whole marker from an edited one.
         "fingerprint_coverage": coverage,
         "installed_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
@@ -2490,18 +2466,15 @@ def write_prebuilt_metadata(ops: ModuleOps, install_dir: Path, selection: Instal
         payload["os"] = selection.platform_os
         payload["arch"] = selection.platform_arch
     if selection.install_kind == "slim":
-        # Additive slim fields; fat markers keep the legacy payload exactly.
+        # Fat markers keep the legacy payload exactly.
         payload["install_kind"] = "slim"
         payload["paired_llama_tag"] = selection.paired_llama_tag
         payload["linked_from"] = selection.linked_from
-        # The ggml tree these hardlinks point into: the tag alone cannot say whether a later llama
-        # build still backs this bundle. Absent reads as "cannot say": full path.
         paired_tree = getattr(ops, "installed_paired_runtime_tree", None)
         paired_tree = paired_tree() if callable(paired_tree) else None
         if isinstance(paired_tree, str) and paired_tree:
             payload["paired_llama_ggml_tree"] = paired_tree
-        # ...and WHICH install of that tree, since one release publishes a bundle per gfx target:
-        # the tree id survives a reselection that replaces every byte behind these hardlinks.
+        # One release ships a bundle per gfx target, so the tree id alone is not enough.
         paired_id = getattr(ops, "installed_paired_runtime_id", None)
         paired_id = paired_id() if callable(paired_id) else None
         if isinstance(paired_id, str) and paired_id:
@@ -2512,8 +2485,7 @@ def write_prebuilt_metadata(ops: ModuleOps, install_dir: Path, selection: Instal
             payload["runtime_wiring_version"] = selection.runtime_wiring_version
         if selection.linked_runtime_directories is not None:
             payload["linked_runtime_directories"] = list(selection.linked_runtime_directories)
-    # Optional per component: size + sha256 of the payload a reuse would otherwise have to RUN to
-    # trust. Written last so it covers the wiring above. Absent means full path once.
+    # Written last so it covers the wiring above.
     records = getattr(ops, "runtime_file_records", None)
     records = records(install_dir, selection) if callable(records) else None
     if records:
@@ -2571,7 +2543,6 @@ def _kept_marker_patch(
     if not isinstance(metadata.get("fingerprint_coverage"), dict):
         patch["fingerprint_coverage"] = selection.coverage
     patch.update(walk_back_patch(metadata, selection.walk_back))
-    # Added only: a platform already recorded was written by the run that selected it.
     if (
         selection.platform_os
         and selection.platform_arch
@@ -2602,8 +2573,7 @@ def _backfill_fingerprint_inputs(
     if not patch:
         return
     metadata = ops.load_prebuilt_metadata(install_dir)
-    # A second read: another installer swapping the tree in between leaves None, and falling out is
-    # right, since the run that replaced the tree wrote its own marker.
+    # Another installer may have swapped the tree; it wrote its own marker.
     if not metadata:
         return
     if metadata.get("install_fingerprint") != selection.fingerprint():
@@ -2613,7 +2583,7 @@ def _backfill_fingerprint_inputs(
             metadata.pop(key, None)
         else:
             metadata[key] = value
-    # Over a LIVE marker: temp-and-replace, so a failed write leaves the valid one in place.
+    # Temp-and-replace so a failed write leaves the live marker valid.
     write_live_marker(ops.metadata_path(install_dir), metadata)
 
 
@@ -2657,12 +2627,7 @@ def locate_server_in_tree(ops: ModuleOps, root: Path, host: Any) -> Path:
 
 
 def assemble_install_tree(ops: ModuleOps, bundle_root: Path, staged_root: Path, host: Any) -> Path:
-    """Lay out staged_root as a full install: <runtime bin dir>/<server + libs>.
-
-    Everything beside the server in the archive (shared libs, backend kernel
-    subdirs, license/build-info) is co-located into the canonical bin dir so the
-    server's RUNPATH=$ORIGIN resolves its libs.
-    """
+    """Co-locates the bundle in the runtime bin dir so RUNPATH=$ORIGIN resolves its libs."""
     bin_dir = ops.runtime_bin_dir(staged_root, host)
     bin_dir.mkdir(parents = True, exist_ok = True)
     for entry in sorted(bundle_root.iterdir()):
@@ -2766,7 +2731,7 @@ def install_from_bundle(
 ) -> None:
     staging_root = install_dir.parent / ops.INSTALL_STAGING_ROOT_NAME
     staging_root.mkdir(parents = True, exist_ok = True)
-    staging = Path(tempfile.mkdtemp(prefix = f"{install_dir.name}.staging-", dir = staging_root))
+    staging = make_staging_dir(staging_root, f"{install_dir.name}.staging-")
     try:
         archive_path = staging / selection.asset
         url = ops.asset_download_url(bundle, selection.asset)
@@ -2782,10 +2747,7 @@ def install_from_bundle(
 
         staged_root = staging / "staged"
         ops.assemble_install_tree(bundle_root, staged_root, host)
-        # Component hook (default no-op): slim whisper wires the llama ggml
-        # runtime here so staged validation sees the final linked tree; a returned
-        # selection (with the wired filenames) supersedes the input so the marker
-        # records what was actually linked.
+        # Wire the slim runtime before staged validation; the returned selection supersedes the input.
         updated = ops.prepare_runtime_payload(staged_root, host, selection)
         if updated is not None:
             selection = updated
@@ -2809,8 +2771,7 @@ def plan_selection(
     backend: str,
     checksums: dict[str, str],
 ) -> InstallSelection:
-    """Choose an artifact (with the component's fallback policy) and resolve its
-    trusted sha256 from the release checksum index."""
+    """Picks an artifact via the fallback policy; its sha256 comes from the checksum index."""
     artifact, effective_backend, _used_fallback = ops.select_artifact_with_fallback(
         bundle.manifest, host, backend
     )
@@ -2891,7 +2852,6 @@ def install_selected_prebuilt(
     if not force and ops.existing_install_matches(install_dir, host, selection):
         if _settle_kept_install(ops, install_dir, host, selection, locked = False):
             return 0
-        # Changed under the lock: the locked path re-checks rather than reporting a replaced release.
 
     with ops.install_lock(ops.install_lock_path(install_dir)):
         # Re-check under the lock: a concurrent run may have just finished.
@@ -2912,20 +2872,8 @@ def install_selected_prebuilt(
 def _settle_kept_install(
     ops: ModuleOps, install_dir: Path, host: Any, selection: InstallSelection, *, locked: bool
 ) -> bool:
-    """Let a component catch up the marker of an install it is keeping, under the lock.
-
-    Returns False only when the pre-lock keep's re-check under the lock found another
-    install on disk; everything else, a settle that fails included, keeps the install.
-
-    Optional: a component that has nothing to write defines neither hook. One that
-    does (whisper's slim pairing backfill) rewrites the marker, and a rewrite outside
-    the install lock races a concurrent installer swapping in a new release: the old
-    marker is read, the tree is replaced, the old fields are written over the new
-    marker. So the pre-lock keep takes the lock for the write, re-checks that the
-    install it read is still the one on disk, and only then settles it. Never raises:
-    the install is already valid, and a lock that cannot be had or a write that fails
-    costs the next run the same settle, not the install.
-    """
+    """Catches up a kept install's marker under the lock, since an unlocked rewrite can race a swap;
+    optional per component; False only if re-check finds another install; never raises."""
     settle = getattr(ops, "settle_kept_install", None)
     needs_settling = getattr(ops, "kept_install_needs_settling", None)
     try:
@@ -2988,8 +2936,7 @@ def resolve_prebuilt(
         "arch": arch_token,
         "runtime_line": artifact.get("runtime_line"),
     }
-    # Component hook (default none): whisper adds install_kind slim|fat. The JSON
-    # emitter sorts keys, so an appended field can't perturb the legacy key order.
+    # The JSON emitter sorts keys, so appended fields cannot perturb legacy order.
     payload.update(ops.resolver_payload_extra(artifact))
     return payload
 
@@ -3011,8 +2958,6 @@ def installed_server_path(ops: ModuleOps, install_dir: Path, host: Any) -> Path:
     return ops.runtime_bin_dir(install_dir, host) / ops.server_binary_name(host)
 
 
-# Underscored aliases so ops lookups that mirror the installer modules' private
-# names still resolve for a descriptor-only component.
 _download_host_latest_release_tag = download_host_latest_release_tag
 _download_host_json = fetch_download_host_json
 _resolve_release_via_download_host = resolve_release_via_download_host

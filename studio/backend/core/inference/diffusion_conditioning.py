@@ -1,19 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
-"""Condition images and output geometry for the reference and unified-edit workflows, shared by
-the diffusers and sd.cpp engines.
-
-Localized editing follows the official Qwen-Image-2.1 demo conventions, which are generative
-guides rather than inpainting masks: nothing here keeps pixels outside the region.
-
-- ``annotate``: coloured marks (outlines, arrows) drawn ON the source. The instruction names the
-  colours and asks for the marks to be left out of the result.
-- ``paint``: an opaque white region painted ON the source. The instruction refers to the white
-  area.
-- ``mask``: a separate white-on-black mask at the source's geometry, sent as Image 2 right after
-  the source. The instruction refers to the marked area.
-"""
+"""Reference/edit image modes (annotate, paint, mask) are generative guides, not inpainting masks."""
 
 from __future__ import annotations
 
@@ -27,6 +15,8 @@ LOCALIZED_EDIT_MODES = ("annotate", "paint", "mask")
 MAX_CONDITION_SOURCE_PIXELS = 64_000_000
 
 MIN_OUTPUT_SIDE = 256
+# Largest family max_output_side; per-family bounds live in check_output_size.
+MAX_REQUEST_SIDE = 6272
 
 # Upstream QwenImage21Pipeline's own ``output_resolution`` default.
 DEFAULT_REFERENCE_RESOLUTION = 1024
@@ -66,8 +56,7 @@ def check_conditioned_fields(
 
 
 def check_output_size(fam: Any, width: int, height: int) -> None:
-    """Refuse an output size the loaded family cannot render as asked. A size the pipeline would
-    silently floor to its own grid is refused rather than changed behind the caller's back."""
+    """Refuse output sizes the family cannot render, or that the pipeline would silently floor."""
     multiple = int(getattr(fam, "dimension_multiple", 16) or 16)
     max_side = int(getattr(fam, "max_output_side", 2048) or 2048)
     max_pixels = int(getattr(fam, "max_output_pixels", 2048 * 2048) or 2048 * 2048)
@@ -93,14 +82,19 @@ def check_output_size(fam: Any, width: int, height: int) -> None:
 
 
 def match_source_size(fam: Any, source_size: tuple[int, int], resolution: int) -> tuple[int, int]:
-    """Output (width, height) with the source's aspect ratio at a ``resolution`` squared area, on
-    the family grid and inside its bounds. Upstream's ``calculate_dimensions`` rounding, but from
-    Image 1 rather than the LAST reference. A source too elongated for both bounds keeps the short
-    side at the minimum and caps the long side, so the size is always one the request accepts."""
+    """Source aspect ratio at the target area, snapped to the family grid and bounds, from Image 1. MiniMax-H3-Image
+    renders at the reference edit workflow's size instead (Image 1 at 4 MP, sides cut to the 32 grid)."""
     multiple = int(getattr(fam, "dimension_multiple", 16) or 16)
     max_side = int(getattr(fam, "max_output_side", 2048) or 2048)
     max_pixels = int(getattr(fam, "max_output_pixels", 2048 * 2048) or 2048 * 2048)
     sw, sh = source_size
+    if getattr(fam, "name", None) == "minimax-h3-image" and sw > 0 and sh > 0:
+        from .diffusion_minimax_h3_image import reference_edit_size
+
+        w, h = reference_edit_size(int(sw), int(sh))
+        if max(w, h) <= max_side and w * h <= max_pixels:
+            return w, h
+        resolution = int(math.sqrt(min(max_pixels, w * h)))
     ratio = max(1e-6, float(sw) / float(max(1, sh)))
     area = float(resolution) * float(resolution)
     for _ in range(64):
@@ -120,9 +114,17 @@ def match_source_size(fam: Any, source_size: tuple[int, int], resolution: int) -
     return w, h
 
 
+def omitted_txt2img_size(family_name: Optional[str]) -> Optional[tuple[int, int]]:
+    """The text-to-image size for a request that names none, when the family's differs from the schema's 1024
+    square: MiniMax-H3-Image renders at the reference workflow's 2048x2048."""
+    if family_name == "minimax-h3-image":
+        from .diffusion_minimax_h3_image import H3_IMAGE_DEFAULT_SIZE
+        return H3_IMAGE_DEFAULT_SIZE, H3_IMAGE_DEFAULT_SIZE
+    return None
+
+
 def effective_reference_resolution(fam: Any, requested: Optional[int]) -> Optional[int]:
-    """The condition-image preprocessing resolution this call uses, or None for a family without
-    the control. Refuses a value the family does not list rather than rounding it."""
+    """Condition-image resolution, or None without the control; an unlisted value is refused."""
     allowed = tuple(getattr(fam, "reference_resolutions", ()) or ())
     if not allowed:
         if requested is not None:
@@ -144,6 +146,17 @@ def effective_reference_resolution(fam: Any, requested: Optional[int]) -> Option
     return int(requested)
 
 
+def reference_request_pixels(ref_resolution: Optional[int], extra_images: int = 0) -> int:
+    """Shared by the load's edit placement and the render-time guard, so both price the same pixels."""
+    if not ref_resolution:
+        return 0
+    return int((1 + max(0, int(extra_images))) * int(ref_resolution) * int(ref_resolution))
+
+
+def default_reference_pixels(fam: Any) -> int:
+    return reference_request_pixels(effective_reference_resolution(fam, None))
+
+
 def _decode_bounded(data: str, mode: str, budget: list[int], what: str) -> Any:
     from core.inference.diffusion import decode_b64_image
 
@@ -161,8 +174,7 @@ def _decode_bounded(data: str, mode: str, budget: list[int], what: str) -> Any:
 
 
 def _to_source_geometry(img: Any, source: Any, what: str, resample: Any) -> Any:
-    """``img`` at the source's pixel size. Only a pure scale is accepted: a different aspect ratio
-    means the layer was drawn over another image."""
+    """``img`` at source size; only pure scale (other ratios: layer drawn over another image)."""
     if img.size == source.size:
         return img
     sw, sh = source.size
@@ -176,8 +188,7 @@ def _to_source_geometry(img: Any, source: Any, what: str, resample: Any) -> Any:
 
 
 def apply_localized_edit(source: Any, localized: LocalizedEdit, budget: list[int]) -> list[Any]:
-    """The images the localized edit contributes, source first: ``[marked_source]`` for annotate
-    and paint, ``[source, mask]`` for a separate mask. Alpha outside the marks is preserved."""
+    """Annotate/paint: [marked_source]; mask: [source, mask]; alpha outside the marks is kept."""
     from PIL import Image
 
     if localized.mode == "annotate":
@@ -210,8 +221,7 @@ def decode_condition_images(
     reference_images: Optional[Sequence[str]],
     localized: Optional[LocalizedEdit] = None,
 ) -> list[Any]:
-    """The ordered condition list: the (possibly marked) source, a separate mask if any, then every
-    reference in request order. More images than the family takes is refused, not truncated."""
+    """Ordered list: source, any mask, then references in request order; any excess is refused."""
     limit = int(getattr(fam, "max_condition_images", 4) or 4)
     mode = getattr(fam, "condition_image_mode", "RGB") or "RGB"
     refs = [r for r in (reference_images or []) if r]
@@ -232,10 +242,22 @@ def decode_condition_images(
     return images
 
 
+# QwenImageEditPlusPipeline's VAE_IMAGE_SIZE: each image of a multi-image edit is VAE-encoded at this area (pixels).
+EDIT_EXTRA_IMAGE_AREA = 1024 * 1024
+
+
+def edit_takes_extra_images(fam: Any) -> bool:
+    """An instruction-edit family that reads more than the source in one edit (Qwen-Image-Edit-Plus): its edit
+    workflow takes ``reference_images`` after ``init_image``, up to ``max_condition_images`` in total."""
+    return (
+        bool(getattr(fam, "edit", False)) and int(getattr(fam, "max_condition_images", 4) or 4) > 1
+    )
+
+
 def conditioning_capabilities(fam: Any, workflows: Sequence[str]) -> dict[str, Any]:
-    """What the UI may offer for ``fam`` given the ``workflows`` the active engine runs for it.
-    Localized editing is advertised only where the unified edit workflow itself is."""
-    unified = bool(getattr(fam, "unified_edit", False)) and "edit" in workflows
+    localized = bool(getattr(fam, "unified_edit", False)) and "edit" in workflows
+    # The page's unified Edit form (Image 1 + extras, output sized from Image 1) fits a reference-edit family too.
+    unified = localized or (bool(getattr(fam, "reference_edit", False)) and "edit" in workflows)
     return {
         "max_condition_images": int(getattr(fam, "max_condition_images", 4) or 4),
         "alpha": (getattr(fam, "condition_image_mode", "RGB") or "RGB") == "RGBA",
@@ -243,6 +265,9 @@ def conditioning_capabilities(fam: Any, workflows: Sequence[str]) -> dict[str, A
         "max_output_side": int(getattr(fam, "max_output_side", 2048) or 2048),
         "max_output_pixels": int(getattr(fam, "max_output_pixels", 2048 * 2048) or 2048 * 2048),
         "reference_resolutions": list(getattr(fam, "reference_resolutions", ()) or ()),
+        "edit_output_resolution": getattr(fam, "edit_output_resolution", None),
         "unified_edit": unified,
-        "localized_edit_modes": list(LOCALIZED_EDIT_MODES) if unified else [],
+        # Edit-only families whose edit takes the extra images too (the UI shows them on the Edit tab).
+        "multi_image_edit": edit_takes_extra_images(fam) and "edit" in workflows,
+        "localized_edit_modes": list(LOCALIZED_EDIT_MODES) if localized else [],
     }

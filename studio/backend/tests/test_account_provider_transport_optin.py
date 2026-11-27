@@ -1,12 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
-"""Which httpx client a managed account gets, and that the choice follows the switch live.
-
-The pin is not merely an optimisation: with the switch on it would refuse the very
-connection the owner allowed, so the selection has to move with the setting rather
-than being decided once at import.
-"""
+"""The httpx client must follow the opt-in switch live, or it refuses connections the owner allowed."""
 
 from pathlib import Path
 import sys
@@ -40,8 +35,7 @@ def switch(monkeypatch):
     state = {"allowed": False}
     from utils import managed_provider_url_settings
 
-    # Patched on the settings module: `_client` imports the helper per call, so a caller-side
-    # patch would miss.
+    # Patch the settings module: _client imports the helper per call.
     monkeypatch.setattr(
         managed_provider_url_settings,
         "get_managed_private_provider_urls_allowed",
@@ -59,8 +53,7 @@ def client_as(account):
 
 
 def is_pinned(client) -> bool:
-    """Public-only. Exact type: the allowed-private screen subclasses this, so isinstance would
-    call that pinned too and every assertion below would stop meaning anything."""
+    """Public-only: exact type, since isinstance would also match the allowed-private screen."""
     return type(getattr(client, "_transport", None)) is external_provider._PinnedPublicTransport
 
 
@@ -98,8 +91,7 @@ def test_the_pinning_client_is_reused_not_rebuilt(switch):
 
 
 def test_two_managed_accounts_never_share_a_client(switch):
-    """httpx persists cookies per client, so one shared by two accounts carries a gateway
-    session from one to the other. https://www.python-httpx.org/advanced/clients/"""
+    """httpx keeps cookies per client, so sharing one across accounts leaks a gateway session."""
     for allowed in (False, True):
         switch["allowed"] = allowed
         alice, bob = client_as(ALICE), client_as(BOB)
@@ -113,8 +105,7 @@ def test_two_managed_accounts_never_share_a_client(switch):
 
 
 def test_an_unbound_thread_defaults_to_owner(switch):
-    """The account ContextVar fails open: a worker thread that forgot run_as reads as the owner.
-    Unchanged by the switch, and load-bearing for any _client() caller off the request path."""
+    """ContextVar fails open to owner (unchanged by switch); off-path _client() relies on it."""
     import threading
 
     seen = []
@@ -155,7 +146,6 @@ def test_the_allowed_client_still_screens_every_connection(switch):
 
     from core.inference.providers import provider_address_excluding_metadata
 
-    # Private is now fine, metadata never is, whichever spelling it arrives in.
     assert provider_address_excluding_metadata("http://127.0.0.1:11434/v1") == "127.0.0.1"
     assert provider_address_excluding_metadata("http://192.168.1.50:8000/v1") == "192.168.1.50"
     for metadata in (
@@ -169,8 +159,7 @@ def test_the_allowed_client_still_screens_every_connection(switch):
 
 
 def test_a_retired_account_stops_being_held(switch):
-    """Deleting an account has to drop its clients, or the cache is bounded by accounts ever
-    created rather than accounts that exist, and a deleted one's cookie jar outlives it."""
+    """Deleted accounts must drop their clients: cookie jars outlive them and the cache grows."""
     for allowed in (False, True):
         switch["allowed"] = allowed
         client_as(ALICE)
@@ -179,9 +168,7 @@ def test_a_retired_account_stops_being_held(switch):
 
     assert external_provider.retire_account_clients(ALICE.account_id) == 2
     assert not [key for key in external_provider._managed_clients if key[0] == ALICE.account_id]
-    # Another account's client is untouched.
     assert [key for key in external_provider._managed_clients if key[0] == BOB.account_id]
-    # A second retirement is a no-op rather than an error.
     assert external_provider.retire_account_clients(ALICE.account_id) == 0
 
 
@@ -196,21 +183,18 @@ def test_account_retirement_calls_it(switch):
 
 
 def test_a_request_after_retirement_is_served_but_not_cached(switch):
-    """A request that authenticated before deletion can reach _client() after the sweep; it
-    gets a working client, and nothing is left behind for an account nothing sweeps again."""
+    """Late requests get a working client but it is not cached; no later sweep would drop it."""
     client_as(ALICE)
     external_provider.retire_account_clients(ALICE.account_id)
 
     late = client_as(ALICE)
     assert late is not None
     assert not [key for key in external_provider._managed_clients if key[0] == ALICE.account_id]
-    # And it is a fresh object each time rather than a cached one.
     assert client_as(ALICE) is not late
 
 
 def test_retirement_from_a_worker_thread_closes_on_the_owning_loop(switch):
-    """Deletion is a synchronous route, so it runs with no loop of its own. Dropping the last
-    reference does not close an httpx pool; the close has to reach the loop that opened it."""
+    """Dropping the last reference won't close an httpx pool; close it on its owning loop."""
     import asyncio
     import threading
 
@@ -226,11 +210,9 @@ def test_retirement_from_a_worker_thread_closes_on_the_owning_loop(switch):
     thread.start()
     ready.wait(5)
     try:
-        # Built ON the loop, as a request would be.
         client = asyncio.run_coroutine_threadsafe(_make_client_as(ALICE), loop).result(timeout = 10)
         assert not client.is_closed
 
-        # Retired from a thread with no running loop, like the delete route.
         assert external_provider.retire_account_clients(ALICE.account_id) == 1
         deadline = time.time() + 10
         while time.time() < deadline and not client.is_closed:
@@ -246,8 +228,7 @@ async def _make_client_as(account):
 
 
 def test_reactivation_lifts_the_tombstone(switch):
-    """A delete that failed leaves the account disabled and reactivatable; a tombstone left
-    behind would mean a fresh client per request forever after."""
+    """A failed delete must leave no tombstone, so the account stays reactivatable."""
     client_as(ALICE)
     external_provider.retire_account_clients(ALICE.account_id)
     assert client_as(ALICE) is not client_as(ALICE)
